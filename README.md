@@ -20,34 +20,66 @@ XT-16 激光雷达和 Go2 内部 IMU 接入 ROS 2 Humble，并通过 Super-LIO �
 
 ### 1. 获取 ROS2 分支
 
+本仓库自身已经包含 `src/` 分层，因此应先创建一个全新的空工作空间，再把仓库
+直接克隆到工作空间根目录。不要再额外创建 `GO2_Hesai/` 子目录。
+
+下面使用 `~/go2_hesai_ros2_ws` 作为示例。也可以把工作空间命名为
+`~/catkin_ws`，但它必须是新建的空目录，绝不能复用已有的 ROS 1 工作空间。
+
 第一次下载仓库：
 
 ```bash
 cd ~
+mkdir go2_hesai_ros2_ws
+cd ~/go2_hesai_ros2_ws
+
 git clone --branch ROS2 --single-branch \
-  https://github.com/Aphra-neck/GO2_Hesai.git
-cd GO2_Hesai
+  https://github.com/Aphra-neck/GO2_Hesai.git .
 ```
 
-如果机器上已经有该仓库：
+克隆命令最后的 `.` 表示把仓库内容放进当前空目录。完成后的结构应为：
+
+```text
+~/go2_hesai_ros2_ws/
+├── .git/
+├── src/
+├── shell/
+└── README.md
+```
+
+不应出现下面这种多余嵌套：
+
+```text
+~/go2_hesai_ros2_ws/GO2_Hesai/src/
+```
+
+如果这个独立工作空间已经克隆过仓库，拉取 ROS2 分支：
 
 ```bash
-cd ~/GO2_Hesai
+cd ~/go2_hesai_ros2_ws
 git fetch origin
 git switch ROS2
 git pull --ff-only origin ROS2
 ```
 
-确认当前分支：
+拉取完成后检查当前分支和远端跟踪关系：
 
 ```bash
 git branch --show-current
+git status --short --branch
+git branch -vv
 ```
 
-输出应为：
+第一条命令必须输出：
 
 ```text
 ROS2
+```
+
+`git status --short --branch` 应以类似下面的内容开头：
+
+```text
+## ROS2...origin/ROS2
 ```
 
 ### 2. 安装编译依赖
@@ -104,7 +136,7 @@ cmake --find-package \
 在仓库根目录执行：
 
 ```bash
-cd ~/GO2_Hesai
+cd ~/go2_hesai_ros2_ws
 source /opt/ros/humble/setup.bash
 
 rosdep install --from-paths src --ignore-src -r -y
@@ -169,7 +201,7 @@ Go2 LowState
 完成编译后，在仓库根目录执行：
 
 ```bash
-cd ~/GO2_Hesai
+cd ~/go2_hesai_ros2_ws
 ./shell/start_slam.sh
 ```
 
