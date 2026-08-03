@@ -73,10 +73,10 @@ Visualization Manager:
       Size (m): 0.009999999776482582
       Style: Points
       Topic:
-        Depth: 5
+        Depth: 1
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Reliable
+        Reliability Policy: Best Effort
         Value: /lio/cloud_world
       Use Fixed Frame: true
       Use rainbow: true
@@ -106,10 +106,10 @@ Visualization Manager:
       Size (m): 0.009999999776482582
       Style: Points
       Topic:
-        Depth: 5
+        Depth: 1
         Durability Policy: Volatile
         History Policy: Keep Last
-        Reliability Policy: Reliable
+        Reliability Policy: Best Effort
         Value: /lio/cloud_world
       Use Fixed Frame: true
       Use rainbow: true

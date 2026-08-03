@@ -42,7 +42,7 @@
     lio.output.plan_env_body: false
     lio.output.planner: false
     lio.output.map: true
-    lio.output.dense: true
-    lio.output.pub_step: 10
+    lio.output.dense: false
+    lio.output.pub_step: 1
 
     lio.eva.timer: true

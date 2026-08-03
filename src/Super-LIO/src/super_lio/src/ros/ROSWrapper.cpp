@@ -344,9 +344,12 @@ void ROSWrapper::setupIO(){
   pub_path_ = this->create_publisher<nav_msgs::msg::Path>(
       "/lio/path", 10);
 
+  auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+                   .best_effort()
+                   .durability_volatile();
   pub_cloud_world_ =
     this->create_publisher<sensor_msgs::msg::PointCloud2>(
-        "/lio/cloud_world", 10);
+        "/lio/cloud_world", cloud_qos);
 
   tf_broadcaster_ =
       std::make_shared<tf2_ros::TransformBroadcaster>(this);
