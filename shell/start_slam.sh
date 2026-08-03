@@ -67,6 +67,27 @@ if ! ros2 pkg prefix "${RMW_IMPLEMENTATION}" >/dev/null 2>&1; then
   exit 1
 fi
 
+assert_not_running() {
+  local name="$1"
+  local executable_path="$2"
+
+  if pgrep -f -- "${executable_path}" >/dev/null 2>&1; then
+    echo "${name} is already running. Stop the existing process before starting SLAM." >&2
+    pgrep -af -- "${executable_path}" >&2 || true
+    exit 1
+  fi
+}
+
+assert_not_running \
+  "Hesai LiDAR driver" \
+  "${WORKSPACE_DIR}/install/hesai_ros_driver/lib/hesai_ros_driver/hesai_ros_driver_node"
+assert_not_running \
+  "Go2 IMU bridge" \
+  "${WORKSPACE_DIR}/install/go2_imu_bridge/lib/go2_imu_bridge/go2_imu_bridge_node"
+assert_not_running \
+  "Super-LIO" \
+  "${WORKSPACE_DIR}/install/super_lio/lib/super_lio/super_lio_node"
+
 declare -a CHILD_PIDS=()
 LAST_STARTED_PID=""
 
@@ -77,6 +98,27 @@ cleanup() {
     for pid in "${CHILD_PIDS[@]}"; do
       if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && (( pid > 1 )); then
         kill -TERM -- "-${pid}" 2>/dev/null || true
+      fi
+    done
+
+    local deadline=$((SECONDS + 3))
+    while (( SECONDS < deadline )); do
+      local running=false
+      for pid in "${CHILD_PIDS[@]}"; do
+        if kill -0 -- "-${pid}" 2>/dev/null; then
+          running=true
+          break
+        fi
+      done
+      if [[ "${running}" == false ]]; then
+        break
+      fi
+      sleep 0.1
+    done
+
+    for pid in "${CHILD_PIDS[@]}"; do
+      if kill -0 -- "-${pid}" 2>/dev/null; then
+        kill -KILL -- "-${pid}" 2>/dev/null || true
       fi
     done
     wait "${CHILD_PIDS[@]}" 2>/dev/null || true
@@ -94,12 +136,16 @@ start_background() {
 
 wait_for_message() {
   local topic="$1"
-  local timeout_seconds="$2"
-  local producer_pid="$3"
+  local message_type="$2"
+  local timeout_seconds="$3"
+  local producer_pid="$4"
+  local probe_status=0
 
-  # Keep one subscription alive so DDS discovery is not restarted every two seconds.
-  if timeout "${timeout_seconds}" \
-    ros2 topic echo --once --qos-profile sensor_data "${topic}" >/dev/null 2>&1; then
+  # Supplying the type lets the subscriber start before DDS discovers the publisher.
+  timeout "${timeout_seconds}" \
+    ros2 topic echo --once --qos-profile sensor_data \
+      "${topic}" "${message_type}" >/dev/null 2>&1 || probe_status=$?
+  if (( probe_status == 0 )); then
     return 0
   fi
 
@@ -111,7 +157,12 @@ wait_for_message() {
     return 1
   fi
 
-  echo "Timed out waiting for data on ${topic}. See ${LOG_DIR}." >&2
+  if (( probe_status == 124 )); then
+    echo "Timed out waiting for data on ${topic}. See ${LOG_DIR}." >&2
+  else
+    echo \
+      "Topic probe for ${topic} exited with status ${probe_status}. See ${LOG_DIR}." >&2
+  fi
   return 1
 }
 
@@ -126,7 +177,8 @@ echo "[1/3] Starting Hesai LiDAR driver..."
 start_background hesai \
   ros2 run hesai_ros_driver hesai_ros_driver_node --ros-args \
   -p "config_path:=${WORKSPACE_DIR}/src/HesaiLidar_ROS_2.0/config/config.yaml"
-wait_for_message /lidar_points 20 "${LAST_STARTED_PID}"
+wait_for_message \
+  /lidar_points sensor_msgs/msg/PointCloud2 20 "${LAST_STARTED_PID}"
 echo "/lidar_points is active."
 
 echo "[2/3] Starting Go2 IMU bridge on ${NETWORK_INTERFACE}..."
@@ -134,7 +186,7 @@ start_background go2_imu_bridge \
   ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args \
   -p "net:=${NETWORK_INTERFACE}" \
   -p "publish_rate:=${IMU_RATE}"
-wait_for_message /imu/data 15 "${LAST_STARTED_PID}"
+wait_for_message /imu/data sensor_msgs/msg/Imu 15 "${LAST_STARTED_PID}"
 echo "/imu/data is active."
 
 echo "[3/3] Starting Super-LIO..."
