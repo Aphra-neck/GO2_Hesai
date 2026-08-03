@@ -91,7 +91,7 @@ endif()
 
 ament_target_dependencies(lio ${SUPER_LIO_ROS_DEPENDENCIES})
 
-target_link_libraries(lio PUBLIC
+target_link_libraries(lio
   Eigen3::Eigen
   ${PCL_LIBRARIES}
   glog
