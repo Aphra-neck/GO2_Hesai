@@ -227,6 +227,7 @@ RVIZ=true ./shell/start_slam.sh
 | `RVIZ` | `false` | 是否启动 RViz2 |
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
 | `ROS_DOMAIN_ID` | `30` | ROS 2 domain；与 Unitree SDK 固定使用的 domain 0 隔离 |
+| `RMW_IMPLEMENTATION` | `rmw_fastrtps_cpp` | ROS 2 使用 Fast DDS，避免与 Unitree SDK 的 CycloneDDS 冲突 |
 
 例如：
 
@@ -243,10 +244,12 @@ SLAM_LOG_DIR=~/slam_logs \
 以下命令都需要在仓库根目录执行。
 
 Unitree SDK 固定使用 CycloneDDS domain 0。为避免它与同进程内的 ROS 2
-CycloneDDS 冲突，所有手动启动和检查终端都必须使用同一个非零 ROS domain：
+CycloneDDS 冲突，ROS 2 使用 Fast DDS和非零 domain。所有手动启动和检查
+终端都必须使用相同设置：
 
 ```bash
 export ROS_DOMAIN_ID=30
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ```
 
 `shell/start_slam.sh` 会自动使用该默认值。
@@ -255,6 +258,7 @@ export ROS_DOMAIN_ID=30
 
 ```bash
 export ROS_DOMAIN_ID=30
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 
@@ -266,6 +270,7 @@ ros2 run hesai_ros_driver hesai_ros_driver_node --ros-args \
 
 ```bash
 export ROS_DOMAIN_ID=30
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 
@@ -280,6 +285,7 @@ ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args \
 
 ```bash
 export ROS_DOMAIN_ID=30
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 
@@ -292,6 +298,7 @@ ros2 launch super_lio hesai.py rviz:=false
 
 ```bash
 export ROS_DOMAIN_ID=30
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ```
 
 查看话题：
@@ -450,7 +457,8 @@ tail -n 100 ~/slam_logs/go2_imu_bridge.log
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ROS_DOMAIN_ID=30 ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args -p net:=enP8p1s0
+RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=30 \
+  ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args -p net:=enP8p1s0
 ```
 
 ### `/lio/odom` 没有输出

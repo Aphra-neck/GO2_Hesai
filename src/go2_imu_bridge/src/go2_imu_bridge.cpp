@@ -10,7 +10,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -22,6 +24,8 @@ constexpr char kLowStateTopic[] = "rt/lowstate";
 constexpr char kDefaultImuTopic[] = "/imu/data";
 constexpr char kDefaultFrameId[] = "go2_imu";
 constexpr char kDefaultNetworkInterface[] = "enP8p1s0";
+constexpr char kCycloneRmw[] = "rmw_cyclonedds_cpp";
+constexpr char kDefaultRmw[] = "rmw_fastrtps_cpp";
 constexpr double kDefaultPublishRate = 200.0;
 constexpr std::size_t kPublisherDepth = 200;
 }  // namespace
@@ -149,6 +153,20 @@ private:
 
 int main(int argc, char ** argv)
 {
+  const char * rmw_implementation = std::getenv("RMW_IMPLEMENTATION");
+  if (rmw_implementation == nullptr || rmw_implementation[0] == '\0') {
+    if (setenv("RMW_IMPLEMENTATION", kDefaultRmw, 0) != 0) {
+      std::cerr << "Failed to select ROS 2 RMW implementation: " << kDefaultRmw << '\n';
+      return 2;
+    }
+  } else if (std::string(rmw_implementation) == kCycloneRmw) {
+    std::cerr
+      << kCycloneRmw
+      << " is incompatible with the bundled Unitree SDK2 CycloneDDS; use "
+      << kDefaultRmw << '\n';
+    return 2;
+  }
+
   rclcpp::init(argc, argv);
 
   try {

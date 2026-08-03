@@ -8,7 +8,9 @@ NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 IMU_RATE="${GO2_IMU_RATE:-200.0}"
 RVIZ="${RVIZ:-false}"
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-30}"
+RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export ROS_DOMAIN_ID
+export RMW_IMPLEMENTATION
 
 # ROS-generated setup scripts may read optional variables that are unset.
 set +u
@@ -37,6 +39,18 @@ set +u
 source "${WORKSPACE_DIR}/install/setup.bash"
 set -u
 mkdir -p "${LOG_DIR}"
+
+if [[ "${RMW_IMPLEMENTATION}" == "rmw_cyclonedds_cpp" ]]; then
+  echo "rmw_cyclonedds_cpp is incompatible with the bundled Unitree SDK2 CycloneDDS." >&2
+  echo "Use: RMW_IMPLEMENTATION=rmw_fastrtps_cpp" >&2
+  exit 1
+fi
+
+if ! ros2 pkg prefix "${RMW_IMPLEMENTATION}" >/dev/null 2>&1; then
+  echo "ROS 2 RMW package is not installed: ${RMW_IMPLEMENTATION}" >&2
+  echo "Install it with: sudo apt install ros-humble-rmw-fastrtps-cpp" >&2
+  exit 1
+fi
 
 declare -a CHILD_PIDS=()
 LAST_STARTED_PID=""
@@ -89,6 +103,7 @@ wait_for_message() {
 echo "======================================"
 echo " Go2 + Hesai XT-16 + Super-LIO (ROS 2)"
 echo " ROS domain: ${ROS_DOMAIN_ID} (Unitree SDK domain: 0)"
+echo " ROS RMW: ${RMW_IMPLEMENTATION}"
 echo "======================================"
 
 echo "[1/3] Starting Hesai LiDAR driver..."
