@@ -19,8 +19,12 @@ source install/setup.bash
 
 ## Run
 
+ROS 2 must use a different domain from the Unitree SDK2 CycloneDDS domain 0.
+Use the same ROS domain in every terminal that needs to communicate with the
+bridge.
+
 ```bash
-ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args \
+ROS_DOMAIN_ID=30 ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args \
   -p net:=enP8p1s0 \
   -p publish_rate:=200.0 \
   -p frame_id:=go2_imu \

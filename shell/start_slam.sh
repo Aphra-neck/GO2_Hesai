@@ -7,6 +7,8 @@ LOG_DIR="${SLAM_LOG_DIR:-${HOME}/slam_logs}"
 NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 IMU_RATE="${GO2_IMU_RATE:-200.0}"
 RVIZ="${RVIZ:-false}"
+ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-30}"
+export ROS_DOMAIN_ID
 
 # ROS-generated setup scripts may read optional variables that are unset.
 set +u
@@ -86,6 +88,7 @@ wait_for_message() {
 
 echo "======================================"
 echo " Go2 + Hesai XT-16 + Super-LIO (ROS 2)"
+echo " ROS domain: ${ROS_DOMAIN_ID} (Unitree SDK domain: 0)"
 echo "======================================"
 
 echo "[1/3] Starting Hesai LiDAR driver..."
