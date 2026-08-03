@@ -5,6 +5,8 @@
 #include <unitree/robot/channel/channel_factory.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
 
+#include <net/if.h>
+
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -19,7 +21,7 @@ namespace
 constexpr char kLowStateTopic[] = "rt/lowstate";
 constexpr char kDefaultImuTopic[] = "/imu/data";
 constexpr char kDefaultFrameId[] = "go2_imu";
-constexpr char kDefaultNetworkInterface[] = "eth10";
+constexpr char kDefaultNetworkInterface[] = "enP8p1s0";
 constexpr double kDefaultPublishRate = 200.0;
 constexpr std::size_t kPublisherDepth = 200;
 }  // namespace
@@ -38,6 +40,11 @@ public:
 
     if (!std::isfinite(publish_rate_) || publish_rate_ <= 0.0) {
       throw std::invalid_argument("publish_rate must be finite and greater than zero");
+    }
+
+    if (if_nametoindex(network_interface.c_str()) == 0U) {
+      throw std::invalid_argument(
+        "network interface does not exist: " + network_interface);
     }
 
     unitree::robot::ChannelFactory::Instance()->Init(0, network_interface);

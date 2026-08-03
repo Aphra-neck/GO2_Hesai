@@ -4,7 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 LOG_DIR="${SLAM_LOG_DIR:-${HOME}/slam_logs}"
-NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-eth10}"
+NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 IMU_RATE="${GO2_IMU_RATE:-200.0}"
 RVIZ="${RVIZ:-false}"
 
@@ -15,6 +15,13 @@ set -u
 
 if ! command -v setsid >/dev/null 2>&1; then
   echo "The setsid command is required to manage ROS 2 child processes." >&2
+  exit 1
+fi
+
+if ! ip link show dev "${NETWORK_INTERFACE}" >/dev/null 2>&1; then
+  echo "Go2 network interface does not exist: ${NETWORK_INTERFACE}" >&2
+  echo "Available interfaces:" >&2
+  ip -brief address >&2 || true
   exit 1
 fi
 
@@ -58,24 +65,20 @@ wait_for_message() {
   local topic="$1"
   local timeout_seconds="$2"
   local producer_pid="$3"
-  local deadline=$((SECONDS + timeout_seconds))
 
-  while (( SECONDS < deadline )); do
-    if ! kill -0 "${producer_pid}" 2>/dev/null; then
-      local exit_status=0
-      wait "${producer_pid}" || exit_status=$?
-      echo \
-        "Producer for ${topic} exited with status ${exit_status}. See ${LOG_DIR}." >&2
-      return 1
-    fi
+  # Keep one subscription alive so DDS discovery is not restarted every two seconds.
+  if timeout "${timeout_seconds}" \
+    ros2 topic echo --once --qos-profile sensor_data "${topic}" >/dev/null 2>&1; then
+    return 0
+  fi
 
-    if timeout 2 \
-      ros2 topic echo --once --qos-profile sensor_data "${topic}" >/dev/null 2>&1; then
-      return 0
-    fi
-
-    sleep 1
-  done
+  if ! kill -0 "${producer_pid}" 2>/dev/null; then
+    local exit_status=0
+    wait "${producer_pid}" || exit_status=$?
+    echo \
+      "Producer for ${topic} exited with status ${exit_status}. See ${LOG_DIR}." >&2
+    return 1
+  fi
 
   echo "Timed out waiting for data on ${topic}. See ${LOG_DIR}." >&2
   return 1

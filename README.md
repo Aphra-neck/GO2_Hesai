@@ -222,7 +222,7 @@ RVIZ=true ./shell/start_slam.sh
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `GO2_NETWORK_INTERFACE` | `eth10` | Unitree SDK2 接收 LowState 的网卡 |
+| `GO2_NETWORK_INTERFACE` | `enP8p1s0` | Unitree SDK2 接收 LowState 的网卡 |
 | `GO2_IMU_RATE` | `200.0` | IMU 最大发布频率，单位 Hz |
 | `RVIZ` | `false` | 是否启动 RViz2 |
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
@@ -230,7 +230,7 @@ RVIZ=true ./shell/start_slam.sh
 例如：
 
 ```bash
-GO2_NETWORK_INTERFACE=eth10 \
+GO2_NETWORK_INTERFACE=enP8p1s0 \
 GO2_IMU_RATE=200.0 \
 RVIZ=true \
 SLAM_LOG_DIR=~/slam_logs \
@@ -258,7 +258,7 @@ source /opt/ros/humble/setup.bash
 source install/setup.bash
 
 ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args \
-  -p net:=eth10 \
+  -p net:=enP8p1s0 \
   -p publish_rate:=200.0 \
   -p frame_id:=go2_imu \
   -p imu_topic:=/imu/data
@@ -364,7 +364,7 @@ lio.extrinsic.lidar_imu: [0.171, 0.0, 0.0908,
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `net` | `eth10` | Unitree SDK2 使用的网卡 |
+| `net` | `enP8p1s0` | Unitree SDK2 使用的网卡 |
 | `publish_rate` | `200.0` | IMU 最大发布频率 |
 | `frame_id` | `go2_imu` | ROS 2 消息坐标系 |
 | `imu_topic` | `/imu/data` | IMU 输出话题 |
@@ -403,11 +403,11 @@ MAKEFLAGS=-j2 colcon build \
 
 ### `/lidar_points` 没有数据
 
-确认 `eth10` 地址和雷达 UDP 数据：
+确认 `enP8p1s0` 地址和雷达 UDP 数据：
 
 ```bash
-ip address show eth10
-sudo tcpdump -i eth10 -nn 'udp port 2368' -c 10
+ip address show enP8p1s0
+sudo tcpdump -i enP8p1s0 -nn 'udp port 2368' -c 10
 ```
 
 正常应能看到 `192.168.123.20:10000` 发往 `192.168.123.18:2368` 的数据。
@@ -422,7 +422,7 @@ tail -n 100 ~/slam_logs/hesai.log
 确认网卡名和 bridge 日志：
 
 ```bash
-ip link show eth10
+ip link show enP8p1s0
 tail -n 100 ~/slam_logs/go2_imu_bridge.log
 ```
 
@@ -431,7 +431,7 @@ tail -n 100 ~/slam_logs/go2_imu_bridge.log
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args -p net:=eth10
+ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args -p net:=enP8p1s0
 ```
 
 ### `/lio/odom` 没有输出

@@ -21,7 +21,7 @@ source install/setup.bash
 
 ```bash
 ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args \
-  -p net:=eth10 \
+  -p net:=enP8p1s0 \
   -p publish_rate:=200.0 \
   -p frame_id:=go2_imu \
   -p imu_topic:=/imu/data
@@ -31,7 +31,7 @@ Parameters:
 
 | Name | Default | Description |
 | --- | --- | --- |
-| `net` | `eth10` | Interface used by Unitree SDK2 to receive `rt/lowstate`. |
+| `net` | `enP8p1s0` | Interface used by Unitree SDK2 to receive `rt/lowstate`. |
 | `publish_rate` | `200.0` | Maximum IMU publish rate in hertz. |
 | `frame_id` | `go2_imu` | ROS frame assigned to each IMU message. |
 | `imu_topic` | `/imu/data` | ROS 2 topic used for IMU output. |
