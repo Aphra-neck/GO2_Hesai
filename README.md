@@ -229,6 +229,7 @@ RVIZ=true ./shell/start_slam.sh
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
 | `ROS_DOMAIN_ID` | `30` | ROS 2 domain；与 Unitree SDK 固定使用的 domain 0 隔离 |
 | `RMW_IMPLEMENTATION` | `rmw_fastrtps_cpp` | ROS 2 使用 Fast DDS，避免与 Unitree SDK 的 CycloneDDS 冲突 |
+| `UNITREE_SDK_LIBRARY_DIR` | `/usr/local/lib` | Unitree SDK配套的 CycloneDDS动态库目录 |
 
 例如：
 
@@ -274,6 +275,8 @@ export ROS_DOMAIN_ID=30
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 source /opt/ros/humble/setup.bash
 source install/setup.bash
+
+export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"
 
 ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args \
   -p net:=enP8p1s0 \
@@ -458,6 +461,7 @@ tail -n 100 ~/slam_logs/go2_imu_bridge.log
 ```bash
 source /opt/ros/humble/setup.bash
 source install/setup.bash
+export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"
 RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=30 \
   ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args -p net:=enP8p1s0
 ```
@@ -470,8 +474,8 @@ awk '/libddsc|librmw|fastdds|fastrtps/ {print $6}' \
   "/proc/${bridge_pid}/maps" | sort -u
 ```
 
-`/usr/local/lib/libddsc.so.0` 和 `libddscxx.so.0` 属于 Unitree SDK，出现是正常的；
-ROS侧应出现 Fast DDS/Fast RTPS相关库，不应再加载
+`/usr/local/lib/libddsc.so.0` 和 `libddscxx.so.0` 必须同时出现并配套供
+Unitree SDK使用；ROS侧应出现 Fast DDS/Fast RTPS相关库，不应再加载
 `/opt/ros/humble/lib/aarch64-linux-gnu/libddsc.so.0.10.5`。
 `ldd` 只显示直接链接依赖，不能确认运行时动态选择的 RMW实现，因此以上
 `/proc` 检查更准确。

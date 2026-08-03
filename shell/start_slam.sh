@@ -9,6 +9,7 @@ IMU_RATE="${GO2_IMU_RATE:-200.0}"
 RVIZ="${RVIZ:-false}"
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-30}"
 RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+UNITREE_SDK_LIBRARY_DIR="${UNITREE_SDK_LIBRARY_DIR:-/usr/local/lib}"
 export ROS_DOMAIN_ID
 export RMW_IMPLEMENTATION
 
@@ -39,6 +40,20 @@ set +u
 source "${WORKSPACE_DIR}/install/setup.bash"
 set -u
 mkdir -p "${LOG_DIR}"
+
+# Pair Unitree's libddscxx with the matching libddsc before ROS library paths.
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+  LD_LIBRARY_PATH="${UNITREE_SDK_LIBRARY_DIR}:${LD_LIBRARY_PATH}"
+else
+  LD_LIBRARY_PATH="${UNITREE_SDK_LIBRARY_DIR}"
+fi
+export LD_LIBRARY_PATH
+
+if [[ ! -r "${UNITREE_SDK_LIBRARY_DIR}/libddsc.so.0" || \
+      ! -r "${UNITREE_SDK_LIBRARY_DIR}/libddscxx.so.0" ]]; then
+  echo "Unitree CycloneDDS runtime libraries are missing from ${UNITREE_SDK_LIBRARY_DIR}." >&2
+  exit 1
+fi
 
 if [[ "${RMW_IMPLEMENTATION}" == "rmw_cyclonedds_cpp" ]]; then
   echo "rmw_cyclonedds_cpp is incompatible with the bundled Unitree SDK2 CycloneDDS." >&2
@@ -104,6 +119,7 @@ echo "======================================"
 echo " Go2 + Hesai XT-16 + Super-LIO (ROS 2)"
 echo " ROS domain: ${ROS_DOMAIN_ID} (Unitree SDK domain: 0)"
 echo " ROS RMW: ${RMW_IMPLEMENTATION}"
+echo " Unitree DDS libraries: ${UNITREE_SDK_LIBRARY_DIR}"
 echo "======================================"
 
 echo "[1/3] Starting Hesai LiDAR driver..."
