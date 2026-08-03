@@ -101,6 +101,7 @@ sudo apt install -y \
   libtbb-dev \
   libyaml-cpp-dev \
   ros-humble-pcl-ros \
+  ros-humble-rmw-fastrtps-cpp \
   ros-humble-tf2-ros \
   ros-humble-rviz2
 ```
@@ -460,6 +461,20 @@ source install/setup.bash
 RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=30 \
   ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args -p net:=enP8p1s0
 ```
+
+bridge 运行时可在另一个终端确认实际加载的 DDS库：
+
+```bash
+bridge_pid="$(pgrep -n -f go2_imu_bridge_node)"
+awk '/libddsc|librmw|fastdds|fastrtps/ {print $6}' \
+  "/proc/${bridge_pid}/maps" | sort -u
+```
+
+`/usr/local/lib/libddsc.so.0` 和 `libddscxx.so.0` 属于 Unitree SDK，出现是正常的；
+ROS侧应出现 Fast DDS/Fast RTPS相关库，不应再加载
+`/opt/ros/humble/lib/aarch64-linux-gnu/libddsc.so.0.10.5`。
+`ldd` 只显示直接链接依赖，不能确认运行时动态选择的 RMW实现，因此以上
+`/proc` 检查更准确。
 
 ### `/lio/odom` 没有输出
 

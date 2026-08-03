@@ -6,13 +6,14 @@ ROS 2 Humble bridge from the Unitree SDK2 `rt/lowstate` DDS topic to
 ## Prerequisites
 
 - ROS 2 Humble
+- ROS 2 Fast DDS RMW (`ros-humble-rmw-fastrtps-cpp`)
 - Unitree SDK2 installed as a discoverable CMake package
 
 ## Build
 
 ```bash
+cd ~/catkin_ws
 source /opt/ros/humble/setup.bash
-cd ~/go2_hesai_ws
 colcon build --symlink-install --packages-select go2_imu_bridge
 source install/setup.bash
 ```
