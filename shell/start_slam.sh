@@ -8,7 +8,10 @@ NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-eth10}"
 IMU_RATE="${GO2_IMU_RATE:-200.0}"
 RVIZ="${RVIZ:-false}"
 
+# ROS-generated setup scripts may read optional variables that are unset.
+set +u
 source /opt/ros/humble/setup.bash
+set -u
 
 if ! command -v setsid >/dev/null 2>&1; then
   echo "The setsid command is required to manage ROS 2 child processes." >&2
@@ -21,7 +24,9 @@ if [[ ! -f "${WORKSPACE_DIR}/install/setup.bash" ]]; then
   exit 1
 fi
 
+set +u
 source "${WORKSPACE_DIR}/install/setup.bash"
+set -u
 mkdir -p "${LOG_DIR}"
 
 declare -a CHILD_PIDS=()
