@@ -182,6 +182,7 @@ bool SuperLIO::map_init(){
   ivox_->insert(points_world_v3_);
   kf_->SetLastObsTime(measures_.lidar.end_time);
 
+  // 20 Hz for 1.0 seconds. Integral coverage area > 70%
   if(frame_num_ > 3){
     g_flg_map_init = false;
     return true;
@@ -193,10 +194,10 @@ bool SuperLIO::map_init(){
 void SuperLIO::stateProcess(){
   frame_num_++;
   if(g_time_eva){
-    time_record_.Evaluate([this](){Propagation_Undistort();}, "Undistort");
-    time_record_.Evaluate([this]() { DownSample(); }, "DownSample");
-    time_record_.Evaluate([this]() { Observe(); }, "Observe");
-    time_record_.Evaluate([this]() { UpdateMap(); }, "UpdateMap");
+    time_record_.Evaluate([this](){Propagation_Undistort();}, "[Undistort]");
+    time_record_.Evaluate([this]() { DownSample(); }, "[DownSample]");
+    time_record_.Evaluate([this]() { Observe(); }, "[Observe]");
+    time_record_.Evaluate([this]() { UpdateMap(); }, "[UpdateMap]");
   }else{
     Propagation_Undistort();
     DownSample();
@@ -324,6 +325,7 @@ void SuperLIO::saveMap(){
     LOG(INFO) << GREEN << " ---> Save last cace success. " << RESET;
     LOG(INFO) << YELLOW << " ---> Process cace map ... " << RESET;
     ProcessCaceMap();
+    LOG(INFO) << GREEN << " ---> Process cace map success. " << RESET;
     return;
   }
 
@@ -345,6 +347,14 @@ void SuperLIO::saveMap(){
     LOG(INFO) << GREEN << " ---> Save map success. File: " << map_name << RESET;
     LOG(INFO) << GREEN << " ---> Map size: " << latst_map.size() << RESET;
   }
+}
+
+
+inline double get_cpu_time_seconds() {
+  struct rusage usage;
+  getrusage(RUSAGE_SELF, &usage);
+  return usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 +
+         usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
 }
 
 

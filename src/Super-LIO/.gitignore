@@ -2,8 +2,8 @@
 build
 devel
 log
-./logs
 install
+./logs
 .catkin_workspace
 .catkin_tools
 src/CMakeLists.txt

@@ -1,108 +1,158 @@
-#include <ros/ros.h>
-#include <sensor_msgs/Imu.h>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 
+#include <unitree/idl/go2/LowState_.hpp>
 #include <unitree/robot/channel/channel_factory.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
-#include <unitree/idl/go2/LowState_.hpp>
 
+#include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <functional>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 
-#define TOPIC_LOWSTATE "rt/lowstate"
+namespace
+{
+constexpr char kLowStateTopic[] = "rt/lowstate";
+constexpr char kDefaultImuTopic[] = "/imu/data";
+constexpr char kDefaultFrameId[] = "go2_imu";
+constexpr char kDefaultNetworkInterface[] = "eth10";
+constexpr double kDefaultPublishRate = 200.0;
+constexpr std::size_t kPublisherDepth = 200;
+}  // namespace
 
-class Go2ImuBridge {
+class Go2ImuBridge final : public rclcpp::Node
+{
 public:
-  explicit Go2ImuBridge(ros::NodeHandle& nh) {
-    ros::NodeHandle pnh("~");
-    pnh.param<std::string>("frame_id", frame_id_, "go2_imu");
-    pnh.param<double>("publish_rate", publish_rate_, 200.0);
+  Go2ImuBridge()
+  : Node("go2_imu_bridge"),
+    frame_id_(declare_parameter<std::string>("frame_id", kDefaultFrameId)),
+    imu_topic_(declare_parameter<std::string>("imu_topic", kDefaultImuTopic)),
+    publish_rate_(declare_parameter<double>("publish_rate", kDefaultPublishRate))
+  {
+    const auto network_interface =
+      declare_parameter<std::string>("net", kDefaultNetworkInterface);
 
-    imu_pub_ = nh.advertise<sensor_msgs::Imu>("/imu/data", 200);
+    if (!std::isfinite(publish_rate_) || publish_rate_ <= 0.0) {
+      throw std::invalid_argument("publish_rate must be finite and greater than zero");
+    }
 
-    lowstate_sub_.reset(
-      new unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::LowState_>(TOPIC_LOWSTATE)
-    );
+    unitree::robot::ChannelFactory::Instance()->Init(0, network_interface);
 
-    lowstate_sub_->InitChannel(
-      std::bind(&Go2ImuBridge::LowStateCallback, this, std::placeholders::_1),
-      10
-    );
+    const auto qos = rclcpp::QoS(rclcpp::KeepLast(kPublisherDepth))
+      .reliable()
+      .durability_volatile();
+    imu_publisher_ = create_publisher<sensor_msgs::msg::Imu>(imu_topic_, qos);
 
-    ROS_INFO("go2_imu_bridge started, publishing /imu/data at %.1f Hz", publish_rate_);
+    lowstate_subscriber_ = std::make_shared<
+      unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::LowState_>>(
+      kLowStateTopic);
+    lowstate_subscriber_->InitChannel(
+      std::bind(&Go2ImuBridge::low_state_callback, this, std::placeholders::_1),
+      10);
+
+    RCLCPP_INFO(
+      get_logger(),
+      "Listening for %s on %s; publishing %s at up to %.1f Hz",
+      kLowStateTopic,
+      network_interface.c_str(),
+      imu_topic_.c_str(),
+      publish_rate_);
   }
 
 private:
-  void LowStateCallback(const void* message) {
-    ros::Time now = ros::Time::now();
-
-    if (!last_pub_time_.isZero()) {
-      const double dt = (now - last_pub_time_).toSec();
-      if (dt < 1.0 / publish_rate_) {
-        return;
-      }
-      if (dt <= 0.0) {
-        return;
+  bool should_publish(const std::chrono::steady_clock::time_point now)
+  {
+    std::lock_guard<std::mutex> lock(publish_mutex_);
+    if (has_published_) {
+      const auto elapsed = std::chrono::duration<double>(now - last_publish_time_).count();
+      if (elapsed < (1.0 / publish_rate_)) {
+        return false;
       }
     }
-    last_pub_time_ = now;
 
-    const auto* state = static_cast<const unitree_go::msg::dds_::LowState_*>(message);
-    const auto& imu = state->imu_state();
+    last_publish_time_ = now;
+    has_published_ = true;
+    return true;
+  }
 
-    const auto& q = imu.quaternion();      // Unitree order: w, x, y, z
-    const auto& gyro = imu.gyroscope();    // rad/s
-    const auto& acc = imu.accelerometer(); // m/s^2
+  void low_state_callback(const void * message)
+  {
+    if (message == nullptr) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000, "Received a null LowState message");
+      return;
+    }
 
-    sensor_msgs::Imu msg;
-    msg.header.stamp = now;
-    msg.header.frame_id = frame_id_;
+    if (!should_publish(std::chrono::steady_clock::now())) {
+      return;
+    }
 
-    msg.orientation.w = q[0];
-    msg.orientation.x = q[1];
-    msg.orientation.y = q[2];
-    msg.orientation.z = q[3];
+    const auto * state =
+      static_cast<const unitree_go::msg::dds_::LowState_ *>(message);
+    const auto & imu = state->imu_state();
+    const auto & quaternion = imu.quaternion();  // Unitree order: w, x, y, z.
+    const auto & gyroscope = imu.gyroscope();    // rad/s.
+    const auto & accelerometer = imu.accelerometer();  // m/s^2.
 
-    msg.angular_velocity.x = gyro[0];
-    msg.angular_velocity.y = gyro[1];
-    msg.angular_velocity.z = gyro[2];
+    sensor_msgs::msg::Imu message_out;
+    message_out.header.stamp = now();
+    message_out.header.frame_id = frame_id_;
 
-    msg.linear_acceleration.x = acc[0];
-    msg.linear_acceleration.y = acc[1];
-    msg.linear_acceleration.z = acc[2];
+    message_out.orientation.w = quaternion[0];
+    message_out.orientation.x = quaternion[1];
+    message_out.orientation.y = quaternion[2];
+    message_out.orientation.z = quaternion[3];
 
-    // Tell consumers not to trust the absolute orientation from LowState.
-    msg.orientation_covariance[0] = -1.0;
+    message_out.angular_velocity.x = gyroscope[0];
+    message_out.angular_velocity.y = gyroscope[1];
+    message_out.angular_velocity.z = gyroscope[2];
 
-    msg.angular_velocity_covariance[0] = 0.01;
-    msg.angular_velocity_covariance[4] = 0.01;
-    msg.angular_velocity_covariance[8] = 0.01;
+    message_out.linear_acceleration.x = accelerometer[0];
+    message_out.linear_acceleration.y = accelerometer[1];
+    message_out.linear_acceleration.z = accelerometer[2];
 
-    msg.linear_acceleration_covariance[0] = 0.1;
-    msg.linear_acceleration_covariance[4] = 0.1;
-    msg.linear_acceleration_covariance[8] = 0.1;
+    // Super-LIO should estimate orientation instead of trusting LowState's absolute attitude.
+    message_out.orientation_covariance[0] = -1.0;
 
-    imu_pub_.publish(msg);
+    message_out.angular_velocity_covariance[0] = 0.01;
+    message_out.angular_velocity_covariance[4] = 0.01;
+    message_out.angular_velocity_covariance[8] = 0.01;
+
+    message_out.linear_acceleration_covariance[0] = 0.1;
+    message_out.linear_acceleration_covariance[4] = 0.1;
+    message_out.linear_acceleration_covariance[8] = 0.1;
+
+    imu_publisher_->publish(message_out);
   }
 
   std::string frame_id_;
+  std::string imu_topic_;
   double publish_rate_;
-  ros::Time last_pub_time_;
-  ros::Publisher imu_pub_;
-  unitree::robot::ChannelSubscriberPtr<unitree_go::msg::dds_::LowState_> lowstate_sub_;
+  std::mutex publish_mutex_;
+  std::chrono::steady_clock::time_point last_publish_time_{};
+  bool has_published_{false};
+  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher_;
+  unitree::robot::ChannelSubscriberPtr<unitree_go::msg::dds_::LowState_>
+    lowstate_subscriber_;
 };
 
-int main(int argc, char** argv) {
-  ros::init(argc, argv, "go2_imu_bridge");
-  ros::NodeHandle nh;
-  ros::NodeHandle pnh("~");
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
 
-  std::string net;
-  pnh.param<std::string>("net", net, "eth10");
+  try {
+    rclcpp::spin(std::make_shared<Go2ImuBridge>());
+  } catch (const std::exception & exception) {
+    RCLCPP_FATAL(
+      rclcpp::get_logger("go2_imu_bridge"), "Failed to start: %s", exception.what());
+    rclcpp::shutdown();
+    return 1;
+  }
 
-  unitree::robot::ChannelFactory::Instance()->Init(0, net);
-
-  Go2ImuBridge bridge(nh);
-  ros::spin();
-
+  rclcpp::shutdown();
   return 0;
 }

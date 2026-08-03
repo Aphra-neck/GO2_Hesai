@@ -1,4 +1,4 @@
-# Catkin build products
+# ROS build products (catkin and colcon)
 build/
 devel/
 install/

@@ -1,29 +1,29 @@
-<?xml version="1.0"?>
-<package format="2">
+<package format="3">
   <name>basic</name>
-  <version>0.0.0</version>
+  <version>2.0.0</version>
   <description>The basic package</description>
 
   <maintainer email="lswang@mail.ecust.edu.cn">LS.Wang</maintainer>
 
   <license>GPLv3</license>
 
-  <buildtool_depend>catkin</buildtool_depend>
+  <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <build_depend>roscpp</build_depend>
-  <build_depend>rospy</build_depend>
+  <depend>rclcpp</depend>
 
-  <build_export_depend>roscpp</build_export_depend>
-  <build_export_depend>rospy</build_export_depend>
+  <depend>eigen3</depend>
+  <depend>pcl_conversions</depend>
 
-  <exec_depend>roscpp</exec_depend>
-  <exec_depend>rospy</exec_depend>
+  <build_depend>libpcl-dev</build_depend>
+  <build_depend>libeigen3-dev</build_depend>
 
-  <depend>eigen</depend>
-  <depend>pcl</depend>
+  <exec_depend>libpcl-dev</exec_depend>
+  <exec_depend>libeigen3-dev</exec_depend>
 
-  
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
   <export>
-    <build_type>catkin</build_type>
+    <build_type>ament_cmake</build_type>
   </export>
 </package>

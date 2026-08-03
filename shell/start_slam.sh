@@ -1,55 +1,102 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-source /opt/ros/noetic/setup.bash
-source /home/unitree/catkin_ws/devel/setup.bash
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+LOG_DIR="${SLAM_LOG_DIR:-${HOME}/slam_logs}"
+NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-eth10}"
+IMU_RATE="${GO2_IMU_RATE:-200.0}"
+RVIZ="${RVIZ:-false}"
 
-LOG_DIR="/home/unitree/slam_logs"
-mkdir -p "$LOG_DIR"
+source /opt/ros/humble/setup.bash
 
-echo "======================================"
-echo " Go2 + Hesai XT-16 + Super-LIO 启动"
-echo "======================================"
+if ! command -v setsid >/dev/null 2>&1; then
+  echo "The setsid command is required to manage ROS 2 child processes." >&2
+  exit 1
+fi
+
+if [[ ! -f "${WORKSPACE_DIR}/install/setup.bash" ]]; then
+  echo "Workspace is not built: ${WORKSPACE_DIR}/install/setup.bash is missing." >&2
+  echo "Run: colcon build --symlink-install" >&2
+  exit 1
+fi
+
+source "${WORKSPACE_DIR}/install/setup.bash"
+mkdir -p "${LOG_DIR}"
+
+declare -a CHILD_PIDS=()
+LAST_STARTED_PID=""
 
 cleanup() {
-  echo ""
-  echo "正在关闭 SLAM 相关节点..."
-
-  rosnode kill /super_lio_node 2>/dev/null || true
-  rosnode kill /super_lio 2>/dev/null || true
-  rosnode kill /go2_imu_bridge 2>/dev/null || true
-  rosnode kill /hesai_ros_driver_node 2>/dev/null || true
-
-  pkill -f "roslaunch hesai_ros_driver start.launch" 2>/dev/null || true
-  pkill -f "rosrun go2_imu_bridge go2_imu_bridge_node" 2>/dev/null || true
-  pkill -f "roslaunch super_lio hesai_XT16.launch" 2>/dev/null || true
-
-  echo "已关闭。"
+  trap - EXIT INT TERM
+  if (( ${#CHILD_PIDS[@]} > 0 )); then
+    local pid
+    for pid in "${CHILD_PIDS[@]}"; do
+      if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && (( pid > 1 )); then
+        kill -TERM -- "-${pid}" 2>/dev/null || true
+      fi
+    done
+    wait "${CHILD_PIDS[@]}" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT INT TERM
 
-echo "[1/3] 启动 Hesai 雷达驱动..."
-roslaunch hesai_ros_driver start.launch rviz:=false > "$LOG_DIR/hesai.log" 2>&1 &
-sleep 5
+start_background() {
+  local name="$1"
+  shift
+  setsid "$@" >"${LOG_DIR}/${name}.log" 2>&1 &
+  LAST_STARTED_PID="$!"
+  CHILD_PIDS+=("${LAST_STARTED_PID}")
+}
 
-echo "检查 /lidar_points..."
-timeout 10 bash -c 'until rostopic echo -n 1 /lidar_points/header >/dev/null 2>&1; do sleep 1; done'
-echo "/lidar_points 正常。"
+wait_for_message() {
+  local topic="$1"
+  local timeout_seconds="$2"
+  local producer_pid="$3"
+  local deadline=$((SECONDS + timeout_seconds))
 
-echo "[2/3] 启动 Go2 IMU bridge..."
-rosrun go2_imu_bridge go2_imu_bridge_node _net:=eth10 _publish_rate:=200 > "$LOG_DIR/go2_imu_bridge.log" 2>&1 &
-sleep 3
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "${producer_pid}" 2>/dev/null; then
+      local exit_status=0
+      wait "${producer_pid}" || exit_status=$?
+      echo \
+        "Producer for ${topic} exited with status ${exit_status}. See ${LOG_DIR}." >&2
+      return 1
+    fi
 
-echo "检查 /imu/data..."
-timeout 10 bash -c 'until rostopic echo -n 1 /imu/data/header >/dev/null 2>&1; do sleep 1; done'
-echo "/imu/data 正常。"
+    if timeout 2 \
+      ros2 topic echo --once --qos-profile sensor_data "${topic}" >/dev/null 2>&1; then
+      return 0
+    fi
 
-echo "[3/3] 启动 Super-LIO..."
-echo ""
-echo "启动完成后，另开命令检查位姿："
-echo "  rostopic echo /lio/odom"
-echo ""
-echo "日志目录：$LOG_DIR"
-echo ""
+    sleep 1
+  done
 
-roslaunch super_lio hesai_XT16.launch
+  echo "Timed out waiting for data on ${topic}. See ${LOG_DIR}." >&2
+  return 1
+}
+
+echo "======================================"
+echo " Go2 + Hesai XT-16 + Super-LIO (ROS 2)"
+echo "======================================"
+
+echo "[1/3] Starting Hesai LiDAR driver..."
+start_background hesai \
+  ros2 run hesai_ros_driver hesai_ros_driver_node --ros-args \
+  -p "config_path:=${WORKSPACE_DIR}/src/HesaiLidar_ROS_2.0/config/config.yaml"
+wait_for_message /lidar_points 20 "${LAST_STARTED_PID}"
+echo "/lidar_points is active."
+
+echo "[2/3] Starting Go2 IMU bridge on ${NETWORK_INTERFACE}..."
+start_background go2_imu_bridge \
+  ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args \
+  -p "net:=${NETWORK_INTERFACE}" \
+  -p "publish_rate:=${IMU_RATE}"
+wait_for_message /imu/data 15 "${LAST_STARTED_PID}"
+echo "/imu/data is active."
+
+echo "[3/3] Starting Super-LIO..."
+echo "Logs: ${LOG_DIR}"
+echo "Check pose: ros2 topic echo /lio/odom"
+
+ros2 launch super_lio hesai.py "rviz:=${RVIZ}"
