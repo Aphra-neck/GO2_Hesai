@@ -6,7 +6,6 @@ WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 LOG_DIR="${SLAM_LOG_DIR:-${HOME}/slam_logs}"
 NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 IMU_RATE="${GO2_IMU_RATE:-200.0}"
-RVIZ="${RVIZ:-false}"
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-30}"
 RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 UNITREE_SDK_LIBRARY_DIR="${UNITREE_SDK_LIBRARY_DIR:-/usr/local/lib}"
@@ -87,6 +86,12 @@ assert_not_running \
 assert_not_running \
   "Super-LIO" \
   "${WORKSPACE_DIR}/install/super_lio/lib/super_lio/super_lio_node"
+
+if [[ ! -x "${WORKSPACE_DIR}/tools/go2-log" ]]; then
+  echo "Diagnostics command is missing or not executable: ${WORKSPACE_DIR}/tools/go2-log" >&2
+  exit 1
+fi
+"${WORKSPACE_DIR}/tools/go2-log" start
 
 declare -a CHILD_PIDS=()
 LAST_STARTED_PID=""
@@ -191,6 +196,7 @@ echo "/imu/data is active."
 
 echo "[3/3] Starting Super-LIO..."
 echo "Logs: ${LOG_DIR}"
+echo "Diagnostics: ${HOME}/go2_logs/sessions"
 echo "Check pose: ros2 topic echo /lio/odom"
 
-ros2 launch super_lio hesai.py "rviz:=${RVIZ}"
+ros2 launch super_lio hesai.py rviz:=false

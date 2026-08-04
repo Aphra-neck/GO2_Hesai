@@ -153,15 +153,18 @@ source install/setup.bash
 Jetson 内存有限，因此默认建议使用 `--executor sequential` 和 `MAKEFLAGS=-j2`。
 Super-LIO 的 LTO 默认关闭，以降低 ARM64 链接阶段的内存占用。
 
-编译完成后检查三个 ROS 2 包：
+编译完成后检查六个 ROS 2 包：
 
 ```bash
 ros2 pkg prefix hesai_ros_driver
 ros2 pkg prefix go2_imu_bridge
 ros2 pkg prefix super_lio
+ros2 pkg prefix utree_dog_msgs
+ros2 pkg prefix utree_dog_navigation
+ros2 pkg prefix utree_go2_sdk2_bridge
 ```
 
-三个命令都能输出安装路径，说明工作空间已被正确加载。
+六个命令都能输出安装路径，说明工作空间已被正确加载。
 
 仅重新编译 IMU 桥接器时，可以执行：
 
@@ -187,6 +190,16 @@ Go2 LowState
   -> Super-LIO ROS 2
   -> /lio/odom
   -> /lio/cloud_world
+
+/lio/odom + /lio/cloud_world + /goal_pose
+  -> utree_dog_navigation
+  -> /terrain_map
+  -> /terrain_costmap
+  -> /body_path
+
+/body_path + /lio/odom
+  -> utree_go2_sdk2_bridge (default: disabled)
+  -> Unitree SDK2 SportClient
 ```
 
 仓库包含：
@@ -195,7 +208,14 @@ Go2 LowState
 - `src/go2_imu_bridge`：使用 `rclcpp` 编写的 Unitree DDS 到 ROS 2 IMU 桥接器。
 - `src/Super-LIO`：来自 Super-LIO 上游 `ros2` 分支，并加入 Humble/ARM64
   兼容修正。具体来源见 `src/Super-LIO/UPSTREAM.md`。
+- `src/utree_dog_msgs`：地形规划所需的 ROS 2 自定义消息。
+- `src/utree_dog_navigation`：时序地形图和机身 lattice 路径规划器。
+- `src/utree_go2_sdk2_bridge`：将 `/body_path` 转换为受限的 Unitree SDK2
+  `SportClient` 指令，默认禁止运动。
 - `shell/start_slam.sh`：顺序启动雷达、IMU 桥接器和 Super-LIO 的脚本。
+- `shell/start_navigation.sh`：启动规划层和项目唯一的 RViz2。
+- `shell/start_sdk2_bridge.sh`：安全检查后启动默认禁用的路径执行器。
+- `tools/go2-log`：采集、检查、停止和上传有界诊断会话。
 
 ## 一键启动
 
@@ -213,11 +233,16 @@ cd ~/go2_hesai_ros2_ws
 3. 启动 Super-LIO。
 4. 退出时清理所有由脚本启动的 ROS 2 进程。
 
-默认不启动 RViz2。如需显示：
+感知启动脚本固定使用 `rviz:=false`，不会启动 RViz2。规划层拥有项目中唯一的
+RViz；在另一个终端启动：
 
 ```bash
-RVIZ=true ./shell/start_slam.sh
+cd ~/go2_hesai_ros2_ws
+./shell/start_navigation.sh
 ```
+
+规划脚本会先确认 `/lio/odom` 和 `/lio/cloud_world` 有数据，再启动地形构建、
+机身路径规划和规划 RViz。不要同时运行 Super-LIO 自带的第二个 RViz。
 
 可用环境变量：
 
@@ -225,7 +250,6 @@ RVIZ=true ./shell/start_slam.sh
 | --- | --- | --- |
 | `GO2_NETWORK_INTERFACE` | `enP8p1s0` | Unitree SDK2 接收 LowState 的网卡 |
 | `GO2_IMU_RATE` | `200.0` | IMU 最大发布频率，单位 Hz |
-| `RVIZ` | `false` | 是否启动 RViz2 |
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
 | `ROS_DOMAIN_ID` | `30` | ROS 2 domain；与 Unitree SDK 固定使用的 domain 0 隔离 |
 | `RMW_IMPLEMENTATION` | `rmw_fastrtps_cpp` | ROS 2 使用 Fast DDS，避免与 Unitree SDK 的 CycloneDDS 冲突 |
@@ -236,10 +260,118 @@ RVIZ=true ./shell/start_slam.sh
 ```bash
 GO2_NETWORK_INTERFACE=enP8p1s0 \
 GO2_IMU_RATE=200.0 \
-RVIZ=true \
 SLAM_LOG_DIR=~/slam_logs \
 ./shell/start_slam.sh
 ```
+
+### 规划和 RViz
+
+`shell/start_navigation.sh` 默认启动规划 RViz。固定坐标系为 `world`，显示
+`/lio/cloud_world`、`/lio/odom`、`/terrain_costmap` 和 `/body_path`，并通过
+`/goal_pose` 设置目标。世界点云使用 Best Effort QoS，RViz 累积时间为 10 秒。
+
+如果 RViz 在另一台 ROS 2 计算机运行，Jetson 只启动规划节点：
+
+```bash
+PLANNING_RVIZ=false ./shell/start_navigation.sh
+```
+
+规划配置已经和 Super-LIO 对齐：
+
+```yaml
+map_frame: world
+cloud_topic: /lio/cloud_world
+odom_topic: /lio/odom
+```
+
+坐标关系为 `world -> imu`（Super-LIO 动态发布）、`imu -> base_link`（单位变换）
+和 `imu -> hesai_lidar`（平移 `0.171 0 0.0908`，无旋转）。
+
+### SDK2 路径执行器
+
+规划路径验证完成后，可在第三个终端启动 SDK2 bridge：
+
+```bash
+./shell/start_sdk2_bridge.sh
+```
+
+脚本会拒绝与 RL `/lowcmd` 控制器并行运行；节点运行期间也会持续检查
+`/lowcmd` 发布者，一旦发现便立即禁用 SportClient 并停车。节点启动后仍为禁用状态；确认
+`/body_path`、`/lio/odom` 和机器人周边安全后，才可显式启用：
+
+`enabled:=true` 启动配置会被拒绝，不能绕过人工授权。路径、里程计或控制参数包含
+非有限值、非法四元数或不一致坐标系时，节点也会保持禁用并尝试停车。
+
+```bash
+ros2 service call /go2_sdk2_bridge/enable_motion \
+  std_srvs/srv/SetBool '{data: true}'
+```
+
+随时禁用并停车：
+
+```bash
+ros2 service call /go2_sdk2_bridge/enable_motion \
+  std_srvs/srv/SetBool '{data: false}'
+```
+
+如果 SDK2 尚未确认 `StopMove`，禁用服务会返回失败；节点仍保持禁用并按控制周期
+持续重试停车，在确认成功前拒绝再次启用。
+
+不要让 `utree_go2_sdk2_bridge` 和发布 `/lowcmd` 的 RL 控制器同时控制机器人。
+
+### 诊断日志
+
+三个启动脚本都会调用 `tools/go2-log start`。该命令是幂等的：同一会话已在采集时
+不会重复创建进程。采集内容包括 Git 版本、ROS/DDS 环境、网络、参数、进程状态、
+关键小消息和频率摘要以及 `/rosout` 警告/错误；不会复制完整雷达点云、世界点云或
+`TerrainGrid`。
+
+如需使用简短的全局命令，可在 Jetson 安装一次：
+
+```bash
+sudo install -m 0755 tools/go2-log /usr/local/bin/go2-log
+```
+
+以下示例假定已安装该命令；未安装时把 `go2-log` 替换为 `./tools/go2-log`。
+
+运行期间只查看状态：
+
+```bash
+go2-log status
+```
+
+先停止 SLAM、规划和 SDK2 bridge，再停止并上传诊断会话：
+
+```bash
+go2-log stop
+go2-log upload
+```
+
+`upload` 会在发现任一雷达、IMU、SLAM、规划、SDK2 或 RL 控制进程时拒绝 Git
+push。每个会话最多 100 MiB，本地最多保留 20 个；只有远端提交验证成功的旧会话
+才允许被清理。默认上传到公开仓库 `Aphra-neck/G02_log` 的 `main` 分支，并使用：
+
+```bash
+export GO2_LOG_PROXY=http://192.168.151.143:7890
+```
+
+Git 凭据由系统 credential helper 提供，禁止把 token 写入脚本、URL 或日志。
+
+Windows 本地拉取并分析：
+
+```powershell
+git -C D:\G02_log `
+  -c http.proxy=http://192.168.151.143:7890 `
+  -c https.proxy=http://192.168.151.143:7890 `
+  pull --ff-only origin main
+
+python .\tools\analyze_diagnostics.py `
+  D:\G02_log\sessions\<session-id>
+```
+
+分析器生成 Markdown 报告和 CSV 汇总，保留原始 JSONL。PCD、rosbag 和 core dump
+不得进入 Git；用 SCP 分别传到 `D:\GO2_Data\maps`、`D:\GO2_Data\bags` 和
+`D:\GO2_Data\cores`。详细约束见 `tools/README.md`。
 
 ## 分别启动各组件
 

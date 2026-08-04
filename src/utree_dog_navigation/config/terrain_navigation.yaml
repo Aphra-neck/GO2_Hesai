@@ -1,0 +1,51 @@
+terrain_mapper:
+  ros__parameters:
+    map_frame: world
+    cloud_topic: /lio/cloud_world
+    odom_topic: /lio/odom
+    resolution: 0.05
+    size_x: 40.0
+    size_y: 40.0
+    origin_x: -20.0
+    origin_y: -20.0
+    min_range: 0.35
+    max_range: 12.0
+    min_z_relative: -1.5
+    max_z_relative: 1.5
+    self_filter.length: 0.90
+    self_filter.width: 0.55
+    self_filter.height: 0.70
+    # Frame confidence is counted across scans; a sparse scan may contribute one point.
+    min_points_per_cell: 1
+    max_slope: 0.65
+    max_roughness: 0.08
+    max_step_height: 0.24
+    obstacle_height: 0.18
+    # XT-16 stair returns can be sparse. Fuse registered scans only within this window.
+    integration_window: 1.5
+    min_observed_frames: 4
+    height_bin_resolution: 0.015
+    confidence_frames: 8.0
+    publish_rate: 2.0
+
+body_lattice_planner:
+  ros__parameters:
+    terrain_map_topic: terrain_map
+    odom_topic: /lio/odom
+    goal_topic: /goal_pose
+    path_topic: body_path
+    yaw_bins: 16
+    motion_step: 0.20
+    nominal_body_height: 0.42
+    min_traversability: 0.18
+    max_step_height: 0.24
+    max_slope: 0.65
+    stair_height_threshold: 0.08
+    terrain_cost_weight: 4.0
+    slope_cost_weight: 1.5
+    height_cost_weight: 2.0
+    yaw_change_cost: 0.15
+    reverse_cost_factor: 1.15
+    lateral_cost_factor: 1.25
+    max_expansions: 250000
+    snap_radius: 0.50

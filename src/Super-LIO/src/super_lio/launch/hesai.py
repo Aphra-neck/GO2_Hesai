@@ -14,8 +14,8 @@ def generate_launch_description():
 
     declare_rviz_arg = DeclareLaunchArgument(
         'rviz',
-        default_value='true',
-        description='Whether to start RVIZ2'
+        default_value='false',
+        description='Whether to start RVIZ2 (the integrated workflow uses planning RViz)'
     )
     rviz_flag = LaunchConfiguration('rviz')
 

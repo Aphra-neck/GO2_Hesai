@@ -1,0 +1,1374 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+resolve_repository_root() {
+  local script_parent candidate
+  script_parent="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+  if [[ -n "${GO2_WORKSPACE:-}" ]]; then
+    candidate="${GO2_WORKSPACE}"
+  elif git -C "${script_parent}" rev-parse --show-toplevel >/dev/null 2>&1; then
+    candidate="$(git -C "${script_parent}" rev-parse --show-toplevel)"
+  elif git -C "${PWD}" rev-parse --show-toplevel >/dev/null 2>&1; then
+    candidate="$(git -C "${PWD}" rev-parse --show-toplevel)"
+  else
+    candidate="${PWD}"
+  fi
+  if [[ ! -d "${candidate}" ]]; then
+    echo "go2-log: workspace directory does not exist: ${candidate}" >&2
+    return 1
+  fi
+  (cd -- "${candidate}" && pwd)
+}
+
+REPO_ROOT="$(resolve_repository_root)"
+LOG_ROOT="${GO2_LOG_ROOT:-${HOME}/go2_logs}"
+SESSIONS_DIR="${LOG_ROOT}/sessions"
+ACTIVE_FILE="${LOG_ROOT}/active_session"
+LOCK_DIR="${LOG_ROOT}/.command-lock"
+LOCK_OWNER_FILE="${LOCK_DIR}/owner"
+LOG_REPO="${GO2_LOG_REPO:-${HOME}/G02_log}"
+LOG_REMOTE="${GO2_LOG_REMOTE:-https://github.com/Aphra-neck/G02_log.git}"
+LOG_BRANCH="${GO2_LOG_BRANCH:-main}"
+LOG_PROXY="${GO2_LOG_PROXY:-http://192.168.151.143:7890}"
+
+# Leave room for the independently bounded rosout and parameter-capture writers.
+readonly SESSION_STOP_BYTES=$((36 * 1024 * 1024))
+readonly SESSION_FINAL_BYTES=$((94 * 1024 * 1024))
+readonly SESSION_MAX_BYTES=$((100 * 1024 * 1024))
+readonly MAX_GIT_FILE_BYTES=$((40 * 1024 * 1024))
+readonly COMMAND_CAPTURE_BYTES=$((4 * 1024 * 1024))
+readonly MAX_LOCAL_SESSIONS=20
+
+readonly ROBOT_PROCESS_PATTERN='hesai_ros_driver_node|go2_imu_bridge_node|super_lio_node|terrain_mapper_node|body_lattice_planner_node|go2_sdk2_bridge_node|rl_controller_node|utree_go2_rl_controller'
+
+declare -ar COMPONENT_SPECS=(
+  'hesai_lidar:hesai_ros_driver_node'
+  'go2_imu_bridge:go2_imu_bridge_node'
+  'super_lio:super_lio_node'
+  'terrain_mapper:terrain_mapper_node'
+  'body_lattice_planner:body_lattice_planner_node'
+  'go2_sdk2_bridge:go2_sdk2_bridge_node'
+  'go2_rl_controller:rl_controller_node|utree_go2_rl_controller'
+)
+
+die() {
+  echo "go2-log: $*" >&2
+  exit 1
+}
+
+utc_now() {
+  date -u +'%Y-%m-%dT%H:%M:%SZ'
+}
+
+ensure_directories() {
+  mkdir -p -- "${SESSIONS_DIR}"
+}
+
+process_start_ticks() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  local stat_line stat_tail
+  local -a stat_fields=()
+  IFS= read -r stat_line < "/proc/${pid}/stat" || return 1
+  # The comm field is parenthesized and may itself contain spaces or ')'.
+  # Strip through its final delimiter; starttime is field 20 of the tail
+  # because the tail begins with the process state (the kernel's field 3).
+  stat_tail="${stat_line##*) }"
+  read -r -a stat_fields <<< "${stat_tail}"
+  (( ${#stat_fields[@]} >= 20 )) || return 1
+  [[ "${stat_fields[19]}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${stat_fields[19]}"
+}
+
+process_state() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  local stat_line stat_tail
+  IFS= read -r stat_line < "/proc/${pid}/stat" || return 1
+  stat_tail="${stat_line##*) }"
+  [[ -n "${stat_tail}" ]] || return 1
+  printf '%s\n' "${stat_tail%% *}"
+}
+
+boot_id() {
+  read_first_line /proc/sys/kernel/random/boot_id
+}
+
+lock_owner_is_live() {
+  [[ -r "${LOCK_OWNER_FILE}" ]] || return 1
+  local key value owner_pid='' owner_boot='' owner_start=''
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      pid) owner_pid="${value}" ;;
+      boot_id) owner_boot="${value}" ;;
+      start_ticks) owner_start="${value}" ;;
+    esac
+  done < "${LOCK_OWNER_FILE}"
+
+  [[ "${owner_pid}" =~ ^[1-9][0-9]*$ && -n "${owner_boot}" && -n "${owner_start}" ]] || return 1
+  [[ "$(boot_id 2>/dev/null || true)" == "${owner_boot}" ]] || return 1
+  kill -0 "${owner_pid}" 2>/dev/null || return 1
+  [[ "$(process_start_ticks "${owner_pid}" 2>/dev/null || true)" == "${owner_start}" ]] || return 1
+  [[ -r "/proc/${owner_pid}/cmdline" ]] || return 1
+  local command_line
+  command_line="$(tr '\0' ' ' < "/proc/${owner_pid}/cmdline")"
+  [[ "${command_line}" == *"go2-log"* ]]
+}
+
+release_lock() {
+  [[ -d "${LOCK_DIR}" && -r "${LOCK_OWNER_FILE}" ]] || return 0
+  local owner_pid
+  owner_pid="$(awk -F= '$1 == "pid" {print $2; exit}' "${LOCK_OWNER_FILE}")"
+  [[ "${owner_pid}" == "$$" ]] || return 0
+  rm -f -- "${LOCK_OWNER_FILE}"
+  rmdir -- "${LOCK_DIR}" 2>/dev/null || true
+}
+
+acquire_lock() {
+  ensure_directories
+  local attempt stale_dir age_seconds modified_at owner_pid
+  for attempt in 1 2 3; do
+    if mkdir -- "${LOCK_DIR}" 2>/dev/null; then
+      local owner_temp="${LOCK_OWNER_FILE}.tmp.$$"
+      {
+        echo "pid=$$"
+        echo "boot_id=$(boot_id)"
+        echo "start_ticks=$(process_start_ticks "$$")"
+        echo "created_at=$(utc_now)"
+      } > "${owner_temp}"
+      mv -f -- "${owner_temp}" "${LOCK_OWNER_FILE}"
+      trap release_lock EXIT
+      return 0
+    fi
+
+    if lock_owner_is_live; then
+      owner_pid="$(awk -F= '$1 == "pid" {print $2; exit}' "${LOCK_OWNER_FILE}")"
+      die "another go2-log command is running (PID ${owner_pid})"
+    fi
+
+    # Do not reclaim a directory while its owner file may still be initialized.
+    modified_at="$(stat -c '%Y' -- "${LOCK_DIR}" 2>/dev/null || echo 0)"
+    age_seconds=$(( $(date +%s) - modified_at ))
+    if [[ ! -r "${LOCK_OWNER_FILE}" && ${age_seconds} -lt 10 ]]; then
+      die "another go2-log command is initializing its lock"
+    fi
+
+    stale_dir="${LOCK_DIR}.stale.$$-${attempt}"
+    if mv -- "${LOCK_DIR}" "${stale_dir}" 2>/dev/null; then
+      find "${stale_dir}" -mindepth 1 -maxdepth 1 -type f -delete
+      rmdir -- "${stale_dir}" || die "stale lock contains unexpected entries: ${stale_dir}"
+    fi
+  done
+  die "could not acquire the go2-log command lock"
+}
+
+session_bytes() {
+  local session_dir="$1"
+  du -sb -- "${session_dir}" 2>/dev/null | awk '{print $1}' || echo 0
+}
+
+human_bytes() {
+  local bytes="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "${bytes}"
+  else
+    echo "${bytes} bytes"
+  fi
+}
+
+cap_text_file() {
+  local path="$1"
+  local max_bytes="${2:-${COMMAND_CAPTURE_BYTES}}"
+  [[ -f "${path}" && ! -L "${path}" ]] || return 0
+  local size
+  size="$(stat -c '%s' -- "${path}" 2>/dev/null || echo 0)"
+  (( size > max_bytes )) || return 0
+
+  python3 - "${path}" "${max_bytes}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+limit = int(sys.argv[2])
+marker = b"\n[go2-log: capture truncated to preserve the session size limit]\n"
+with path.open("rb") as stream:
+    data = stream.read(limit)
+prefix = data[: max(0, limit - len(marker))].decode("utf-8", errors="replace").encode("utf-8")
+while len(prefix) + len(marker) > limit:
+    prefix = prefix[:-1]
+temporary = path.with_name(path.name + ".bounded.tmp")
+temporary.write_bytes(prefix + marker)
+temporary.replace(path)
+PY
+}
+
+enforce_session_size_limit() {
+  local session_dir="$1"
+  local size
+  size="$(session_bytes "${session_dir}")"
+  (( size <= SESSION_FINAL_BYTES )) && return 0
+
+  printf '%s session captures were trimmed on approach to the 100 MiB safety ceiling\n' \
+    "$(utc_now)" > "${session_dir}/capacity_reached.txt"
+  cap_text_file "${session_dir}/rosout_warn_error.txt" $((16 * 1024 * 1024))
+  cap_text_file "${session_dir}/collector.log" $((4 * 1024 * 1024))
+
+  local path
+  for path in git.txt ros_dds_environment.txt network.txt system.txt topics.txt nodes.txt capacity_reached.txt; do
+    cap_text_file "${session_dir}/${path}" $((1 * 1024 * 1024))
+  done
+  while IFS= read -r -d '' path; do
+    cap_text_file "${path}" $((512 * 1024))
+  done < <(find "${session_dir}" -maxdepth 1 -type f -name 'parameters_*.yaml' -print0)
+  for path in topic_rates.csv odom_position.csv sdk2_commands.csv process_health.csv events.jsonl; do
+    cap_text_file "${session_dir}/${path}" $((8 * 1024 * 1024))
+  done
+
+  # Deterministically shrink only collector-owned text outputs. Unknown files
+  # are never altered; they remain subject to the upload payload validator.
+  python3 - "${session_dir}" $((93 * 1024 * 1024)) <<'PY'
+from pathlib import Path
+import os
+import sys
+
+root = Path(sys.argv[1])
+target = int(sys.argv[2])
+owned_names = {
+    "git.txt", "ros_dds_environment.txt", "network.txt", "system.txt",
+    "topics.txt", "nodes.txt", "rosout_warn_error.txt", "collector.log",
+    "topic_rates.csv", "odom_position.csv", "sdk2_commands.csv",
+    "process_health.csv", "events.jsonl", "capacity_reached.txt",
+    "rosout.identity",
+}
+
+def files() -> list[Path]:
+    return [path for path in root.rglob("*") if path.is_file() and not path.is_symlink()]
+
+def is_owned_text(path: Path) -> bool:
+    relative = path.relative_to(root)
+    if len(relative.parts) == 1:
+        return path.name in owned_names or (
+            path.name.startswith("parameters_") and path.suffix in {".yaml", ".tmp"}
+        )
+    return relative.parts[0] == "analysis" and path.suffix.lower() in {".md", ".csv", ".txt", ".json", ".jsonl"}
+
+current = sum(path.stat().st_size for path in files())
+marker = b"\n[go2-log: content trimmed to preserve the session size ceiling]\n"
+while current > target:
+    candidates = sorted(
+        (path for path in files() if is_owned_text(path) and path.stat().st_size > 4096),
+        key=lambda path: path.stat().st_size,
+        reverse=True,
+    )
+    if not candidates:
+        break
+    path = candidates[0]
+    old_size = path.stat().st_size
+    requested = max(4096, old_size - (current - target) - 1024 * 1024)
+    with path.open("rb") as stream:
+        data = stream.read(requested)
+    prefix = data[: max(0, requested - len(marker))].decode("utf-8", errors="replace").encode("utf-8")
+    while len(prefix) + len(marker) > requested:
+        prefix = prefix[:-1]
+    temporary = path.with_name(path.name + ".bounded.tmp")
+    temporary.write_bytes(prefix + marker)
+    temporary.replace(path)
+    current -= old_size - path.stat().st_size
+
+if current > target:
+    print("collector-owned text could not be compacted below the hard ceiling", file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+  size="$(session_bytes "${session_dir}")"
+  if (( size > SESSION_FINAL_BYTES )); then
+    echo "go2-log: session still exceeds the 94 MiB finalized-session ceiling" >&2
+    return 1
+  fi
+}
+
+collector_is_running() {
+  local pid="$1"
+  local session_dir="$2"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+  [[ -r "/proc/${pid}/cmdline" ]] || return 1
+
+  local command_line
+  command_line="$(tr '\0' ' ' < "/proc/${pid}/cmdline")"
+  [[ "${command_line}" == *"go2-log"* ]] &&
+    [[ "${command_line}" == *"_collect"* ]] &&
+    [[ "${command_line}" == *"${session_dir}"* ]]
+}
+
+rosout_identity_matches() {
+  local pid="$1"
+  local expected_boot_id="$2"
+  local expected_start_ticks="$3"
+  local session_dir="$4"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -n "${expected_boot_id}" && "${expected_start_ticks}" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "${session_dir}" ]] || return 1
+  [[ "$(boot_id 2>/dev/null || true)" == "${expected_boot_id}" ]] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+  [[ "$(process_start_ticks "${pid}" 2>/dev/null || true)" == "${expected_start_ticks}" ]] || return 1
+  [[ -r "/proc/${pid}/cmdline" ]] || return 1
+
+  local command_line
+  command_line="$(tr '\0' ' ' < "/proc/${pid}/cmdline")"
+  [[ "${command_line}" == *"go2-log"* ]] &&
+    [[ "${command_line}" == *"_rosout"* ]] &&
+    [[ "${command_line}" == *"${session_dir}"* ]]
+}
+
+write_rosout_identity() {
+  local session_dir="$1"
+  local pid="$2"
+  local captured_boot_id="$3"
+  local captured_start_ticks="$4"
+  local pgid identity_file temporary
+  pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+  identity_file="${session_dir}/rosout.identity"
+  temporary="${identity_file}.tmp.$$"
+  {
+    echo "pid=${pid}"
+    echo "boot_id=${captured_boot_id}"
+    echo "start_ticks=${captured_start_ticks}"
+    echo "pgid=${pgid:-unknown}"
+    echo "session_dir=${session_dir}"
+    echo "collector_pid=$$"
+    echo "captured_at=$(utc_now)"
+  } > "${temporary}"
+  mv -f -- "${temporary}" "${identity_file}"
+}
+
+capture_rosout_identity() {
+  local pid="$1"
+  local session_dir="$2"
+  local attempt captured_boot_id captured_start_ticks
+  for (( attempt = 0; attempt < 100; attempt++ )); do
+    captured_boot_id="$(boot_id 2>/dev/null || true)"
+    captured_start_ticks="$(process_start_ticks "${pid}" 2>/dev/null || true)"
+    if rosout_identity_matches \
+      "${pid}" "${captured_boot_id}" "${captured_start_ticks}" "${session_dir}"; then
+      write_rosout_identity \
+        "${session_dir}" "${pid}" "${captured_boot_id}" "${captured_start_ticks}"
+      printf '%s %s\n' "${captured_boot_id}" "${captured_start_ticks}"
+      return 0
+    fi
+    kill -0 "${pid}" 2>/dev/null || return 1
+    sleep 0.02
+  done
+  return 1
+}
+
+stop_rosout_collector_process() {
+  local pid="$1"
+  local expected_boot_id="$2"
+  local expected_start_ticks="$3"
+  local session_dir="$4"
+
+  # A child which no longer exists can be reaped without addressing a PID.
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    wait "${pid}" 2>/dev/null || true
+    return 0
+  fi
+
+  # A matching zombie is still the original child and only needs wait(2).
+  if [[ "$(boot_id 2>/dev/null || true)" == "${expected_boot_id}" ]] &&
+    [[ "$(process_start_ticks "${pid}" 2>/dev/null || true)" == "${expected_start_ticks}" ]] &&
+    [[ "$(process_state "${pid}" 2>/dev/null || true)" == Z ]]; then
+    wait "${pid}" 2>/dev/null || true
+    return 0
+  fi
+
+  rosout_identity_matches \
+    "${pid}" "${expected_boot_id}" "${expected_start_ticks}" "${session_dir}" || return 2
+
+  local pgid
+  pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+
+  # Close the check-to-signal window as much as shell APIs allow. Never signal
+  # after any identity field changes, even if the numeric PID is still live.
+  rosout_identity_matches \
+    "${pid}" "${expected_boot_id}" "${expected_start_ticks}" "${session_dir}" || return 2
+  if [[ "${pgid}" == "${pid}" ]]; then
+    kill -TERM -- "-${pid}" 2>/dev/null || return 1
+  else
+    kill -TERM "${pid}" 2>/dev/null || return 1
+  fi
+  wait "${pid}" 2>/dev/null || true
+}
+
+active_session_dir() {
+  [[ -f "${ACTIVE_FILE}" ]] || return 1
+  local session_dir
+  IFS= read -r session_dir < "${ACTIVE_FILE}"
+  [[ -n "${session_dir}" && -d "${session_dir}" ]] || return 1
+  printf '%s\n' "${session_dir}"
+}
+
+read_first_line() {
+  local path="$1"
+  local value=''
+  [[ -r "${path}" ]] || return 1
+  IFS= read -r value < "${path}" || [[ -n "${value}" ]]
+  printf '%s\n' "${value}"
+}
+
+append_event() {
+  local session_dir="$1"
+  local level="$2"
+  local category="$3"
+  local message="$4"
+
+  (( $(session_bytes "${session_dir}") < SESSION_STOP_BYTES )) || return 0
+  python3 - "${session_dir}/events.jsonl" "${level}" "${category}" "${message}" <<'PY'
+import datetime
+import json
+import sys
+
+path, level, category, message = sys.argv[1:]
+record = {
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "level": level,
+    "category": category,
+    "message": message,
+}
+with open(path, "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
+PY
+}
+
+source_ros_environment() {
+  if command -v ros2 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  set +u
+  if [[ -f /opt/ros/humble/setup.bash ]]; then
+    # shellcheck disable=SC1091
+    source /opt/ros/humble/setup.bash
+  fi
+  if [[ -f "${REPO_ROOT}/install/setup.bash" ]]; then
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/install/setup.bash"
+  fi
+  set -u
+}
+
+capture_static_context() {
+  local session_dir="$1"
+  local session_id="$2"
+
+  python3 - "${session_dir}/metadata.json" "${session_id}" "$(utc_now)" \
+    "$(hostname)" "${REPO_ROOT}" <<'PY'
+import json
+import platform
+import sys
+
+path, session_id, started_at, hostname, repository = sys.argv[1:]
+record = {
+    "schema_version": 1,
+    "session_id": session_id,
+    "started_at": started_at,
+    "hostname": hostname,
+    "machine": platform.machine(),
+    "platform": platform.platform(),
+    "source_repository": repository,
+    "size_limit_bytes": 100 * 1024 * 1024,
+}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(record, stream, ensure_ascii=True, indent=2)
+    stream.write("\n")
+PY
+
+  {
+    echo "captured_at=$(utc_now)"
+    echo "repository=${REPO_ROOT}"
+    echo "sha=$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "branch=$(git -C "${REPO_ROOT}" branch --show-current 2>/dev/null || echo unknown)"
+    echo "worktree_status:"
+    git -C "${REPO_ROOT}" status --short 2>/dev/null || true
+  } > "${session_dir}/git.txt"
+
+  env | LC_ALL=C sort | grep -E \
+    '^(ROS_|RMW_|CYCLONEDDS_URI=|FASTRTPS_DEFAULT_PROFILES_FILE=|FASTDDS_DEFAULT_PROFILES_FILE=|LD_LIBRARY_PATH=|GO2_NETWORK_INTERFACE=|GO2_IMU_RATE=)' \
+    > "${session_dir}/ros_dds_environment.txt" || true
+
+  {
+    echo "captured_at=$(utc_now)"
+    echo ""
+    echo "[addresses]"
+    ip -brief address 2>&1 || true
+    echo ""
+    echo "[routes]"
+    ip route 2>&1 || true
+    echo ""
+    echo "[neighbors]"
+    ip neigh 2>&1 || true
+  } > "${session_dir}/network.txt"
+
+  {
+    echo "captured_at=$(utc_now)"
+    uname -a
+    if command -v lsb_release >/dev/null 2>&1; then
+      lsb_release -a 2>&1 || true
+    fi
+  } > "${session_dir}/system.txt"
+
+  local context_file
+  for context_file in git.txt ros_dds_environment.txt network.txt system.txt; do
+    cap_text_file "${session_dir}/${context_file}"
+  done
+
+  printf 'timestamp,topic,average_hz,status\n' > "${session_dir}/topic_rates.csv"
+  printf 'timestamp,x,y,z,status\n' > "${session_dir}/odom_position.csv"
+  printf 'timestamp,vx,vy,yaw_rate,status\n' > "${session_dir}/sdk2_commands.csv"
+  printf 'timestamp,component,running,pids\n' > "${session_dir}/process_health.csv"
+  : > "${session_dir}/events.jsonl"
+  : > "${session_dir}/rosout_warn_error.txt"
+}
+
+capture_ros_graph() {
+  local session_dir="$1"
+  command -v ros2 >/dev/null 2>&1 || return 0
+  (( $(session_bytes "${session_dir}") < SESSION_STOP_BYTES )) || return 0
+
+  timeout 8 ros2 topic list -t > "${session_dir}/topics.txt.tmp" 2>&1 || true
+  cap_text_file "${session_dir}/topics.txt.tmp"
+  mv -f -- "${session_dir}/topics.txt.tmp" "${session_dir}/topics.txt"
+
+  local nodes
+  nodes="$(timeout 8 ros2 node list 2>/dev/null || true)"
+  printf '%s\n' "${nodes}" > "${session_dir}/nodes.txt"
+  cap_text_file "${session_dir}/nodes.txt"
+
+  local node safe_name output_file
+  while IFS= read -r node; do
+    [[ "${node}" =~ (super_lio|terrain_mapper|body_lattice_planner|go2_sdk2_bridge|go2_imu_bridge|hesai_ros_driver) ]] || continue
+    safe_name="$(printf '%s' "${node#/}" | tr -c 'A-Za-z0-9_.-' '_')"
+    output_file="${session_dir}/parameters_${safe_name}.yaml"
+    [[ -f "${output_file}" ]] && continue
+    timeout 8 ros2 param dump "${node}" > "${output_file}.tmp" 2>&1 || true
+    if [[ -s "${output_file}.tmp" ]]; then
+      cap_text_file "${output_file}.tmp"
+      mv -f -- "${output_file}.tmp" "${output_file}"
+    else
+      rm -f -- "${output_file}.tmp"
+    fi
+  done <<< "${nodes}"
+}
+
+sample_topic_rate() {
+  local session_dir="$1"
+  local topic="$2"
+  local result rate status timestamp
+  timestamp="$(utc_now)"
+
+  if ! command -v ros2 >/dev/null 2>&1; then
+    printf '%s,%s,,ros_unavailable\n' "${timestamp}" "${topic}" \
+      >> "${session_dir}/topic_rates.csv"
+    return 0
+  fi
+
+  result="$(LC_ALL=C timeout 4 ros2 topic hz "${topic}" --window 100 2>&1 || true)"
+  rate="$(awk '/average rate:/ {value=$3} END {print value}' <<< "${result}")"
+  if [[ "${rate}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    status=ok
+  else
+    rate=''
+    status=no_data
+  fi
+  printf '%s,%s,%s,%s\n' "${timestamp}" "${topic}" "${rate}" "${status}" \
+    >> "${session_dir}/topic_rates.csv"
+}
+
+sample_odom_position() {
+  local session_dir="$1"
+  local result x y z status timestamp
+  timestamp="$(utc_now)"
+  if ! command -v ros2 >/dev/null 2>&1; then
+    printf '%s,,,,ros_unavailable\n' "${timestamp}" >> "${session_dir}/odom_position.csv"
+    return 0
+  fi
+
+  result="$(timeout 3 ros2 topic echo --once --qos-profile sensor_data \
+    /lio/odom --field pose.pose.position 2>/dev/null || true)"
+  x="$(awk '$1 == "x:" {print $2; exit}' <<< "${result}")"
+  y="$(awk '$1 == "y:" {print $2; exit}' <<< "${result}")"
+  z="$(awk '$1 == "z:" {print $2; exit}' <<< "${result}")"
+  if [[ "${x}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] &&
+    [[ "${y}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] &&
+    [[ "${z}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+    status=ok
+  else
+    x=''
+    y=''
+    z=''
+    status=no_data
+  fi
+  printf '%s,%s,%s,%s,%s\n' "${timestamp}" "${x}" "${y}" "${z}" "${status}" \
+    >> "${session_dir}/odom_position.csv"
+}
+
+sample_sdk2_command() {
+  local session_dir="$1"
+  local result vx vy yaw_rate status timestamp
+  timestamp="$(utc_now)"
+  if ! command -v ros2 >/dev/null 2>&1; then
+    printf '%s,,,,ros_unavailable\n' "${timestamp}" >> "${session_dir}/sdk2_commands.csv"
+    return 0
+  fi
+
+  result="$(timeout 3 ros2 topic echo --once \
+    /sdk2_command geometry_msgs/msg/TwistStamped --field twist 2>/dev/null || true)"
+  vx="$(awk '
+    /^linear:$/ {section="linear"; next}
+    /^angular:$/ {section="angular"; next}
+    $1 == "x:" && section == "linear" {print $2; exit}
+  ' <<< "${result}")"
+  vy="$(awk '
+    /^linear:$/ {section="linear"; next}
+    /^angular:$/ {section="angular"; next}
+    $1 == "y:" && section == "linear" {print $2; exit}
+  ' <<< "${result}")"
+  yaw_rate="$(awk '
+    /^linear:$/ {section="linear"; next}
+    /^angular:$/ {section="angular"; next}
+    $1 == "z:" && section == "angular" {print $2; exit}
+  ' <<< "${result}")"
+
+  if [[ "${vx}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] &&
+    [[ "${vy}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] &&
+    [[ "${yaw_rate}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+    status=ok
+  else
+    vx=''
+    vy=''
+    yaw_rate=''
+    status=no_data
+  fi
+  printf '%s,%s,%s,%s,%s\n' \
+    "${timestamp}" "${vx}" "${vy}" "${yaw_rate}" "${status}" \
+    >> "${session_dir}/sdk2_commands.csv"
+}
+
+sample_process_health() {
+  local session_dir="$1"
+  local timestamp="$2"
+  local spec component pattern pids running previous
+  declare -n previous_states_ref="$3"
+
+  for spec in "${COMPONENT_SPECS[@]}"; do
+    component="${spec%%:*}"
+    pattern="${spec#*:}"
+    pids="$(pgrep -f "${pattern}" 2>/dev/null | paste -sd ';' - || true)"
+    if [[ -n "${pids}" ]]; then
+      running=1
+    else
+      running=0
+    fi
+    printf '%s,%s,%s,%s\n' "${timestamp}" "${component}" "${running}" "${pids}" \
+      >> "${session_dir}/process_health.csv"
+
+    previous="${previous_states_ref[${component}]:-unknown}"
+    if [[ "${previous}" != "${running}" ]]; then
+      if [[ "${running}" == 1 ]]; then
+        append_event "${session_dir}" info lifecycle "${component} started (pids=${pids})"
+      elif [[ "${previous}" != unknown ]]; then
+        append_event "${session_dir}" warning lifecycle "${component} stopped"
+      fi
+      previous_states_ref["${component}"]="${running}"
+    fi
+  done
+}
+
+run_rosout_collector() {
+  local session_dir="$1"
+  command -v ros2 >/dev/null 2>&1 || exit 0
+
+  # A 32 MiB per-file ceiling stays inside the headroom above the stop threshold.
+  ulimit -f 32768 2>/dev/null || true
+  ros2 topic echo /rosout 2>/dev/null | awk '
+    BEGIN { RS="---[[:space:]]*\n"; ORS="---\n" }
+    /(^|\n)level: (30|40|50)(\n|$)/ { print; fflush() }
+  ' >> "${session_dir}/rosout_warn_error.txt"
+}
+
+run_collector() {
+  local session_dir="$1"
+  local session_id
+  session_id="$(basename -- "${session_dir}")"
+  source_ros_environment
+
+  local stop_requested=0
+  local rosout_pid=''
+  local rosout_boot_id=''
+  local rosout_start_ticks=''
+  # Passed by name to sample_process_health via Bash's declare -n.
+  # shellcheck disable=SC2034
+  declare -A previous_states=()
+
+  request_stop() {
+    stop_requested=1
+  }
+
+  finish_collector() {
+    if [[ -n "${rosout_pid}" ]]; then
+      local rosout_stop_status=0
+      stop_rosout_collector_process \
+        "${rosout_pid}" "${rosout_boot_id}" "${rosout_start_ticks}" "${session_dir}" ||
+        rosout_stop_status=$?
+      if (( rosout_stop_status == 2 )); then
+        append_event "${session_dir}" warning collector \
+          "rosout identity mismatch for PID ${rosout_pid}; no signal was sent"
+      elif (( rosout_stop_status != 0 )); then
+        append_event "${session_dir}" warning collector \
+          "failed to stop the verified rosout process PID ${rosout_pid}"
+      fi
+      rosout_pid=''
+    fi
+    append_event "${session_dir}" info collector "collector stopped"
+    printf '%s\n' "$(utc_now)" > "${session_dir}/ended_at.txt"
+    enforce_session_size_limit "${session_dir}" ||
+      echo "WARNING: preserve the oversized session with SCP: ${session_dir}" >&2
+    if [[ -f "${ACTIVE_FILE}" ]] && [[ "$(< "${ACTIVE_FILE}")" == "${session_dir}" ]]; then
+      rm -f -- "${ACTIVE_FILE}"
+    fi
+  }
+
+  trap request_stop INT TERM
+  trap finish_collector EXIT
+
+  if command -v setsid >/dev/null 2>&1 && command -v ros2 >/dev/null 2>&1; then
+    setsid "${SCRIPT_DIR}/go2-log" _rosout "${session_dir}" &
+    rosout_pid="$!"
+    printf '%s\n' "${rosout_pid}" > "${session_dir}/rosout.pid"
+    local rosout_identity
+    if rosout_identity="$(capture_rosout_identity "${rosout_pid}" "${session_dir}")"; then
+      read -r rosout_boot_id rosout_start_ticks <<< "${rosout_identity}"
+    else
+      append_event "${session_dir}" warning collector \
+        "could not capture the complete rosout identity for PID ${rosout_pid}"
+    fi
+  fi
+
+  append_event "${session_dir}" info collector "collector started"
+  local graph_cycle=0 size timestamp topic
+  while (( stop_requested == 0 )); do
+    size="$(session_bytes "${session_dir}")"
+    if (( size >= SESSION_STOP_BYTES )); then
+      printf '%s session collection stopped at %s to enforce the 100 MiB limit\n' \
+        "$(utc_now)" "$(human_bytes "${size}")" > "${session_dir}/capacity_reached.txt"
+      break
+    fi
+
+    timestamp="$(utc_now)"
+    sample_process_health "${session_dir}" "${timestamp}" previous_states
+
+    if (( graph_cycle % 4 == 0 )); then
+      capture_ros_graph "${session_dir}"
+    fi
+    graph_cycle=$((graph_cycle + 1))
+
+    for topic in /imu/data /lio/odom /body_path /terrain_costmap /sdk2_command; do
+      (( stop_requested == 0 )) || break
+      (( $(session_bytes "${session_dir}") < SESSION_STOP_BYTES )) || break
+      sample_topic_rate "${session_dir}" "${topic}"
+    done
+    (( stop_requested == 0 )) || break
+    sample_odom_position "${session_dir}"
+    (( stop_requested == 0 )) || break
+    sample_sdk2_command "${session_dir}"
+
+    local slept=0
+    while (( slept < 10 && stop_requested == 0 )); do
+      sleep 1
+      slept=$((slept + 1))
+    done
+  done
+
+  # On a normal return, run cleanup while this function's local state is still
+  # in scope. The EXIT trap remains the fallback for errors and abrupt exits.
+  finish_collector
+  trap - EXIT INT TERM
+}
+
+start_session() {
+  acquire_lock
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+
+  local current pid
+  if current="$(active_session_dir 2>/dev/null)"; then
+    pid="$(read_first_line "${current}/collector.pid" 2>/dev/null || true)"
+    if collector_is_running "${pid}" "${current}"; then
+      echo "Diagnostic session is already running: $(basename -- "${current}")"
+      echo "Directory: ${current}"
+      echo "Collector PID: ${pid}"
+      return 0
+    fi
+    rm -f -- "${ACTIVE_FILE}"
+  fi
+
+  cleanup_uploaded_sessions 19
+  local session_count
+  session_count="$(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '.\n' | wc -l)"
+  if (( session_count >= MAX_LOCAL_SESSIONS )); then
+    die "${session_count} unuploaded sessions are retained; upload one before starting another"
+  fi
+
+  source_ros_environment
+
+  local host session_id session_dir temp_active collector_pid
+  host="$(hostname -s | tr -d '\n' | tr -c 'A-Za-z0-9_.-' '-')"
+  session_id="$(date -u +'%Y%m%dT%H%M%SZ')-${host}-$$"
+  session_dir="${SESSIONS_DIR}/${session_id}"
+  mkdir -m 0750 -- "${session_dir}"
+  capture_static_context "${session_dir}" "${session_id}"
+
+  temp_active="${ACTIVE_FILE}.tmp.$$"
+  printf '%s\n' "${session_dir}" > "${temp_active}"
+  mv -f -- "${temp_active}" "${ACTIVE_FILE}"
+
+  nohup "${SCRIPT_DIR}/go2-log" _collect "${session_dir}" \
+    >> "${session_dir}/collector.log" 2>&1 </dev/null &
+  collector_pid="$!"
+  printf '%s\n' "${collector_pid}" > "${session_dir}/collector.pid"
+
+  sleep 1
+  if ! collector_is_running "${collector_pid}" "${session_dir}"; then
+    rm -f -- "${ACTIVE_FILE}"
+    die "collector failed to start; see ${session_dir}/collector.log"
+  fi
+
+  echo "Started diagnostic session: ${session_id}"
+  echo "Directory: ${session_dir}"
+  echo "Collector PID: ${collector_pid}"
+}
+
+status_session() {
+  ensure_directories
+  local session_dir pid size
+  if session_dir="$(active_session_dir 2>/dev/null)"; then
+    pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+    size="$(session_bytes "${session_dir}")"
+    if collector_is_running "${pid}" "${session_dir}"; then
+      echo "Status: running"
+    else
+      echo "Status: stale (collector is not running)"
+    fi
+    echo "Session: $(basename -- "${session_dir}")"
+    echo "Directory: ${session_dir}"
+    echo "Collector PID: ${pid:-unknown}"
+    echo "Size: $(human_bytes "${size}") / 100 MiB"
+  else
+    echo "Status: stopped"
+    local latest
+    latest="$(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+    [[ -z "${latest}" ]] || echo "Latest session: ${latest}"
+  fi
+}
+
+stop_session() {
+  acquire_lock
+  local session_dir pid
+  session_dir="$(active_session_dir 2>/dev/null)" || die "no active session"
+  pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+
+  if ! collector_is_running "${pid}" "${session_dir}"; then
+    rm -f -- "${ACTIVE_FILE}"
+    die "removed stale active-session state; collector was not running"
+  fi
+
+  kill -TERM "${pid}"
+  for _ in {1..20}; do
+    collector_is_running "${pid}" "${session_dir}" || break
+    sleep 1
+  done
+  if collector_is_running "${pid}" "${session_dir}"; then
+    die "collector did not stop within 20 seconds; inspect PID ${pid} before taking further action"
+  fi
+
+  rm -f -- "${ACTIVE_FILE}"
+  echo "Stopped diagnostic session: $(basename -- "${session_dir}")"
+  echo "Directory: ${session_dir}"
+}
+
+running_robot_processes() {
+  pgrep -af "${ROBOT_PROCESS_PATTERN}" 2>/dev/null || true
+}
+
+assert_robot_idle() {
+  local processes
+  processes="$(running_robot_processes)"
+  if [[ -n "${processes}" ]]; then
+    echo "Refusing Git push while robot/SLAM/planning processes are running:" >&2
+    echo "${processes}" >&2
+    return 1
+  fi
+}
+
+validate_session_for_upload() {
+  local session_dir="$1"
+  local allow_oversized_text="${2:-false}"
+  [[ -d "${session_dir}" && ! -L "${session_dir}" ]] || die "invalid session directory: ${session_dir}"
+  local size
+  size="$(session_bytes "${session_dir}")"
+  if [[ "${allow_oversized_text}" != true ]]; then
+    (( size <= SESSION_MAX_BYTES )) || die "session exceeds 100 MiB; preserve it with SCP instead of Git"
+  fi
+
+  local max_file_bytes="${MAX_GIT_FILE_BYTES}"
+  [[ "${allow_oversized_text}" != true ]] || max_file_bytes=0
+  if ! python3 - "${session_dir}" "${max_file_bytes}" <<'PY'
+from pathlib import Path
+import os
+import re
+import stat
+import sys
+
+root = Path(sys.argv[1])
+max_file_bytes = int(sys.argv[2])
+artifact_pattern = re.compile(
+    r"(?:^|\.)(?:pcd|ply|las|bag|bag2|db3|sqlite3|mcap|pcap)(?:\.|$)", re.IGNORECASE
+)
+archive_suffixes = (
+    ".zip", ".7z", ".rar", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".zst", ".lz4"
+)
+binary_magic = (
+    b"\x7fELF", b"PK\x03\x04", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00",
+    b"(\xb5/\xfd", b"7z\xbc\xaf'\x1c", b"Rar!\x1a\x07", b"SQLite format 3\x00",
+    b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"%PDF-",
+)
+allowed_controls = {9, 10, 12, 13, 27}
+
+def reject(message: str) -> None:
+    print(f"go2-log payload rejection: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+for directory, dirnames, filenames in os.walk(root, followlinks=False):
+    directory_path = Path(directory)
+    for dirname in list(dirnames):
+        path = directory_path / dirname
+        if path.is_symlink():
+            reject(f"symbolic-link directory: {path.relative_to(root)}")
+    for filename in filenames:
+        path = directory_path / filename
+        relative = path.relative_to(root)
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            reject(f"non-regular file: {relative}")
+        lower_name = filename.lower()
+        if artifact_pattern.search(lower_name) or re.match(r"^core(?:\.|$)", lower_name):
+            reject(f"runtime artifact filename: {relative}")
+        if lower_name.endswith(archive_suffixes):
+            reject(f"archive/compressed filename: {relative}")
+        size = path.stat().st_size
+        if max_file_bytes and size > max_file_bytes:
+            reject(f"file exceeds {max_file_bytes} bytes: {relative} ({size} bytes)")
+        if size == 0:
+            continue
+        controls = 0
+        inspected = 0
+        first = b""
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                if not first:
+                    first = chunk[:4096]
+                    if any(first.startswith(magic) for magic in binary_magic):
+                        reject(f"binary file signature: {relative}")
+                    if b"FIELDS " in first and b"POINTS " in first and b"DATA " in first:
+                        reject(f"PCD content: {relative}")
+                if b"\x00" in chunk:
+                    reject(f"NUL-containing binary file: {relative}")
+                controls += sum(byte < 32 and byte not in allowed_controls for byte in chunk)
+                inspected += len(chunk)
+        if controls > 16 and controls * 100 > inspected:
+            reject(f"binary control-byte content: {relative}")
+PY
+  then
+    die "session contains a forbidden or unsafe Git payload: ${session_dir}"
+  fi
+}
+
+git_with_proxy() {
+  git -c "http.proxy=${LOG_PROXY}" -c "https.proxy=${LOG_PROXY}" "$@"
+}
+
+canonical_git_remote() {
+  python3 - "$1" <<'PY'
+import os
+import posixpath
+import re
+import sys
+from urllib.parse import unquote, urlsplit
+
+value = sys.argv[1].strip()
+if not value or any(character in value for character in "\r\n\0"):
+    raise SystemExit("invalid empty or multiline Git remote")
+
+scp = re.fullmatch(r"(?:([^@/:]+)@)?([^/:]+):(.+)", value)
+if scp and "://" not in value:
+    host = scp.group(2).lower()
+    path = scp.group(3)
+    if "?" in path or "#" in path:
+        raise SystemExit("Git remote query strings and fragments are forbidden")
+    kind = "remote"
+else:
+    parsed = urlsplit(value)
+    if parsed.query or parsed.fragment:
+        raise SystemExit("Git remote query strings and fragments are forbidden")
+    if parsed.scheme in {"http", "https"}:
+        if parsed.username is not None or parsed.password is not None:
+            raise SystemExit("embedded HTTP Git credentials are forbidden")
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        default_port = 80 if parsed.scheme == "http" else 443
+        path = unquote(parsed.path)
+        kind = "remote"
+    elif parsed.scheme in {"ssh", "git"}:
+        if parsed.password is not None:
+            raise SystemExit("embedded SSH password is forbidden")
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        default_port = 22 if parsed.scheme == "ssh" else 9418
+        path = unquote(parsed.path)
+        kind = "remote"
+    elif parsed.scheme == "file":
+        if parsed.hostname not in (None, "", "localhost"):
+            raise SystemExit("non-local file:// Git remote is forbidden")
+        print("local:" + os.path.realpath(os.path.expanduser(unquote(parsed.path))))
+        raise SystemExit(0)
+    elif parsed.scheme:
+        raise SystemExit(f"unsupported Git remote scheme: {parsed.scheme}")
+    else:
+        print("local:" + os.path.realpath(os.path.expanduser(value)))
+        raise SystemExit(0)
+
+if not host:
+    raise SystemExit("Git remote has no host")
+path = posixpath.normpath("/" + path).lstrip("/")
+if path.lower().endswith(".git"):
+    path = path[:-4]
+if not path or path == ".":
+    raise SystemExit("Git remote has no repository path")
+if host == "github.com":
+    path = path.lower()
+if 'port' in locals() and port not in (None, default_port):
+    host = f"{host}:{port}"
+print(f"remote:{host}/{path}")
+PY
+}
+
+assert_log_remote_identity() {
+  local expected actual canonical
+  if ! expected="$(canonical_git_remote "${LOG_REMOTE}")"; then
+    die "GO2_LOG_REMOTE is invalid or embeds credentials"
+  fi
+  local -a urls=()
+  mapfile -t urls < <(git -C "${LOG_REPO}" remote get-url --all origin 2>/dev/null || true)
+  (( ${#urls[@]} > 0 )) || die "log repository has no origin fetch URL"
+  for actual in "${urls[@]}"; do
+    canonical="$(canonical_git_remote "${actual}")" || die "origin has an invalid fetch URL"
+    [[ "${canonical}" == "${expected}" ]] ||
+      die "origin fetch URL is not GO2_LOG_REMOTE (${canonical} != ${expected})"
+  done
+  urls=()
+  mapfile -t urls < <(git -C "${LOG_REPO}" remote get-url --push --all origin 2>/dev/null || true)
+  (( ${#urls[@]} > 0 )) || die "log repository has no origin push URL"
+  for actual in "${urls[@]}"; do
+    canonical="$(canonical_git_remote "${actual}")" || die "origin has an invalid push URL"
+    [[ "${canonical}" == "${expected}" ]] ||
+      die "origin push URL is not GO2_LOG_REMOTE (${canonical} != ${expected})"
+  done
+  LOG_REMOTE_IDENTITY="${expected}"
+}
+
+ensure_log_repository_identity() {
+  local name email source_name source_email
+  name="$(git -C "${LOG_REPO}" config --local --get user.name 2>/dev/null || true)"
+  email="$(git -C "${LOG_REPO}" config --local --get user.email 2>/dev/null || true)"
+  [[ -n "${name}" && -n "${email}" ]] && return 0
+
+  source_name="$(git -C "${REPO_ROOT}" show -s --format='%an' HEAD 2>/dev/null || true)"
+  source_email="$(git -C "${REPO_ROOT}" show -s --format='%ae' HEAD 2>/dev/null || true)"
+  if [[ -z "${source_name}" || -z "${source_email}" ]]; then
+    die "log repository has no local Git identity and the GO2_Hesai commit author could not be read"
+  fi
+
+  if [[ -z "${name}" ]]; then
+    git -C "${LOG_REPO}" config --local user.name "${source_name}"
+  fi
+  if [[ -z "${email}" ]]; then
+    git -C "${LOG_REPO}" config --local user.email "${source_email}"
+  fi
+}
+
+assert_local_commits_are_diagnostic_only() {
+  local upstream="$1"
+  local commit path
+  while IFS= read -r commit; do
+    [[ -n "${commit}" ]] || continue
+    while IFS= read -r -d '' path; do
+      [[ "${path}" == sessions/* ]] ||
+        die "local log-repository commit contains unrelated path: ${path}"
+    done < <(git -C "${LOG_REPO}" diff-tree --root --no-commit-id --name-only -r -z "${commit}")
+  done < <(git -C "${LOG_REPO}" rev-list "${upstream}..HEAD")
+}
+
+prepare_log_repository() {
+  local session_id="$1"
+  local parent expected unrelated session_path destination
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+  expected="$(canonical_git_remote "${LOG_REMOTE}")" ||
+    die "GO2_LOG_REMOTE is invalid or embeds credentials"
+  if [[ ! -d "${LOG_REPO}/.git" ]]; then
+    [[ ! -e "${LOG_REPO}" ]] || die "GO2_LOG_REPO exists but is not a Git checkout: ${LOG_REPO}"
+    parent="$(dirname -- "${LOG_REPO}")"
+    mkdir -p -- "${parent}"
+    git_with_proxy clone "${LOG_REMOTE}" "${LOG_REPO}"
+  fi
+
+  [[ -d "${LOG_REPO}/.git" ]] || die "not a Git repository: ${LOG_REPO}"
+  assert_log_remote_identity
+  ensure_log_repository_identity
+
+  session_path="sessions/${session_id}"
+  unrelated="$(git -C "${LOG_REPO}" status --porcelain --untracked-files=all -- . \
+    ":(exclude)${session_path}" 2>/dev/null || true)"
+  [[ -z "${unrelated}" ]] || die "log repository has unrelated local changes:\n${unrelated}"
+
+  # A failed copy/add/commit is recoverable because the source session remains
+  # authoritative. Clear only this session path, never any unrelated work.
+  if [[ -n "$(git -C "${LOG_REPO}" status --porcelain --untracked-files=all -- "${session_path}")" ]]; then
+    destination="${LOG_REPO}/${session_path}"
+    rm -rf -- "${destination}"
+    git -C "${LOG_REPO}" reset -q HEAD -- "${session_path}" 2>/dev/null || true
+    if git -C "${LOG_REPO}" cat-file -e "HEAD:${session_path}" 2>/dev/null; then
+      git -C "${LOG_REPO}" checkout HEAD -- "${session_path}"
+    fi
+  fi
+
+  git_with_proxy -C "${LOG_REPO}" fetch origin
+  if git -C "${LOG_REPO}" show-ref --verify --quiet "refs/heads/${LOG_BRANCH}"; then
+    git -C "${LOG_REPO}" checkout "${LOG_BRANCH}"
+  elif git -C "${LOG_REPO}" show-ref --verify --quiet "refs/remotes/origin/${LOG_BRANCH}"; then
+    git -C "${LOG_REPO}" checkout --track -b "${LOG_BRANCH}" "origin/${LOG_BRANCH}"
+  else
+    git -C "${LOG_REPO}" checkout -b "${LOG_BRANCH}"
+  fi
+
+  if git -C "${LOG_REPO}" show-ref --verify --quiet "refs/remotes/origin/${LOG_BRANCH}"; then
+    assert_local_commits_are_diagnostic_only "origin/${LOG_BRANCH}"
+    if git -C "${LOG_REPO}" merge-base --is-ancestor HEAD "origin/${LOG_BRANCH}"; then
+      git -C "${LOG_REPO}" merge --ff-only "origin/${LOG_BRANCH}"
+    elif ! git -C "${LOG_REPO}" merge-base --is-ancestor "origin/${LOG_BRANCH}" HEAD; then
+      if ! git -C "${LOG_REPO}" rebase "origin/${LOG_BRANCH}"; then
+        git -C "${LOG_REPO}" rebase --abort 2>/dev/null || true
+        die "could not replay the pending diagnostic commit onto origin/${LOG_BRANCH}"
+      fi
+    fi
+  fi
+}
+
+cleanup_uploaded_sessions() {
+  local retention_limit="${1:-${MAX_LOCAL_SESSIONS}}"
+  local total candidate resolved_root resolved_candidate
+  total="$(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '.\n' | wc -l)"
+  (( total > retention_limit )) || return 0
+  resolved_root="$(realpath -- "${SESSIONS_DIR}")"
+
+  while IFS= read -r candidate; do
+    (( total > retention_limit )) || break
+    [[ -f "${candidate}/.uploaded" && ! -L "${candidate}" ]] || continue
+    resolved_candidate="$(realpath -- "${candidate}")"
+    [[ "${resolved_candidate}" == "${resolved_root}/"* ]] || continue
+    rm -rf -- "${resolved_candidate}"
+    total=$((total - 1))
+    echo "Removed verified uploaded session: $(basename -- "${candidate}")"
+  done < <(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%p\n' | LC_ALL=C sort)
+
+  if (( total > retention_limit )); then
+    echo "WARNING: ${total} sessions remain because unuploaded sessions are never deleted." >&2
+  fi
+}
+
+validate_session_id() {
+  local session_id="$1"
+  [[ ${#session_id} -le 160 ]] || die "session ID is too long"
+  [[ "${session_id}" =~ ^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9_.-]+-[1-9][0-9]*$ ]] ||
+    die "invalid session ID: ${session_id}"
+}
+
+select_session() {
+  local requested="${1:-}"
+  if [[ -n "${requested}" ]]; then
+    validate_session_id "${requested}"
+    printf '%s\n' "${SESSIONS_DIR}/${requested}"
+    return 0
+  fi
+
+  local latest
+  latest="$(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d ! -exec test -e '{}/.uploaded' \; \
+    -printf '%f\n' 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+  [[ -n "${latest}" ]] || die "no unuploaded session found"
+  printf '%s\n' "${SESSIONS_DIR}/${latest}"
+}
+
+validate_staged_session() {
+  local session_id="$1"
+  local session_path="sessions/${session_id}"
+  local destination="${LOG_REPO}/${session_path}"
+  local unrelated path staged_hash worktree_hash
+
+  unrelated="$(git -C "${LOG_REPO}" status --porcelain --untracked-files=all -- . \
+    ":(exclude)${session_path}" 2>/dev/null || true)"
+  [[ -z "${unrelated}" ]] || die "unrelated log-repository changes detected:\n${unrelated}"
+  validate_session_for_upload "${destination}"
+
+  while IFS= read -r -d '' path; do
+    [[ "${path}" == "${session_path}"/* ]] ||
+      die "staged change escaped the selected session: ${path}"
+  done < <(git -C "${LOG_REPO}" diff --cached --name-only -z)
+
+  while IFS= read -r -d '' path; do
+    [[ -f "${LOG_REPO}/${path}" && ! -L "${LOG_REPO}/${path}" ]] ||
+      die "staged file is not a regular worktree file: ${path}"
+    staged_hash="$(git -C "${LOG_REPO}" rev-parse --verify ":${path}")"
+    worktree_hash="$(git -C "${LOG_REPO}" hash-object -- "${LOG_REPO}/${path}")"
+    [[ "${staged_hash}" == "${worktree_hash}" ]] ||
+      die "file changed after validation and staging: ${path}"
+  done < <(git -C "${LOG_REPO}" diff --cached --name-only --diff-filter=ACMRT -z -- "${session_path}")
+}
+
+upload_session() {
+  acquire_lock
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+  local session_dir session_id active destination local_sha remote_sha collector_pid
+  session_dir="$(select_session "${1:-}")"
+  session_id="$(basename -- "${session_dir}")"
+  validate_session_id "${session_id}"
+
+  if [[ -f "${session_dir}/.uploaded" ]]; then
+    echo "Session is already verified as uploaded: ${session_id}"
+    cleanup_uploaded_sessions
+    return 0
+  fi
+
+  if active="$(active_session_dir 2>/dev/null)"; then
+    die "collection is active ($(basename -- "${active}")); stop it before upload"
+  fi
+  collector_pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+  if collector_is_running "${collector_pid}" "${session_dir}"; then
+    die "selected session is still being collected by PID ${collector_pid}"
+  fi
+  assert_robot_idle || die "stop all robot processes before uploading diagnostics"
+
+  # Reject artifacts and binary data before any optional text compaction can
+  # alter a stopped session. The strict size checks run after compaction.
+  validate_session_for_upload "${session_dir}" true
+  enforce_session_size_limit "${session_dir}" ||
+    die "session remains oversized; preserve it with SCP before removing it"
+  validate_session_for_upload "${session_dir}"
+
+  prepare_log_repository "${session_id}"
+  destination="${LOG_REPO}/sessions/${session_id}"
+  rm -rf -- "${destination}"
+  mkdir -p -- "${destination}"
+  cp -a -- "${session_dir}/." "${destination}/"
+  rm -f -- "${destination}/.uploaded"
+  validate_session_for_upload "${destination}"
+
+  git -C "${LOG_REPO}" add -A -- "sessions/${session_id}"
+  validate_staged_session "${session_id}"
+  if ! git -C "${LOG_REPO}" diff --cached --quiet -- "sessions/${session_id}"; then
+    git -C "${LOG_REPO}" commit -m "Add diagnostic session ${session_id}" -- "sessions/${session_id}"
+  fi
+
+  # The clone/copy/commit phase can take long enough for a robot process to
+  # start after the first check. Re-check immediately before network push.
+  assert_robot_idle || die "robot process started during upload; the local commit is retained for retry"
+  git_with_proxy -C "${LOG_REPO}" push origin "HEAD:refs/heads/${LOG_BRANCH}"
+  local_sha="$(git -C "${LOG_REPO}" rev-parse HEAD)"
+  remote_sha="$(git_with_proxy -C "${LOG_REPO}" ls-remote origin "refs/heads/${LOG_BRANCH}" | awk '{print $1}')"
+  [[ -n "${remote_sha}" && "${remote_sha}" == "${local_sha}" ]] ||
+    die "push could not be verified; local logs were preserved"
+
+  {
+    echo "uploaded_at=$(utc_now)"
+    echo "repository_identity=${LOG_REMOTE_IDENTITY}"
+    echo "branch=${LOG_BRANCH}"
+    echo "commit=${local_sha}"
+  } > "${session_dir}/.uploaded"
+
+  echo "Uploaded and verified session: ${session_id}"
+  echo "Commit: ${local_sha}"
+  cleanup_uploaded_sessions
+}
+
+show_usage() {
+  cat <<'EOF'
+Usage: go2-log <command> [arguments]
+
+Commands:
+  start                 Start a bounded diagnostic session.
+  status                Show collector state and session size.
+  stop                  Stop the active diagnostic session cleanly.
+  upload [SESSION_ID]   Push a stopped session to Aphra-neck/G02_log.
+
+Environment:
+  GO2_LOG_ROOT          Runtime root (default: ~/go2_logs)
+  GO2_WORKSPACE         GO2_Hesai workspace (default: current Git checkout)
+  GO2_LOG_REPO          Local G02_log checkout (default: ~/G02_log)
+  GO2_LOG_PROXY         Git HTTP(S) proxy (default: http://192.168.151.143:7890)
+  GO2_LOG_REMOTE        Git remote URL
+  GO2_LOG_BRANCH        Git branch (default: main)
+EOF
+}
+
+main() {
+  local command="${1:-}"
+  case "${command}" in
+    start)
+      [[ $# -eq 1 ]] || die "start takes no arguments"
+      start_session
+      ;;
+    status)
+      [[ $# -eq 1 ]] || die "status takes no arguments"
+      status_session
+      ;;
+    stop)
+      [[ $# -eq 1 ]] || die "stop takes no arguments"
+      stop_session
+      ;;
+    upload)
+      [[ $# -le 2 ]] || die "upload accepts at most one session ID"
+      upload_session "${2:-}"
+      ;;
+    _collect)
+      [[ $# -eq 2 ]] || exit 2
+      run_collector "$2"
+      ;;
+    _rosout)
+      [[ $# -eq 2 ]] || exit 2
+      run_rosout_collector "$2"
+      ;;
+    -h|--help|help)
+      show_usage
+      ;;
+    *)
+      show_usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
