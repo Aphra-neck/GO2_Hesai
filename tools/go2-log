@@ -41,12 +41,13 @@ readonly MAX_GIT_FILE_BYTES=$((40 * 1024 * 1024))
 readonly COMMAND_CAPTURE_BYTES=$((4 * 1024 * 1024))
 readonly MAX_LOCAL_SESSIONS=20
 
-readonly ROBOT_PROCESS_PATTERN='hesai_ros_driver_node|go2_imu_bridge_node|super_lio_node|terrain_mapper_node|body_lattice_planner_node|go2_sdk2_bridge_node|rl_controller_node|utree_go2_rl_controller'
+readonly ROBOT_PROCESS_PATTERN='hesai_ros_driver_node|go2_imu_bridge_node|super_lio_node|body_odom_adapter_node|terrain_mapper_node|body_lattice_planner_node|go2_sdk2_bridge_node|rl_controller_node|utree_go2_rl_controller'
 
 declare -ar COMPONENT_SPECS=(
   'hesai_lidar:hesai_ros_driver_node'
   'go2_imu_bridge:go2_imu_bridge_node'
   'super_lio:super_lio_node'
+  'body_odom_adapter:body_odom_adapter_node'
   'terrain_mapper:terrain_mapper_node'
   'body_lattice_planner:body_lattice_planner_node'
   'go2_sdk2_bridge:go2_sdk2_bridge_node'
@@ -222,7 +223,7 @@ enforce_session_size_limit() {
   while IFS= read -r -d '' path; do
     cap_text_file "${path}" $((512 * 1024))
   done < <(find "${session_dir}" -maxdepth 1 -type f -name 'parameters_*.yaml' -print0)
-  for path in topic_rates.csv odom_position.csv sdk2_commands.csv process_health.csv events.jsonl; do
+  for path in topic_rates.csv odom_position.csv body_odom_pose.csv sdk2_commands.csv process_health.csv events.jsonl; do
     cap_text_file "${session_dir}/${path}" $((8 * 1024 * 1024))
   done
 
@@ -238,7 +239,7 @@ target = int(sys.argv[2])
 owned_names = {
     "git.txt", "ros_dds_environment.txt", "network.txt", "system.txt",
     "topics.txt", "nodes.txt", "rosout_warn_error.txt", "collector.log",
-    "topic_rates.csv", "odom_position.csv", "sdk2_commands.csv",
+    "topic_rates.csv", "odom_position.csv", "body_odom_pose.csv", "sdk2_commands.csv",
     "process_health.csv", "events.jsonl", "capacity_reached.txt",
     "rosout.identity",
 }
@@ -459,6 +460,19 @@ source_ros_environment() {
   set -u
 }
 
+record_active_runtime_overrides() {
+  local session_dir="$1"
+  local body_yaw_offset="${GO2_BODY_YAW_OFFSET_RAD:-}"
+  [[ -n "${body_yaw_offset}" ]] || return 0
+  if [[ ! "${body_yaw_offset}" =~ ^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$ ]]; then
+    append_event "${session_dir}" warning configuration \
+      "ignored invalid GO2_BODY_YAW_OFFSET_RAD from a repeated start command"
+    return 0
+  fi
+  printf 'GO2_BODY_YAW_OFFSET_RAD=%s\n' "${body_yaw_offset}" \
+    >> "${session_dir}/ros_dds_environment.txt"
+}
+
 capture_static_context() {
   local session_dir="$1"
   local session_id="$2"
@@ -495,7 +509,7 @@ PY
   } > "${session_dir}/git.txt"
 
   env | LC_ALL=C sort | grep -E \
-    '^(ROS_|RMW_|CYCLONEDDS_URI=|FASTRTPS_DEFAULT_PROFILES_FILE=|FASTDDS_DEFAULT_PROFILES_FILE=|LD_LIBRARY_PATH=|GO2_NETWORK_INTERFACE=|GO2_IMU_RATE=)' \
+    '^(ROS_|RMW_|CYCLONEDDS_URI=|FASTRTPS_DEFAULT_PROFILES_FILE=|FASTDDS_DEFAULT_PROFILES_FILE=|LD_LIBRARY_PATH=|GO2_NETWORK_INTERFACE=|GO2_IMU_RATE=|GO2_BODY_YAW_OFFSET_RAD=)' \
     > "${session_dir}/ros_dds_environment.txt" || true
 
   {
@@ -525,7 +539,10 @@ PY
   done
 
   printf 'timestamp,topic,average_hz,status\n' > "${session_dir}/topic_rates.csv"
-  printf 'timestamp,x,y,z,status\n' > "${session_dir}/odom_position.csv"
+  local odometry_header
+  odometry_header='timestamp,topic,ros_stamp_ns,frame_id,child_frame_id,x,y,z,qx,qy,qz,qw,yaw,status'
+  printf '%s\n' "${odometry_header}" > "${session_dir}/odom_position.csv"
+  printf '%s\n' "${odometry_header}" > "${session_dir}/body_odom_pose.csv"
   printf 'timestamp,vx,vy,yaw_rate,status\n' > "${session_dir}/sdk2_commands.csv"
   printf 'timestamp,component,running,pids\n' > "${session_dir}/process_health.csv"
   : > "${session_dir}/events.jsonl"
@@ -548,7 +565,7 @@ capture_ros_graph() {
 
   local node safe_name output_file
   while IFS= read -r node; do
-    [[ "${node}" =~ (super_lio|terrain_mapper|body_lattice_planner|go2_sdk2_bridge|go2_imu_bridge|hesai_ros_driver) ]] || continue
+    [[ "${node}" =~ (super_lio|body_odom_adapter|terrain_mapper|body_lattice_planner|go2_sdk2_bridge|go2_imu_bridge|hesai_ros_driver) ]] || continue
     safe_name="$(printf '%s' "${node#/}" | tr -c 'A-Za-z0-9_.-' '_')"
     output_file="${session_dir}/parameters_${safe_name}.yaml"
     [[ -f "${output_file}" ]] && continue
@@ -586,32 +603,166 @@ sample_topic_rate() {
     >> "${session_dir}/topic_rates.csv"
 }
 
-sample_odom_position() {
+sample_odometry_pair() {
   local session_dir="$1"
-  local result x y z status timestamp
+  local timestamp
   timestamp="$(utc_now)"
-  if ! command -v ros2 >/dev/null 2>&1; then
-    printf '%s,,,,ros_unavailable\n' "${timestamp}" >> "${session_dir}/odom_position.csv"
-    return 0
-  fi
+  if ! timeout 5 python3 - \
+    "${session_dir}/odom_position.csv" \
+    "${session_dir}/body_odom_pose.csv" \
+    "${timestamp}" <<'PY'
+import csv
+import math
+from pathlib import Path
+import sys
+import time
 
-  result="$(timeout 3 ros2 topic echo --once --qos-profile sensor_data \
-    /lio/odom --field pose.pose.position 2>/dev/null || true)"
-  x="$(awk '$1 == "x:" {print $2; exit}' <<< "${result}")"
-  y="$(awk '$1 == "y:" {print $2; exit}' <<< "${result}")"
-  z="$(awk '$1 == "z:" {print $2; exit}' <<< "${result}")"
-  if [[ "${x}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] &&
-    [[ "${y}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] &&
-    [[ "${z}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
-    status=ok
-  else
-    x=''
-    y=''
-    z=''
-    status=no_data
+import rclpy
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+
+raw_path = Path(sys.argv[1])
+body_path = Path(sys.argv[2])
+captured_at = sys.argv[3]
+topics = ("/lio/odom", "/lio/body_odom")
+message_buffers = {topic: {} for topic in topics}
+latest_messages = {}
+node = None
+
+
+def blank_row(topic, status):
+    return [captured_at, topic, "", "", "", "", "", "", "", "", "", "", "", status]
+
+
+def encode(topic, message, status_override=None):
+    if message is None:
+        return blank_row(topic, "no_data")
+    position = message.pose.pose.position
+    orientation = message.pose.pose.orientation
+    values = [
+        float(position.x), float(position.y), float(position.z),
+        float(orientation.x), float(orientation.y),
+        float(orientation.z), float(orientation.w),
+    ]
+    stamp = message.header.stamp
+    stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+    norm_squared = sum(value * value for value in values[3:])
+    status = "ok"
+    yaw = ""
+    if (
+        not all(math.isfinite(value) for value in values)
+        or not math.isfinite(norm_squared)
+        or abs(norm_squared - 1.0) > 1.0e-3
+        or stamp_ns <= 0
+        or not 0 <= int(stamp.nanosec) < 1_000_000_000
+    ):
+        status = "invalid_message"
+    else:
+        norm = math.sqrt(norm_squared)
+        qx, qy, qz, qw = (value / norm for value in values[3:])
+        yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+        if status_override is not None:
+            status = status_override
+    return [
+        captured_at,
+        topic,
+        str(stamp_ns),
+        message.header.frame_id,
+        message.child_frame_id,
+        *values,
+        yaw,
+        status,
+    ]
+
+
+def valid_stamp_ns(message):
+    stamp = message.header.stamp
+    nanosec = int(stamp.nanosec)
+    stamp_ns = int(stamp.sec) * 1_000_000_000 + nanosec
+    if stamp_ns <= 0 or not 0 <= nanosec < 1_000_000_000:
+        return None
+    return stamp_ns
+
+
+def store(topic):
+    def callback(message):
+        latest_messages[topic] = message
+        stamp_ns = valid_stamp_ns(message)
+        if stamp_ns is None:
+            return
+        buffer = message_buffers[topic]
+        buffer[stamp_ns] = message
+        while len(buffer) > 64:
+            del buffer[min(buffer)]
+    return callback
+
+
+try:
+    rclpy.init(args=None)
+    node = Node("go2_log_odometry_sampler")
+    subscriptions = [
+        node.create_subscription(
+            Odometry,
+            topic,
+            store(topic),
+            qos_profile_sensor_data,
+        )
+        for topic in topics
+    ]
+    deadline = time.monotonic() + 3.0
+    matched_stamp = None
+    while time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        common_stamps = set(message_buffers[topics[0]]).intersection(
+            message_buffers[topics[1]]
+        )
+        if common_stamps:
+            matched_stamp = max(common_stamps)
+            break
+    if matched_stamp is None:
+        rows = [
+            encode(topic, latest_messages.get(topic), "unpaired_stamp")
+            for topic in topics
+        ]
+    else:
+        rows = [
+            encode(topic, message_buffers[topic][matched_stamp])
+            for topic in topics
+        ]
+except Exception as exception:
+    print(f"go2-log odometry sampler failed: {exception}", file=sys.stderr)
+    rows = [blank_row(topic, "sampler_error") for topic in topics]
+finally:
+    if node is not None:
+        node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+for path, row in zip((raw_path, body_path), rows):
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        csv.writer(stream, lineterminator="\n").writerow(row)
+PY
+  then
+    append_event "${session_dir}" warning collector \
+      "odometry sampler timed out or failed before writing samples"
+    python3 - \
+      "${session_dir}/odom_position.csv" \
+      "${session_dir}/body_odom_pose.csv" \
+      "${timestamp}" <<'PY'
+import csv
+from pathlib import Path
+import sys
+
+for path, topic in zip(map(Path, sys.argv[1:3]), ("/lio/odom", "/lio/body_odom")):
+    row = [sys.argv[3], topic, "", "", "", "", "", "", "", "", "", "", "", "sampler_error"]
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        csv.writer(stream, lineterminator="\n").writerow(row)
+PY
   fi
-  printf '%s,%s,%s,%s,%s\n' "${timestamp}" "${x}" "${y}" "${z}" "${status}" \
-    >> "${session_dir}/odom_position.csv"
 }
 
 sample_sdk2_command() {
@@ -774,13 +925,13 @@ run_collector() {
     fi
     graph_cycle=$((graph_cycle + 1))
 
-    for topic in /imu/data /lio/odom /body_path /terrain_costmap /sdk2_command; do
+    for topic in /imu/data /lio/odom /lio/body_odom /body_path /terrain_costmap /sdk2_command; do
       (( stop_requested == 0 )) || break
       (( $(session_bytes "${session_dir}") < SESSION_STOP_BYTES )) || break
       sample_topic_rate "${session_dir}" "${topic}"
     done
     (( stop_requested == 0 )) || break
-    sample_odom_position "${session_dir}"
+    sample_odometry_pair "${session_dir}"
     (( stop_requested == 0 )) || break
     sample_sdk2_command "${session_dir}"
 
@@ -805,6 +956,7 @@ start_session() {
   if current="$(active_session_dir 2>/dev/null)"; then
     pid="$(read_first_line "${current}/collector.pid" 2>/dev/null || true)"
     if collector_is_running "${pid}" "${current}"; then
+      record_active_runtime_overrides "${current}"
       echo "Diagnostic session is already running: $(basename -- "${current}")"
       echo "Directory: ${current}"
       echo "Collector PID: ${pid}"
@@ -821,6 +973,9 @@ start_session() {
   fi
 
   source_ros_environment
+  command -v ros2 >/dev/null 2>&1 || die "ROS 2 Humble environment is required"
+  python3 -c 'import rclpy; from nav_msgs.msg import Odometry' >/dev/null 2>&1 ||
+    die "ROS 2 Python packages rclpy and nav_msgs are required"
 
   local host session_id session_dir temp_active collector_pid
   host="$(hostname -s | tr -d '\n' | tr -c 'A-Za-z0-9_.-' '-')"

@@ -3,8 +3,14 @@
 `go2-log` collects bounded, low-bandwidth diagnostics for a Go2 + Hesai +
 Super-LIO/navigation session. It records environment and Git identity,
 network state, ROS parameters and graph state, process lifecycle, compact topic
-rates, odometry position, SDK2 command values, and `/rosout` warning/error
-records.
+rates, raw and corrected odometry poses, SDK2 command values, and `/rosout`
+warning/error records. `odom_position.csv` retains its legacy filename but now
+stores the complete sampled `/lio/odom` pose; `body_odom_pose.csv` stores
+`/lio/body_odom`. Both contain the ROS timestamp, parent/child frames,
+quaternion, and yaw. The sampler subscribes to both topics concurrently and
+buffers a bounded number of messages until it finds an identical ROS timestamp,
+so the analyzer can compare the actual relative quaternion with the configured
+body yaw correction without mixing robot motion between adjacent frames.
 
 It never subscribes to or copies `/lidar_points`, `/lio/cloud_world`, or full
 `TerrainGrid` messages. PCD (including compressed PCD), rosbag/MCAP, packet
@@ -43,7 +49,9 @@ go2-log status
 `start` is idempotent: if a healthy collector already owns the active session,
 it prints that session and exits successfully without creating another one.
 This makes it safe for a launch wrapper to call `go2-log start` before every
-SLAM/navigation startup.
+SLAM/navigation startup. When navigation reuses a session that SLAM started,
+the repeated call records `GO2_BODY_YAW_OFFSET_RAD` in that active session so a
+short run still has the exact configured correction available to the analyzer.
 
 Commands use an owner lock containing the process ID, Linux boot ID, and
 process start time. A lock left by a killed command or system restart is
@@ -110,17 +118,25 @@ upload.
 ## Analyze after pulling on the local computer
 
 Pull `Aphra-neck/G02_log` into `D:\G02_log`, then run the analyzer from a local
-`GO2_Hesai` checkout. PowerShell example:
+`GO2_Hesai` checkout. PowerShell example (using the project proxy):
 
 ```powershell
+git -C D:\G02_log `
+  -c http.proxy=http://192.168.151.143:7890 `
+  -c https.proxy=http://192.168.151.143:7890 `
+  pull --ff-only origin main
+
 python .\tools\analyze_diagnostics.py `
   D:\G02_log\sessions\20260804T010203Z-unitree-1234
 ```
 
 It creates `analysis/report.md`, `analysis/topic_rates_summary.csv`,
 `analysis/process_health_summary.csv`, and
-`analysis/sdk2_command_summary.csv`. Raw JSONL, CSV, YAML, and text inputs remain
-unchanged.
+`analysis/sdk2_command_summary.csv`, plus `analysis/body_odometry_audit.csv`.
+The odometry audit compares only pairs with exactly identical ROS timestamps,
+then reports the configured and observed relative rotation, frame mismatches,
+invalid quaternion samples, and whether the maximum rotation error stayed
+within `0.15 rad`. Raw JSONL, CSV, YAML, and text inputs remain unchanged.
 
 ## Large artifact transfer
 

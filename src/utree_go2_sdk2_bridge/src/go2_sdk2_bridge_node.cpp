@@ -46,8 +46,9 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   max_vy_ = declare_parameter("max_vy", 0.35);
   max_yaw_rate_ = declare_parameter("max_yaw_rate", 0.8);
   world_frame_ = declare_parameter("world_frame", "world");
+  body_frame_ = declare_parameter("body_frame", "base_link");
   const std::string path_topic = declare_parameter("path_topic", "/body_path");
-  const std::string odom_topic = declare_parameter("odom_topic", "/lio/odom");
+  const std::string odom_topic = declare_parameter("odom_topic", "/lio/body_odom");
 
   if (configured_enabled) {
     throw std::invalid_argument(
@@ -60,8 +61,9 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   if (domain_id_ < 0 || domain_id_ > 232) {
     throw std::invalid_argument("domain_id must be in [0, 232]");
   }
-  if (world_frame_.empty() || path_topic.empty() || odom_topic.empty()) {
-    throw std::invalid_argument("world_frame, path_topic, and odom_topic must not be empty");
+  if (world_frame_.empty() || body_frame_.empty() || path_topic.empty() || odom_topic.empty()) {
+    throw std::invalid_argument(
+            "world_frame, body_frame, path_topic, and odom_topic must not be empty");
   }
   const ControlParameters parameters{
     command_rate_, path_timeout_, odom_timeout_, timestamp_future_tolerance_,
@@ -216,6 +218,14 @@ void Go2Sdk2BridgeNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr ms
         get_logger(), *get_clock(), 3000,
         "Rejected odometry frame '%s'; expected '%s'",
         msg->header.frame_id.c_str(), world_frame_.c_str());
+      return;
+    }
+    if (msg->child_frame_id != body_frame_) {
+      failSafe("odometry body frame mismatch");
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Rejected odometry child frame '%s'; expected '%s'",
+        msg->child_frame_id.c_str(), body_frame_.c_str());
       return;
     }
     if (!isFinitePose(msg->pose.pose)) {
@@ -411,7 +421,7 @@ void Go2Sdk2BridgeNode::controlTickImpl()
 
   geometry_msgs::msg::TwistStamped command_message;
   command_message.header.stamp = current_time;
-  command_message.header.frame_id = "base_link";
+  command_message.header.frame_id = body_frame_;
   command_message.twist.linear.x = command->vx;
   command_message.twist.linear.y = command->vy;
   command_message.twist.angular.z = command->yaw_rate;
@@ -463,6 +473,7 @@ bool Go2Sdk2BridgeNode::cachedInputsValid() const
 {
   if (!path_ || !odom_ || path_->poses.empty() ||
     path_->header.frame_id != world_frame_ || odom_->header.frame_id != world_frame_ ||
+    odom_->child_frame_id != body_frame_ ||
     !isFinitePose(odom_->pose.pose))
   {
     return false;

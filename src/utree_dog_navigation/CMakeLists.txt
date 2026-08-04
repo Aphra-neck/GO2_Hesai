@@ -27,6 +27,21 @@ find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(utree_dog_msgs REQUIRED)
 
+add_library(body_odometry_core
+  src/body_odometry.cpp)
+target_include_directories(body_odometry_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(body_odometry_core
+  geometry_msgs nav_msgs tf2 tf2_geometry_msgs)
+
+add_executable(body_odom_adapter_node
+  src/body_odometry_adapter_node.cpp
+  src/body_odometry_adapter_main.cpp)
+target_link_libraries(body_odom_adapter_node body_odometry_core)
+ament_target_dependencies(body_odom_adapter_node
+  nav_msgs rclcpp)
+
 add_library(terrain_mapping_core
   src/terrain_map_builder.cpp)
 target_include_directories(terrain_mapping_core PUBLIC
@@ -58,8 +73,10 @@ ament_target_dependencies(body_lattice_planner_node
   geometry_msgs nav_msgs rclcpp tf2 tf2_geometry_msgs utree_dog_msgs)
 
 install(TARGETS
+  body_odometry_core
   terrain_mapping_core
   body_planning_core
+  body_odom_adapter_node
   terrain_mapper_node
   body_lattice_planner_node
   ARCHIVE DESTINATION lib
@@ -82,6 +99,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_lattice_planner test/test_lattice_planner.cpp)
   target_link_libraries(test_lattice_planner body_planning_core)
   ament_target_dependencies(test_lattice_planner utree_dog_msgs)
+
+  ament_add_gtest(test_body_odometry test/test_body_odometry.cpp)
+  target_link_libraries(test_body_odometry body_odometry_core)
+  ament_target_dependencies(test_body_odometry
+    geometry_msgs nav_msgs tf2 tf2_geometry_msgs)
 endif()
 
 ament_package()

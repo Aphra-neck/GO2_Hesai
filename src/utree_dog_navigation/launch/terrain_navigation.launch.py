@@ -2,10 +2,13 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, EmitEvent, RegisterEventHandler
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -22,23 +25,74 @@ def generate_launch_description():
     config = LaunchConfiguration("config")
     rviz = LaunchConfiguration("rviz")
     rviz_config = LaunchConfiguration("rviz_config")
+    body_yaw_offset = LaunchConfiguration("body_yaw_offset")
+    body_frame = LaunchConfiguration("body_frame")
+
+    body_odom_adapter = Node(
+        package="utree_dog_navigation",
+        executable="body_odom_adapter_node",
+        name="body_odom_adapter",
+        output="screen",
+        parameters=[
+            config,
+            {
+                "yaw_offset": ParameterValue(
+                    body_yaw_offset,
+                    value_type=float,
+                ),
+                "body_frame": body_frame,
+            },
+        ],
+    )
+
+    imu_to_base_link_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="imu_to_base_link_tf",
+        output="screen",
+        arguments=[
+            "--x", "0", "--y", "0", "--z", "0",
+            "--roll", "0", "--pitch", "0", "--yaw", body_yaw_offset,
+            "--frame-id", "imu", "--child-frame-id", body_frame,
+        ],
+    )
 
     return LaunchDescription(
         [
             DeclareLaunchArgument("config", default_value=default_config),
             DeclareLaunchArgument("rviz", default_value="true"),
             DeclareLaunchArgument("rviz_config", default_value=default_rviz_config),
-            Node(
-                package="tf2_ros",
-                executable="static_transform_publisher",
-                name="imu_to_base_link_tf",
-                output="screen",
-                arguments=[
-                    "--x", "0", "--y", "0", "--z", "0",
-                    "--roll", "0", "--pitch", "0", "--yaw", "0",
-                    "--frame-id", "imu", "--child-frame-id", "base_link",
-                ],
+            DeclareLaunchArgument(
+                "body_yaw_offset",
+                default_value="-1.5707963267948966",
             ),
+            DeclareLaunchArgument("body_frame", default_value="base_link"),
+            RegisterEventHandler(
+                OnProcessExit(
+                    target_action=body_odom_adapter,
+                    on_exit=[
+                        EmitEvent(
+                            event=Shutdown(
+                                reason="body odometry adapter exited"
+                            )
+                        )
+                    ],
+                )
+            ),
+            body_odom_adapter,
+            RegisterEventHandler(
+                OnProcessExit(
+                    target_action=imu_to_base_link_tf,
+                    on_exit=[
+                        EmitEvent(
+                            event=Shutdown(
+                                reason="IMU-to-body static transform exited"
+                            )
+                        )
+                    ],
+                )
+            ),
+            imu_to_base_link_tf,
             Node(
                 package="tf2_ros",
                 executable="static_transform_publisher",

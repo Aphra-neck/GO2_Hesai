@@ -1,8 +1,17 @@
+body_odom_adapter:
+  ros__parameters:
+    input_odom_topic: /lio/odom
+    output_odom_topic: /lio/body_odom
+    world_frame: world
+    body_frame: base_link
+    # Go2 forward is clockwise 90 degrees from the raw Super-LIO IMU x-axis.
+    yaw_offset: -1.5707963267948966
+
 terrain_mapper:
   ros__parameters:
     map_frame: world
     cloud_topic: /lio/cloud_world
-    odom_topic: /lio/odom
+    odom_topic: /lio/body_odom
     resolution: 0.05
     size_x: 40.0
     size_y: 40.0
@@ -31,7 +40,7 @@ terrain_mapper:
 body_lattice_planner:
   ros__parameters:
     terrain_map_topic: terrain_map
-    odom_topic: /lio/odom
+    odom_topic: /lio/body_odom
     goal_topic: /goal_pose
     path_topic: body_path
     yaw_bins: 16

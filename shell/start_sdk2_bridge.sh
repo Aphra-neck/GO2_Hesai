@@ -72,6 +72,12 @@ if pgrep -f -- "/utree_go2_sdk2_bridge/go2_sdk2_bridge_node" >/dev/null 2>&1; th
   exit 1
 fi
 
+if ! timeout 10 ros2 topic echo --once --qos-profile sensor_data \
+  /lio/body_odom nav_msgs/msg/Odometry >/dev/null 2>&1; then
+  echo "No corrected body odometry on /lio/body_odom. Start terrain navigation first." >&2
+  exit 1
+fi
+
 if [[ ! -x "${WORKSPACE_DIR}/tools/go2-log" ]]; then
   echo "Diagnostics command is missing or not executable: ${WORKSPACE_DIR}/tools/go2-log" >&2
   exit 1
@@ -84,7 +90,7 @@ echo " Network interface: ${NETWORK_INTERFACE}"
 echo " ROS domain: ${ROS_DOMAIN_ID} (Unitree SDK domain: 0)"
 echo " Motion: disabled until explicitly enabled"
 echo "======================================"
-echo "After verifying /body_path and /lio/odom, enable with:"
+echo "After verifying /body_path and /lio/body_odom, enable with:"
 echo "ros2 service call /go2_sdk2_bridge/enable_motion std_srvs/srv/SetBool '{data: true}'"
 
 ros2 launch utree_go2_sdk2_bridge go2_sdk2_bridge.launch.py \

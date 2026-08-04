@@ -46,6 +46,7 @@ private:
 
   std::string network_interface_;
   std::string world_frame_;
+  std::string body_frame_;
   int domain_id_{0};
   bool enabled_{false};
   // Cleared only after SportClient confirms StopMove.

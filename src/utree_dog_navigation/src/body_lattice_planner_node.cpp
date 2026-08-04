@@ -13,7 +13,7 @@ namespace utree_dog_navigation
 BodyLatticePlannerNode::BodyLatticePlannerNode() : Node("body_lattice_planner")
 {
   map_topic_ = declare_parameter("terrain_map_topic", "terrain_map");
-  odom_topic_ = declare_parameter("odom_topic", "/lio/odom");
+  odom_topic_ = declare_parameter("odom_topic", "/lio/body_odom");
   goal_topic_ = declare_parameter("goal_topic", "/goal_pose");
   path_topic_ = declare_parameter("path_topic", "body_path");
   nominal_body_height_ = declare_parameter("nominal_body_height", 0.42);

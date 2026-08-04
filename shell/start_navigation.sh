@@ -4,8 +4,11 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PLANNING_RVIZ="${PLANNING_RVIZ:-true}"
+BODY_YAW_OFFSET="${GO2_BODY_YAW_OFFSET_RAD:--1.5707963267948966}"
+GO2_BODY_YAW_OFFSET_RAD="${BODY_YAW_OFFSET}"
 ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-30}"
 RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+export GO2_BODY_YAW_OFFSET_RAD
 export ROS_DOMAIN_ID
 export RMW_IMPLEMENTATION
 
@@ -37,10 +40,13 @@ if ! ros2 pkg prefix utree_dog_navigation >/dev/null 2>&1; then
   exit 1
 fi
 
-if pgrep -f -- "/utree_dog_navigation/terrain_mapper_node" >/dev/null 2>&1 ||
+if pgrep -f -- "/utree_dog_navigation/body_odom_adapter_node" >/dev/null 2>&1 ||
+   pgrep -f -- "/utree_dog_navigation/terrain_mapper_node" >/dev/null 2>&1 ||
    pgrep -f -- "/utree_dog_navigation/body_lattice_planner_node" >/dev/null 2>&1; then
   echo "Terrain navigation is already running." >&2
-  pgrep -af -- "utree_dog_navigation/(terrain_mapper_node|body_lattice_planner_node)" >&2 || true
+  pgrep -af -- \
+    "utree_dog_navigation/(body_odom_adapter_node|terrain_mapper_node|body_lattice_planner_node)" \
+    >&2 || true
   exit 1
 fi
 
@@ -68,6 +74,7 @@ echo " Go2 terrain navigation (ROS 2)"
 echo " ROS domain: ${ROS_DOMAIN_ID}"
 echo " ROS RMW: ${RMW_IMPLEMENTATION}"
 echo " Planning RViz: ${PLANNING_RVIZ}"
+echo " Body yaw offset: ${BODY_YAW_OFFSET} rad"
 echo "======================================"
 
 echo "Checking Super-LIO inputs..."
@@ -83,4 +90,5 @@ fi
 echo "Starting terrain mapper and body lattice planner..."
 echo "Set a goal with RViz or publish geometry_msgs/msg/PoseStamped to /goal_pose."
 ros2 launch utree_dog_navigation terrain_navigation.launch.py \
-  "rviz:=${PLANNING_RVIZ}"
+  "rviz:=${PLANNING_RVIZ}" \
+  "body_yaw_offset:=${BODY_YAW_OFFSET}"

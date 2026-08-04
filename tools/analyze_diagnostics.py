@@ -7,6 +7,7 @@ import argparse
 import csv
 import datetime as dt
 import json
+import math
 import re
 import statistics
 from collections import Counter, defaultdict
@@ -15,8 +16,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-EXPECTED_TOPICS = ("/imu/data", "/lio/odom", "/body_path", "/terrain_costmap")
+EXPECTED_TOPICS = (
+    "/imu/data",
+    "/lio/odom",
+    "/lio/body_odom",
+    "/body_path",
+    "/terrain_costmap",
+)
 PARAMETER_SCALAR = re.compile(r"^\s*([A-Za-z0-9_.-]+):\s*([^#]+?)\s*(?:#.*)?$")
+YAW_AUDIT_TOLERANCE_RAD = 0.15
 
 
 @dataclass(frozen=True)
@@ -27,6 +35,13 @@ class CapturedSetting:
     @property
     def display_value(self) -> str:
         return "not captured" if self.value is None else f"{self.value:.6g}"
+
+
+@dataclass(frozen=True)
+class OdometrySample:
+    stamp_ns: int
+    yaw: float
+    quaternion: tuple[float, float, float, float]
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,9 +95,10 @@ def read_csv(path: Path) -> list[dict[str, str]]:
 
 def as_float(value: str | None) -> float | None:
     try:
-        return float(value) if value not in (None, "") else None
+        parsed = float(value) if value not in (None, "") else None
     except ValueError:
         return None
+    return parsed if parsed is not None and math.isfinite(parsed) else None
 
 
 def read_environment(path: Path) -> dict[str, str]:
@@ -127,14 +143,18 @@ def find_parameter_setting(
     key: str,
     filename_hints: tuple[str, ...],
     *,
-    positive: bool,
+    positive: bool | None,
 ) -> CapturedSetting:
     for path in sorted(session.glob("parameters_*.yaml")):
         lower_name = path.name.lower()
         if not any(hint in lower_name for hint in filename_hints):
             continue
         value = as_float(read_parameter_scalars(path).get(key))
-        if value is None or (positive and value <= 0.0) or (not positive and value < 0.0):
+        if value is None:
+            continue
+        if positive is True and value <= 0.0:
+            continue
+        if positive is False and value < 0.0:
             continue
         return CapturedSetting(value, f"{path.name}:{key}")
     return CapturedSetting(None, "not captured; comparison skipped")
@@ -156,9 +176,24 @@ def load_runtime_settings(session: Path) -> dict[str, CapturedSetting]:
             positive=True,
         )
 
+    body_environment_offset = as_float(environment.get("GO2_BODY_YAW_OFFSET_RAD"))
+    if body_environment_offset is not None:
+        body_yaw_offset = CapturedSetting(
+            body_environment_offset,
+            "ros_dds_environment.txt:GO2_BODY_YAW_OFFSET_RAD",
+        )
+    else:
+        body_yaw_offset = find_parameter_setting(
+            session,
+            "yaw_offset",
+            ("body_odom_adapter",),
+            positive=None,
+        )
+
     sdk2_hints = ("go2_sdk2_bridge", "sdk2_bridge")
     return {
         "imu_target_hz": imu_rate,
+        "body_yaw_offset": body_yaw_offset,
         "max_vx": find_parameter_setting(
             session, "max_vx", sdk2_hints, positive=False
         ),
@@ -273,6 +308,191 @@ def summarize_sdk2_commands(rows: list[dict[str, str]]) -> dict[str, object]:
     }
 
 
+def normalize_angle(angle: float) -> float:
+    return math.remainder(angle, 2.0 * math.pi)
+
+
+def summarize_odometry(
+    rows: list[dict[str, str]],
+    topic: str,
+    parent_frame: str,
+    child_frames: set[str],
+) -> tuple[dict[str, object], list[OdometrySample]]:
+    valid: list[OdometrySample] = []
+    no_data = 0
+    invalid = 0
+    frame_mismatch = 0
+    for row in rows:
+        status = row.get("status", "")
+        if status != "ok":
+            if status in {"no_data", "ros_unavailable"}:
+                no_data += 1
+            else:
+                invalid += 1
+            continue
+
+        if (
+            row.get("topic") != topic
+            or row.get("frame_id") != parent_frame
+            or row.get("child_frame_id", "") not in child_frames
+        ):
+            frame_mismatch += 1
+            invalid += 1
+            continue
+
+        try:
+            stamp_ns = int(row.get("ros_stamp_ns", ""))
+        except ValueError:
+            stamp_ns = 0
+        position = [as_float(row.get(axis)) for axis in ("x", "y", "z")]
+        quaternion = [as_float(row.get(axis)) for axis in ("qx", "qy", "qz", "qw")]
+        captured_yaw = as_float(row.get("yaw"))
+        if stamp_ns <= 0 or any(value is None for value in position + quaternion):
+            invalid += 1
+            continue
+
+        qx, qy, qz, qw = (float(value) for value in quaternion)
+        norm_squared = qx * qx + qy * qy + qz * qz + qw * qw
+        if abs(norm_squared - 1.0) > 1.0e-3 or norm_squared <= 1.0e-12:
+            invalid += 1
+            continue
+        norm = math.sqrt(norm_squared)
+        qx, qy, qz, qw = (value / norm for value in (qx, qy, qz, qw))
+        computed_yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+        if captured_yaw is None or abs(normalize_angle(captured_yaw - computed_yaw)) > 1.0e-6:
+            invalid += 1
+            continue
+        valid.append(
+            OdometrySample(
+                stamp_ns=stamp_ns,
+                yaw=computed_yaw,
+                quaternion=(qx, qy, qz, qw),
+            )
+        )
+
+    return (
+        {
+            "topic": topic,
+            "samples": len(rows),
+            "ok_samples": len(valid),
+            "no_data_samples": no_data,
+            "invalid_samples": invalid,
+            "frame_mismatch_samples": frame_mismatch,
+            "latest_yaw_deg": f"{math.degrees(valid[-1].yaw):.6f}" if valid else "",
+        },
+        valid,
+    )
+
+
+def summarize_yaw_correction(
+    raw_samples: list[OdometrySample],
+    body_samples: list[OdometrySample],
+    configured_offset: CapturedSetting,
+) -> dict[str, object]:
+    raw_by_stamp = {sample.stamp_ns: sample for sample in raw_samples}
+    offsets: list[float] = []
+    relative_quaternions: list[tuple[float, float, float, float]] = []
+    for body in sorted(body_samples, key=lambda sample: sample.stamp_ns):
+        raw = raw_by_stamp.get(body.stamp_ns)
+        if raw is None:
+            continue
+        rx, ry, rz, rw = raw.quaternion
+        bx, by, bz, bw = body.quaternion
+        relative = (
+            rw * bx - rx * bw - ry * bz + rz * by,
+            rw * by + rx * bz - ry * bw - rz * bx,
+            rw * bz - rx * by + ry * bx - rz * bw,
+            rw * bw + rx * bx + ry * by + rz * bz,
+        )
+        relative_norm = math.sqrt(sum(value * value for value in relative))
+        relative = tuple(value / relative_norm for value in relative)
+        qx, qy, qz, qw = relative
+        offsets.append(
+            math.atan2(
+                2.0 * (qw * qz + qx * qy),
+                1.0 - 2.0 * (qy * qy + qz * qz),
+            )
+        )
+        relative_quaternions.append(relative)
+
+    observed = None
+    if offsets:
+        observed = math.atan2(
+            statistics.fmean(math.sin(value) for value in offsets),
+            statistics.fmean(math.cos(value) for value in offsets),
+        )
+    errors: list[float] = []
+    if configured_offset.value is not None:
+        expected = (
+            0.0,
+            0.0,
+            math.sin(0.5 * configured_offset.value),
+            math.cos(0.5 * configured_offset.value),
+        )
+        for relative in relative_quaternions:
+            dot = abs(sum(left * right for left, right in zip(relative, expected)))
+            errors.append(2.0 * math.acos(max(-1.0, min(1.0, dot))))
+    if not offsets:
+        status = "no_pairs"
+    elif configured_offset.value is None:
+        status = "offset_not_captured"
+    elif max(errors, default=0.0) > YAW_AUDIT_TOLERANCE_RAD:
+        status = "mismatch"
+    else:
+        status = "ok"
+    return {
+        "matched_pairs": len(offsets),
+        "configured_offset_rad": (
+            f"{configured_offset.value:.9f}" if configured_offset.value is not None else ""
+        ),
+        "configured_offset_source": configured_offset.source,
+        "observed_mean_offset_rad": f"{observed:.9f}" if observed is not None else "",
+        "max_abs_error_rad": f"{max(errors):.9f}" if errors else "",
+        "tolerance_rad": f"{YAW_AUDIT_TOLERANCE_RAD:.9f}",
+        "status": status,
+    }
+
+
+def odometry_observations(
+    raw_summary: dict[str, object],
+    body_summary: dict[str, object],
+    correction_summary: dict[str, object],
+) -> list[str]:
+    observations: list[str] = []
+    for label, summary in (("raw", raw_summary), ("corrected body", body_summary)):
+        if int(summary["ok_samples"]) == 0:
+            observations.append(f"No valid {label} odometry pose sample was captured.")
+        if int(summary["no_data_samples"]) > 0:
+            observations.append(
+                f"{label.capitalize()} odometry had {summary['no_data_samples']} no-data samples."
+            )
+        if int(summary["invalid_samples"]) > 0:
+            observations.append(
+                f"{label.capitalize()} odometry had {summary['invalid_samples']} invalid samples."
+            )
+        if int(summary["frame_mismatch_samples"]) > 0:
+            observations.append(
+                f"{label.capitalize()} odometry had {summary['frame_mismatch_samples']} frame mismatches."
+            )
+
+    status = correction_summary["status"]
+    if status == "no_pairs":
+        observations.append("Raw and corrected odometry had no timestamp-aligned yaw samples.")
+    elif status == "offset_not_captured":
+        observations.append("Body yaw offset was not captured; yaw-correction comparison was skipped.")
+    elif status == "mismatch":
+        observations.append(
+            "Observed body yaw correction exceeded the configured tolerance: "
+            f"mean={correction_summary['observed_mean_offset_rad']} rad, "
+            f"configured={correction_summary['configured_offset_rad']} rad, "
+            f"max error={correction_summary['max_abs_error_rad']} rad."
+        )
+    return observations
+
+
 def count_rosout_levels(path: Path) -> Counter[str]:
     counts: Counter[str] = Counter()
     try:
@@ -337,27 +557,45 @@ def build_observations(
         observations.append("Collection stopped at the protective session-size threshold.")
     if not (session / "ended_at.txt").exists():
         observations.append("The session has no clean collector end marker.")
-    if not observations:
-        observations.append("No automatic warning condition was detected; inspect the raw logs for behavior-specific issues.")
     return observations
 
 
-def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, Path]:
+def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, Path, Path]:
     metadata = read_json(session / "metadata.json")
     runtime_settings = load_runtime_settings(session)
     rate_rows = read_csv(session / "topic_rates.csv")
     process_rows = read_csv(session / "process_health.csv")
     sdk2_rows = read_csv(session / "sdk2_commands.csv")
+    raw_odometry_rows = read_csv(session / "odom_position.csv")
+    body_odometry_rows = read_csv(session / "body_odom_pose.csv")
     events, invalid_events = read_jsonl(session / "events.jsonl")
     rate_summaries = summarize_rates(rate_rows)
     process_summaries = summarize_processes(process_rows)
     sdk2_summary = summarize_sdk2_commands(sdk2_rows)
+    raw_odometry_summary, raw_odometry_samples = summarize_odometry(
+        raw_odometry_rows,
+        "/lio/odom",
+        "world",
+        {"", "imu"},
+    )
+    body_odometry_summary, body_odometry_samples = summarize_odometry(
+        body_odometry_rows,
+        "/lio/body_odom",
+        "world",
+        {"base_link"},
+    )
+    yaw_correction_summary = summarize_yaw_correction(
+        raw_odometry_samples,
+        body_odometry_samples,
+        runtime_settings["body_yaw_offset"],
+    )
     rosout_counts = count_rosout_levels(session / "rosout_warn_error.txt")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     rate_csv = output_dir / "topic_rates_summary.csv"
     process_csv = output_dir / "process_health_summary.csv"
     sdk2_csv = output_dir / "sdk2_command_summary.csv"
+    odometry_csv = output_dir / "body_odometry_audit.csv"
     report_path = output_dir / "report.md"
 
     write_csv_atomic(
@@ -400,6 +638,42 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
         ),
         [sdk2_output],
     )
+    odometry_output = {
+        "raw_samples": raw_odometry_summary["samples"],
+        "raw_ok_samples": raw_odometry_summary["ok_samples"],
+        "raw_no_data_samples": raw_odometry_summary["no_data_samples"],
+        "raw_invalid_samples": raw_odometry_summary["invalid_samples"],
+        "raw_frame_mismatch_samples": raw_odometry_summary["frame_mismatch_samples"],
+        "body_samples": body_odometry_summary["samples"],
+        "body_ok_samples": body_odometry_summary["ok_samples"],
+        "body_no_data_samples": body_odometry_summary["no_data_samples"],
+        "body_invalid_samples": body_odometry_summary["invalid_samples"],
+        "body_frame_mismatch_samples": body_odometry_summary["frame_mismatch_samples"],
+        **yaw_correction_summary,
+    }
+    write_csv_atomic(
+        odometry_csv,
+        (
+            "raw_samples",
+            "raw_ok_samples",
+            "raw_no_data_samples",
+            "raw_invalid_samples",
+            "raw_frame_mismatch_samples",
+            "body_samples",
+            "body_ok_samples",
+            "body_no_data_samples",
+            "body_invalid_samples",
+            "body_frame_mismatch_samples",
+            "matched_pairs",
+            "configured_offset_rad",
+            "configured_offset_source",
+            "observed_mean_offset_rad",
+            "max_abs_error_rad",
+            "tolerance_rad",
+            "status",
+        ),
+        [odometry_output],
+    )
 
     event_levels = Counter(str(event.get("level", "unknown")) for event in events)
     event_categories = Counter(str(event.get("category", "unknown")) for event in events)
@@ -427,6 +701,17 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
                 f"Observed SDK2 {label} {value:.3f}, above the captured limit "
                 f"{setting.value:.3f} ({setting.source})."
             )
+    observations.extend(
+        odometry_observations(
+            raw_odometry_summary,
+            body_odometry_summary,
+            yaw_correction_summary,
+        )
+    )
+    if not observations:
+        observations.append(
+            "No automatic warning condition was detected; inspect the raw logs for behavior-specific issues."
+        )
 
     lines = [
         f"# Diagnostic Report: {markdown_cell(metadata.get('session_id', session.name))}",
@@ -452,6 +737,7 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
     )
     for label, key in (
         ("IMU target rate (Hz)", "imu_target_hz"),
+        ("Body yaw offset (rad)", "body_yaw_offset"),
         ("SDK2 max vx", "max_vx"),
         ("SDK2 max vy", "max_vy"),
         ("SDK2 max yaw rate", "max_yaw_rate"),
@@ -486,6 +772,32 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
 
     lines.extend(
         [
+            "",
+            "## Body Odometry Audit",
+            "",
+            "| Topic | Samples | Valid | No data | Invalid | Frame mismatch | Latest yaw (deg) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for summary in (raw_odometry_summary, body_odometry_summary):
+        lines.append(
+            f"| {summary['topic']} | {summary['samples']} | {summary['ok_samples']} | "
+            f"{summary['no_data_samples']} | {summary['invalid_samples']} | "
+            f"{summary['frame_mismatch_samples']} | {summary['latest_yaw_deg'] or '-'} |"
+        )
+    lines.extend(
+        [
+            "",
+            "| Matched pairs | Configured offset (rad) | Observed mean (rad) | Max error (rad) | Tolerance (rad) | Status |",
+            "| ---: | ---: | ---: | ---: | ---: | --- |",
+            "| {matched_pairs} | {configured} | {observed} | {error} | {tolerance} | {status} |".format(
+                matched_pairs=yaw_correction_summary["matched_pairs"],
+                configured=yaw_correction_summary["configured_offset_rad"] or "-",
+                observed=yaw_correction_summary["observed_mean_offset_rad"] or "-",
+                error=yaw_correction_summary["max_abs_error_rad"] or "-",
+                tolerance=yaw_correction_summary["tolerance_rad"],
+                status=yaw_correction_summary["status"],
+            ),
             "",
             "## SDK2 Commands",
             "",
@@ -559,14 +871,14 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
             "## Raw Inputs",
             "",
             "The analyzer does not modify raw files. Review `events.jsonl`, `topic_rates.csv`, "
-            "`odom_position.csv`, `sdk2_commands.csv`, `process_health.csv`, "
+            "`odom_position.csv`, `body_odom_pose.csv`, `sdk2_commands.csv`, `process_health.csv`, "
             "`rosout_warn_error.txt`, parameter dumps, "
             "and the Git/network/environment snapshots alongside this report.",
             "",
         ]
     )
     write_text_atomic(report_path, "\n".join(lines))
-    return report_path, rate_csv, process_csv, sdk2_csv
+    return report_path, rate_csv, process_csv, sdk2_csv, odometry_csv
 
 
 def main() -> int:
@@ -577,11 +889,12 @@ def main() -> int:
     if not (session / "metadata.json").is_file():
         raise SystemExit(f"not a go2-log session (metadata.json is missing): {session}")
     output_dir = (args.output_dir or (session / "analysis")).expanduser().resolve()
-    report, rate_csv, process_csv, sdk2_csv = generate_report(session, output_dir)
+    report, rate_csv, process_csv, sdk2_csv, odometry_csv = generate_report(session, output_dir)
     print(f"Report: {report}")
     print(f"Topic summary: {rate_csv}")
     print(f"Process summary: {process_csv}")
     print(f"SDK2 summary: {sdk2_csv}")
+    print(f"Body odometry audit: {odometry_csv}")
     return 0
 
 

@@ -44,10 +44,10 @@ Visualization Manager:
       Max Color: 240; 80; 40
       Use Fixed Frame: true
     - Class: rviz_default_plugins/Odometry
-      Name: Super-LIO Odometry
+      Name: Go2 Body Odometry
       Enabled: true
       Topic:
-        Value: /lio/odom
+        Value: /lio/body_odom
         Reliability Policy: Best Effort
         Durability Policy: Volatile
         History Policy: Keep Last

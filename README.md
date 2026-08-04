@@ -188,16 +188,20 @@ Go2 LowState
 
 /lidar_points + /imu/data
   -> Super-LIO ROS 2
-  -> /lio/odom
+  -> /lio/odom (raw IMU pose)
   -> /lio/cloud_world
 
-/lio/odom + /lio/cloud_world + /goal_pose
+/lio/odom
+  -> body_odom_adapter (-90 deg yaw)
+  -> /lio/body_odom (world -> base_link pose)
+
+/lio/body_odom + /lio/cloud_world + /goal_pose
   -> utree_dog_navigation
   -> /terrain_map
   -> /terrain_costmap
   -> /body_path
 
-/body_path + /lio/odom
+/body_path + /lio/body_odom
   -> utree_go2_sdk2_bridge (default: disabled)
   -> Unitree SDK2 SportClient
 ```
@@ -209,7 +213,7 @@ Go2 LowState
 - `src/Super-LIO`：来自 Super-LIO 上游 `ros2` 分支，并加入 Humble/ARM64
   兼容修正。具体来源见 `src/Super-LIO/UPSTREAM.md`。
 - `src/utree_dog_msgs`：地形规划所需的 ROS 2 自定义消息。
-- `src/utree_dog_navigation`：时序地形图和机身 lattice 路径规划器。
+- `src/utree_dog_navigation`：IMU 到机身朝向适配、时序地形图和机身 lattice 路径规划器。
 - `src/utree_go2_sdk2_bridge`：将 `/body_path` 转换为受限的 Unitree SDK2
   `SportClient` 指令，默认禁止运动。
 - `shell/start_slam.sh`：顺序启动雷达、IMU 桥接器和 Super-LIO 的脚本。
@@ -241,8 +245,9 @@ cd ~/go2_hesai_ros2_ws
 ./shell/start_navigation.sh
 ```
 
-规划脚本会先确认 `/lio/odom` 和 `/lio/cloud_world` 有数据，再启动地形构建、
-机身路径规划和规划 RViz。不要同时运行 Super-LIO 自带的第二个 RViz。
+规划脚本会先确认原始 `/lio/odom` 和 `/lio/cloud_world` 有数据，再启动
+`body_odom_adapter`、地形构建、机身路径规划和规划 RViz。不要同时运行
+Super-LIO 自带的第二个 RViz。
 
 可用环境变量：
 
@@ -254,6 +259,7 @@ cd ~/go2_hesai_ros2_ws
 | `ROS_DOMAIN_ID` | `30` | ROS 2 domain；与 Unitree SDK 固定使用的 domain 0 隔离 |
 | `RMW_IMPLEMENTATION` | `rmw_fastrtps_cpp` | ROS 2 使用 Fast DDS，避免与 Unitree SDK 的 CycloneDDS 冲突 |
 | `UNITREE_SDK_LIBRARY_DIR` | `/usr/local/lib` | Unitree SDK配套的 CycloneDDS动态库目录 |
+| `GO2_BODY_YAW_OFFSET_RAD` | `-1.5707963267948966` | IMU 到 `base_link` 的 yaw 校正，单位 rad |
 
 例如：
 
@@ -267,7 +273,7 @@ SLAM_LOG_DIR=~/slam_logs \
 ### 规划和 RViz
 
 `shell/start_navigation.sh` 默认启动规划 RViz。固定坐标系为 `world`，显示
-`/lio/cloud_world`、`/lio/odom`、`/terrain_costmap` 和 `/body_path`，并通过
+`/lio/cloud_world`、`/lio/body_odom`、`/terrain_costmap` 和 `/body_path`，并通过
 `/goal_pose` 设置目标。世界点云使用 Best Effort QoS，RViz 累积时间为 10 秒。
 
 如果 RViz 在另一台 ROS 2 计算机运行，Jetson 只启动规划节点：
@@ -281,11 +287,21 @@ PLANNING_RVIZ=false ./shell/start_navigation.sh
 ```yaml
 map_frame: world
 cloud_topic: /lio/cloud_world
-odom_topic: /lio/odom
+odom_topic: /lio/body_odom
 ```
 
-坐标关系为 `world -> imu`（Super-LIO 动态发布）、`imu -> base_link`（单位变换）
-和 `imu -> hesai_lidar`（平移 `0.171 0 0.0908`，无旋转）。
+坐标关系为 `world -> imu`（Super-LIO 动态发布）、`imu -> base_link`
+（零平移，yaw `-90 deg`）和 `imu -> hesai_lidar`（平移
+`0.171 0 0.0908`，无旋转）。`/lio/body_odom` 保留原始位置和时间戳，将
+`/lio/odom` 姿态右乘相同的 `-90 deg` yaw，因此消息中的 `world -> base_link`
+与 TF 树一致。点云、Super-LIO world 和 Hesai 外参不会被旋转。
+
+现场直行标定得到 `-87.39 deg`，当前先使用机械坐标的标称 `-90 deg`。如果复测
+确认需要实验值，可只在启动规划时覆盖，不要修改雷达外参：
+
+```bash
+GO2_BODY_YAW_OFFSET_RAD=-1.525243233318 ./shell/start_navigation.sh
+```
 
 ### SDK2 路径执行器
 
@@ -297,7 +313,7 @@ odom_topic: /lio/odom
 
 脚本会拒绝与 RL `/lowcmd` 控制器并行运行；节点运行期间也会持续检查
 `/lowcmd` 发布者，一旦发现便立即禁用 SportClient 并停车。节点启动后仍为禁用状态；确认
-`/body_path`、`/lio/odom` 和机器人周边安全后，才可显式启用：
+`/body_path`、`/lio/body_odom` 和机器人周边安全后，才可显式启用：
 
 `enabled:=true` 启动配置会被拒绝，不能绕过人工授权。路径、里程计或控制参数包含
 非有限值、非法四元数或不一致坐标系时，节点也会保持禁用并尝试停车。
@@ -369,7 +385,9 @@ python .\tools\analyze_diagnostics.py `
   D:\G02_log\sessions\<session-id>
 ```
 
-分析器生成 Markdown 报告和 CSV 汇总，保留原始 JSONL。PCD、rosbag 和 core dump
+分析器生成 Markdown 报告、话题/进程/SDK2 汇总和
+`body_odometry_audit.csv`，自动核对实机原始与校正里程计的时间戳、frame、四元数及
+yaw 偏置，并保留原始 JSONL。PCD、rosbag 和 core dump
 不得进入 Git；用 SCP 分别传到 `D:\GO2_Data\maps`、`D:\GO2_Data\bags` 和
 `D:\GO2_Data\cores`。详细约束见 `tools/README.md`。
 
@@ -449,6 +467,7 @@ ros2 topic list | grep -E '^/(lidar_points|imu/data|lio/)'
 ros2 topic hz /lidar_points
 ros2 topic hz /imu/data
 ros2 topic hz /lio/odom
+ros2 topic hz /lio/body_odom
 ```
 
 正常情况下大致为：
@@ -456,12 +475,14 @@ ros2 topic hz /lio/odom
 - `/lidar_points`：约 10 Hz
 - `/imu/data`：约 160-200 Hz
 - `/lio/odom`：约 10 Hz
+- `/lio/body_odom`：与 `/lio/odom` 相同
 
 读取一帧传感器数据：
 
 ```bash
 ros2 topic echo --once --qos-profile sensor_data /lidar_points
 ros2 topic echo --once --qos-profile sensor_data /imu/data
+ros2 topic echo --once --qos-profile sensor_data /lio/body_odom
 ```
 
 检查发布者和订阅者的 QoS：
@@ -628,6 +649,21 @@ ros2 node info /super_lio_node
 ros2 topic info -v /lidar_points
 ros2 topic info -v /imu/data
 ```
+
+### `/lio/body_odom` 没有输出或方向不正确
+
+`/lio/body_odom` 由规划 launch 中的 `body_odom_adapter` 发布。依次确认：
+
+```bash
+ros2 node info /body_odom_adapter
+ros2 topic info -v /lio/body_odom
+ros2 param get /body_odom_adapter yaw_offset
+ros2 run tf2_ros tf2_echo imu base_link
+```
+
+默认 `yaw_offset` 和 `imu -> base_link` yaw 都应为
+`-1.5707963267948966 rad`。如果两者不一致，停止规划和 SDK2 bridge 后重新启动
+`shell/start_navigation.sh`；不要通过修改 `lio.extrinsic.lidar_imu` 修正机身方向。
 
 ## 上游来源
 
