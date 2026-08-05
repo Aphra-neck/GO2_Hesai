@@ -25,7 +25,7 @@ different domain from the Unitree SDK2 domain 0. Use the same ROS settings in
 every terminal that needs to communicate with the bridge.
 
 ```bash
-export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=30 \
 ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args \
   -p net:=enP8p1s0 \

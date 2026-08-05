@@ -88,12 +88,35 @@ port, query string, fragment, or embedded HTTP credential is rejected before
 any session data is copied. This prevents a stale `~/G02_log` directory from
 silently sending logs to another repository.
 
-Git authentication comes from the machine's normal credential helper. Tokens
-and credentials must not be placed in this script, environment snapshots, Git
-URLs, or collected logs. If the `G02_log` checkout has no repository-local
+Git authentication comes from the existing `~/G02_log` checkout. The current
+Jetson deployment uses a writable GitHub Deploy Key with an SSH remote on port
+443. The current repository-local setup is:
+
+```bash
+git -C ~/G02_log remote set-url origin \
+  git@github.com:Aphra-neck/G02_log.git
+git -C ~/G02_log config core.sshCommand \
+  "ssh -i /home/unitree/.ssh/g02_log_deploy -o IdentitiesOnly=yes -o HostName=ssh.github.com -p 443"
+```
+
+The matching public key must be registered on `Aphra-neck/G02_log` with
+**Allow write access** enabled. Before field use, while all robot processes are
+stopped, verify actual push permission without changing the remote:
+
+```bash
+git -C ~/G02_log remote -v
+GIT_TERMINAL_PROMPT=0 git -C ~/G02_log \
+  push --dry-run origin HEAD:refs/heads/main
+```
+
+The second command must succeed. Unlike `ls-remote` on a public repository,
+this checks write authentication. Tokens, private keys, and other credentials
+must not be placed in this script, environment snapshots, Git URLs, or
+collected logs. If the `G02_log` checkout has no repository-local
 `user.name` or `user.email`, `go2-log` copies the missing values from the
 current `GO2_Hesai` commit author into `G02_log/.git/config`; it never changes
-global Git identity.
+global Git identity. `GO2_LOG_PROXY` applies only to HTTP(S) Git operations;
+an SSH remote does not use that HTTP proxy.
 
 The command refuses to push while any known lidar, SLAM, planner, IMU bridge,
 SDK2 motion bridge, or RL controller process is running. It checks once before
