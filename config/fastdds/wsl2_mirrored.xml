@@ -21,6 +21,11 @@
                 <address>192.168.151.213</address>
               </udpv4>
             </locator>
+            <locator>
+              <udpv4>
+                <address>192.168.151.143</address>
+              </udpv4>
+            </locator>
           </initialPeersList>
         </builtin>
         <userTransports>
