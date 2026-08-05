@@ -3,14 +3,10 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-PLANNING_RVIZ="${PLANNING_RVIZ:-true}"
+PLANNING_RVIZ="${PLANNING_RVIZ:-false}"
 BODY_YAW_OFFSET="${GO2_BODY_YAW_OFFSET_RAD:--1.5707963267948966}"
 GO2_BODY_YAW_OFFSET_RAD="${BODY_YAW_OFFSET}"
-ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-30}"
-RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 export GO2_BODY_YAW_OFFSET_RAD
-export ROS_DOMAIN_ID
-export RMW_IMPLEMENTATION
 
 case "${PLANNING_RVIZ}" in
   true|false) ;;
@@ -20,19 +16,7 @@ case "${PLANNING_RVIZ}" in
     ;;
 esac
 
-set +u
-source /opt/ros/humble/setup.bash
-set -u
-
-if [[ ! -f "${WORKSPACE_DIR}/install/setup.bash" ]]; then
-  echo "Workspace is not built: ${WORKSPACE_DIR}/install/setup.bash is missing." >&2
-  echo "Run: colcon build --symlink-install" >&2
-  exit 1
-fi
-
-set +u
-source "${WORKSPACE_DIR}/install/setup.bash"
-set -u
+source "${SCRIPT_DIR}/ros2_environment.sh"
 
 if ! ros2 pkg prefix utree_dog_navigation >/dev/null 2>&1; then
   echo "ROS 2 package is not installed: utree_dog_navigation" >&2
@@ -73,6 +57,8 @@ echo "======================================"
 echo " Go2 terrain navigation (ROS 2)"
 echo " ROS domain: ${ROS_DOMAIN_ID}"
 echo " ROS RMW: ${RMW_IMPLEMENTATION}"
+echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
+echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Planning RViz: ${PLANNING_RVIZ}"
 echo " Body yaw offset: ${BODY_YAW_OFFSET} rad"
 echo "======================================"

@@ -68,6 +68,21 @@ git -c http.proxy=http://192.168.151.143:7890 \
 这些代理设置只作用于单条 Git 命令，不写入全局配置。如果现场网络可直接访问
 GitHub，可以省略两个 `-c ...proxy=...` 参数。
 
+代码修改、commit 和 push 只在本地开发 checkout 中完成，目标为 `origin/ROS2`；
+Jetson 的 `~/catkin_ws` 只使用上面的 `pull --ff-only` 更新。确认机器人静止且 SLAM、
+规划、SDK2 bridge 和日志上传均已停止后，本地 Windows PowerShell 可执行：
+
+```powershell
+Set-Location C:\path\to\GO2_Hesai
+git status --short --branch
+git -c http.proxy=http://192.168.151.143:7890 `
+  -c https.proxy=http://192.168.151.143:7890 `
+  push origin ROS2
+```
+
+公开仓库的 push 仍需要当前开发机具有写权限；使用已有 Git 凭据，不把 token 写进
+命令、脚本或 remote URL。
+
 拉取完成后检查当前分支和远端跟踪关系：
 
 ```bash
@@ -224,9 +239,10 @@ Go2 LowState
 - `src/utree_dog_navigation`：IMU 到机身朝向适配、时序地形图和机身 lattice 路径规划器。
 - `src/utree_go2_sdk2_bridge`：将 `/body_path` 转换为受限的 Unitree SDK2
   `SportClient` 指令，默认禁止运动。
+- `shell/ros2_environment.sh`：统一准备 Jetson 的 Humble、工作空间和 Fast DDS 环境。
 - `shell/start_slam.sh`：顺序启动雷达、IMU 桥接器和 Super-LIO 的脚本。
-- `shell/start_navigation.sh`：启动规划层，可选启动本地 RViz2；分布式流程必须设置
-  `PLANNING_RVIZ=false`。
+- `shell/start_navigation.sh`：默认无界面启动规划层；只在明确需要 Jetson 本地显示时
+  设置 `PLANNING_RVIZ=true`。
 - `shell/start_sdk2_bridge.sh`：安全检查后启动默认禁用的路径执行器。
 - `tools/go2-log`：采集、检查、停止和上传有界诊断会话。
 
@@ -274,6 +290,12 @@ Humble/Fast DDS 2.6 使用：
 ```bash
 export FASTRTPS_DEFAULT_PROFILES_FILE=<profile-path>
 ```
+
+Jetson 的三个项目启动脚本会自动 source `shell/ros2_environment.sh`，不需要在每个
+启动终端重复导出这些变量。该 helper 使用自身路径定位仓库，不依赖当前 `$PWD`，并
+自动加载 Humble、`install/setup.bash`、校验 Jetson profile 和停止旧 ROS daemon。
+只有改用另一份 Jetson profile 时才设置 `GO2_FASTDDS_PROFILE=/absolute/path/file.xml`。
+WSL2 不使用 Jetson helper，仍按下文加载自己的 `wsl2_mirrored.xml`。
 
 不要同时设置 `ROS_DISCOVERY_SERVER` 或 `ROS_SUPER_CLIENT`。`ROS_SUPER_CLIENT=TRUE`
 不是有效地址配置。
@@ -414,24 +436,6 @@ pgrep -af \
 
 ```bash
 cd ~/catkin_ws
-source /opt/ros/humble/setup.bash
-
-unset ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI \
-  FASTDDS_DEFAULT_PROFILES_FILE
-export FASTRTPS_DEFAULT_PROFILES_FILE="$PWD/config/fastdds/jetson_wifi.xml"
-export ROS_DOMAIN_ID=30
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_LOCALHOST_ONLY=0
-test -r "$FASTRTPS_DEFAULT_PROFILES_FILE" || exit 1
-ros2 daemon stop
-
-lowcmd_info="$(ros2 topic info --no-daemon --spin-time 3 /lowcmd 2>/dev/null || true)"
-if grep -Eq 'Publisher count: [1-9][0-9]*' <<<"$lowcmd_info"; then
-  printf '%s\n' "$lowcmd_info" >&2
-  echo 'A /lowcmd publisher is active; stop it before continuing.' >&2
-  exit 1
-fi
-
 ./shell/start_slam.sh
 ```
 
@@ -446,7 +450,8 @@ fi
 ```
 
 `start_slam.sh` 固定使用 `rviz:=false`。不要在 Jetson 启动 Super-LIO 自带 RViz。
-脚本会自行 source `install/setup.bash`，所以日常命令不需要在外层重复 source 工作空间。
+脚本会自动准备 ROS/Fast DDS 环境，并拒绝在检测到 RL 控制器进程或 `/lowcmd`
+publisher 时启动。日常命令不需要在外层 source ROS 或重复 export 环境变量。
 
 ### 2. Jetson 终端 2：启动无界面规划
 
@@ -454,19 +459,11 @@ fi
 
 ```bash
 cd ~/catkin_ws
-source /opt/ros/humble/setup.bash
-
-unset ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI \
-  FASTDDS_DEFAULT_PROFILES_FILE
-export FASTRTPS_DEFAULT_PROFILES_FILE="$PWD/config/fastdds/jetson_wifi.xml"
-export ROS_DOMAIN_ID=30
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_LOCALHOST_ONLY=0
-test -r "$FASTRTPS_DEFAULT_PROFILES_FILE" || exit 1
-ros2 daemon stop
-
-PLANNING_RVIZ=false ./shell/start_navigation.sh
+./shell/start_navigation.sh
 ```
+
+该脚本默认 `PLANNING_RVIZ=false`。只有临时改回 Jetson 本地可视化时才使用
+`PLANNING_RVIZ=true ./shell/start_navigation.sh`；分布式日常流程不要设置它。
 
 正常情况下会启动：
 
@@ -575,6 +572,7 @@ pgrep -af \
 | 变量 | 默认值或当前值 | 作用 |
 | --- | --- | --- |
 | `FASTRTPS_DEFAULT_PROFILES_FILE` | Jetson/WSL2 各自 XML | Fast DDS Wi-Fi 静态 peer |
+| `GO2_FASTDDS_PROFILE` | Jetson 仓库内的 `jetson_wifi.xml` | 覆盖 Jetson 启动脚本使用的 profile |
 | `ROS_DOMAIN_ID` | `30` | 与 Unitree SDK domain 0 隔离 |
 | `RMW_IMPLEMENTATION` | `rmw_fastrtps_cpp` | 避免 ROS 2 与 SDK2 CycloneDDS 冲突 |
 | `ROS_LOCALHOST_ONLY` | `0` | 允许跨主机 ROS 2 通信 |
@@ -583,6 +581,7 @@ pgrep -af \
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
 | `UNITREE_SDK_LIBRARY_DIR` | `/usr/local/lib` | Unitree SDK 配套 DDS 动态库目录 |
 | `GO2_BODY_YAW_OFFSET_RAD` | `-1.5707963267948966` | IMU 到 `base_link` 的 yaw 校正 |
+| `PLANNING_RVIZ` | `false` | 仅显式设为 `true` 时在 Jetson 启动规划 RViz |
 
 ### 坐标与 RViz 所有权
 
@@ -604,8 +603,7 @@ odom_topic: /lio/body_odom
 重复测试确认需要实验值时，才在规划终端覆盖：
 
 ```bash
-GO2_BODY_YAW_OFFSET_RAD=-1.525243233318 \
-PLANNING_RVIZ=false ./shell/start_navigation.sh
+GO2_BODY_YAW_OFFSET_RAD=-1.525243233318 ./shell/start_navigation.sh
 ```
 
 不要修改 `lio.extrinsic.lidar_imu` 来校正机身方向。
@@ -613,7 +611,8 @@ PLANNING_RVIZ=false ./shell/start_navigation.sh
 ### SDK2 路径执行器
 
 SDK2 bridge 不属于当前日常启动流程。以下所有门槛必须有日志和测试记录后，才可在
-第三个 Jetson 终端使用与上文相同的 Fast DDS 环境启动：
+第三个 Jetson 终端直接运行启动脚本；它会自动使用与 SLAM/规划相同的 Fast DDS
+环境：
 
 - 无头感知加远程 RViz 时，IMU、雷达、里程计和世界点云达到性能基线。
 - `world -> imu -> base_link` 方向与实机直行一致，静止漂移通过验收。
@@ -733,26 +732,16 @@ yaw 偏置，并保留原始 JSONL。PCD、rosbag 和 core dump
 进程检查、启动顺序和诊断采集。以下命令都需要在 Jetson 仓库根目录执行。
 
 Unitree SDK 固定使用 CycloneDDS domain 0。为避免它与同进程内的 ROS 2
-CycloneDDS 冲突，ROS 2 使用 Fast DDS 和非零 domain。每个新终端都要先完整执行：
+CycloneDDS 冲突，ROS 2 使用 Fast DDS 和非零 domain。每个手动诊断终端先执行：
 
 ```bash
 cd ~/catkin_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-
-unset ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI \
-  FASTDDS_DEFAULT_PROFILES_FILE
-export FASTRTPS_DEFAULT_PROFILES_FILE="$PWD/config/fastdds/jetson_wifi.xml"
-export ROS_DOMAIN_ID=30
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_LOCALHOST_ONLY=0
-
-test -r "$FASTRTPS_DEFAULT_PROFILES_FILE" || exit 1
-ros2 daemon stop
+source ./shell/ros2_environment.sh
 ```
 
-环境变量不会跨终端继承。省略 profile 会使分布式发现失效；profile 只含远端 peer
-时，还会使同机 publisher 与 subscriber 互相发现失败。
+启动脚本中的环境不会回写其父终端，所以独立执行 `ros2 topic` 或单组件诊断时仍要
+source 该 helper。省略 profile 会使分布式发现失效；profile 只含远端 peer 时，还会
+使同机 publisher 与 subscriber 互相发现失败。
 
 终端 1，启动 Hesai XT-16：
 
@@ -785,16 +774,7 @@ ros2 launch super_lio hesai.py rviz:=false
 
 ```bash
 cd ~/catkin_ws
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-unset ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI \
-  FASTDDS_DEFAULT_PROFILES_FILE
-export FASTRTPS_DEFAULT_PROFILES_FILE="$PWD/config/fastdds/jetson_wifi.xml"
-export ROS_DOMAIN_ID=30
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export ROS_LOCALHOST_ONLY=0
-test -r "$FASTRTPS_DEFAULT_PROFILES_FILE" || exit 1
-ros2 daemon stop
+source ./shell/ros2_environment.sh
 ```
 
 查看话题：
@@ -978,16 +958,16 @@ bridge 只读取 Go2 LowState 并发布 IMU，不会向机器狗发送控制命�
 ### `ros2: command not found`
 
 每个新终端都必须重新加载 ROS 2；只设置 `ROS_DOMAIN_ID` 不会把 `ros2` 加入
-`PATH`：
+`PATH`。Jetson 诊断终端使用项目 helper：
 
 ```bash
-source /opt/ros/humble/setup.bash
-source ~/catkin_ws/install/setup.bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
 command -v ros2
 ```
 
-最后一条应输出 `/opt/ros/humble/bin/ros2`。WSL2 只 source Humble，不要 source
-Jetson 工作空间或 Foxy/Noetic 环境。
+WSL2 则只执行 `source /opt/ros/humble/setup.bash`，不要 source Jetson helper、工作空间
+或 Foxy/Noetic 环境。最后一条应输出 `/opt/ros/humble/bin/ros2`。
 
 ### 只能看到 `/parameter_events` 和 `/rosout`
 
@@ -1008,10 +988,10 @@ ros2 topic list --no-daemon
 
 ### Hesai 日志持续有 raw frame，但启动脚本等待 `/lidar_points` 超时
 
-这说明雷达 UDP 和解码正常，故障位于 Jetson 本机 ROS 2 participant 发现。确认
-Jetson profile 已在启动脚本之前导出，并同时包含远端 peer 和本机
-`192.168.151.213`。结束残留的驱动/probe 进程、停止 daemon 后重新启动，不要重复
-启动多个 Hesai 驱动。
+这说明雷达 UDP 和解码正常，故障位于 Jetson 本机 ROS 2 participant 发现。确认启动
+横幅显示仓库内的 `jetson_wifi.xml`，且该 profile 同时包含远端 peer 和本机
+`192.168.151.213`。结束残留的驱动/probe 进程后重新运行脚本；helper 会停止旧
+daemon。不要重复启动多个 Hesai 驱动。
 
 ### 能看到话题或 endpoint，但收不到点云
 
@@ -1092,12 +1072,10 @@ tail -n 100 ~/slam_logs/go2_imu_bridge.log
 也可以单独运行 bridge，直接查看报错：
 
 ```bash
-# 先执行“分别启动各组件”开头的完整 Jetson 环境块
-source /opt/ros/humble/setup.bash
-source install/setup.bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
 export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-RMW_IMPLEMENTATION=rmw_fastrtps_cpp ROS_DOMAIN_ID=30 \
-  ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args -p net:=enP8p1s0
+ros2 run go2_imu_bridge go2_imu_bridge_node --ros-args -p net:=enP8p1s0
 ```
 
 bridge 运行时可在另一个终端确认实际加载的 DDS库：

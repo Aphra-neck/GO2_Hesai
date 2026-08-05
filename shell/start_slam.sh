@@ -6,16 +6,8 @@ WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 LOG_DIR="${SLAM_LOG_DIR:-${HOME}/slam_logs}"
 NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 IMU_RATE="${GO2_IMU_RATE:-200.0}"
-ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-30}"
-RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
 UNITREE_SDK_LIBRARY_DIR="${UNITREE_SDK_LIBRARY_DIR:-/usr/local/lib}"
-export ROS_DOMAIN_ID
-export RMW_IMPLEMENTATION
-
-# ROS-generated setup scripts may read optional variables that are unset.
-set +u
-source /opt/ros/humble/setup.bash
-set -u
+source "${SCRIPT_DIR}/ros2_environment.sh"
 
 if ! command -v setsid >/dev/null 2>&1; then
   echo "The setsid command is required to manage ROS 2 child processes." >&2
@@ -29,15 +21,6 @@ if ! ip link show dev "${NETWORK_INTERFACE}" >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ ! -f "${WORKSPACE_DIR}/install/setup.bash" ]]; then
-  echo "Workspace is not built: ${WORKSPACE_DIR}/install/setup.bash is missing." >&2
-  echo "Run: colcon build --symlink-install" >&2
-  exit 1
-fi
-
-set +u
-source "${WORKSPACE_DIR}/install/setup.bash"
-set -u
 mkdir -p "${LOG_DIR}"
 
 # Pair Unitree's libddscxx with the matching libddsc before ROS library paths.
@@ -63,6 +46,21 @@ fi
 if ! ros2 pkg prefix "${RMW_IMPLEMENTATION}" >/dev/null 2>&1; then
   echo "ROS 2 RMW package is not installed: ${RMW_IMPLEMENTATION}" >&2
   echo "Install it with: sudo apt install ros-humble-rmw-fastrtps-cpp" >&2
+  exit 1
+fi
+
+if pgrep -f -- "utree_go2_rl_controller|rl_controller_node" >/dev/null 2>&1; then
+  echo "An RL low-level controller is running. Stop it before starting this pipeline." >&2
+  pgrep -af -- "utree_go2_rl_controller|rl_controller_node" >&2 || true
+  exit 1
+fi
+
+lowcmd_info="$(
+  ros2 topic info --no-daemon --spin-time 3 /lowcmd 2>/dev/null || true
+)"
+if grep -Eq "Publisher count: [1-9][0-9]*" <<<"${lowcmd_info}"; then
+  echo "A /lowcmd publisher is active. Stop it before starting this pipeline." >&2
+  printf '%s\n' "${lowcmd_info}" >&2
   exit 1
 fi
 
@@ -175,6 +173,8 @@ echo "======================================"
 echo " Go2 + Hesai XT-16 + Super-LIO (ROS 2)"
 echo " ROS domain: ${ROS_DOMAIN_ID} (Unitree SDK domain: 0)"
 echo " ROS RMW: ${RMW_IMPLEMENTATION}"
+echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
+echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Unitree DDS libraries: ${UNITREE_SDK_LIBRARY_DIR}"
 echo "======================================"
 
