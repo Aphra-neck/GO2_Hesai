@@ -5,6 +5,7 @@
       <transport_descriptor>
         <transport_id>go2_wsl2_wifi_udp</transport_id>
         <type>UDPv4</type>
+        <maxInitialPeersRange>64</maxInitialPeersRange>
         <interfaceWhiteList>
           <address>192.168.151.143</address>
         </interfaceWhiteList>
@@ -13,6 +14,15 @@
 
     <participant profile_name="participant_profile_ros2" is_default_profile="true">
       <rtps>
+        <builtin>
+          <initialPeersList>
+            <locator>
+              <udpv4>
+                <address>192.168.151.213</address>
+              </udpv4>
+            </locator>
+          </initialPeersList>
+        </builtin>
         <userTransports>
           <transport_id>go2_wsl2_wifi_udp</transport_id>
         </userTransports>
