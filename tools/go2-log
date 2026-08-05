@@ -54,6 +54,17 @@ declare -ar COMPONENT_SPECS=(
   'go2_rl_controller:rl_controller_node|utree_go2_rl_controller'
 )
 
+declare -ar REPAIRABLE_SESSION_TEXT_FILES=(
+  'topic_rates.csv'
+  'odom_position.csv'
+  'body_odom_pose.csv'
+  'sdk2_commands.csv'
+  'process_health.csv'
+  'events.jsonl'
+  'rosout_warn_error.txt'
+  'collector.log'
+)
+
 die() {
   echo "go2-log: $*" >&2
   exit 1
@@ -207,14 +218,19 @@ PY
 
 enforce_session_size_limit() {
   local session_dir="$1"
-  local size
+  local size protect_repair_outputs=false
+  if [[ -f "${session_dir}/repair_manifest.jsonl" && ! -L "${session_dir}/repair_manifest.jsonl" ]]; then
+    protect_repair_outputs=true
+  fi
   size="$(session_bytes "${session_dir}")"
   (( size <= SESSION_FINAL_BYTES )) && return 0
 
   printf '%s session captures were trimmed on approach to the 100 MiB safety ceiling\n' \
     "$(utc_now)" > "${session_dir}/capacity_reached.txt"
-  cap_text_file "${session_dir}/rosout_warn_error.txt" $((16 * 1024 * 1024))
-  cap_text_file "${session_dir}/collector.log" $((4 * 1024 * 1024))
+  if [[ "${protect_repair_outputs}" != true ]]; then
+    cap_text_file "${session_dir}/rosout_warn_error.txt" $((16 * 1024 * 1024))
+    cap_text_file "${session_dir}/collector.log" $((4 * 1024 * 1024))
+  fi
 
   local path
   for path in git.txt ros_dds_environment.txt network.txt system.txt topics.txt nodes.txt capacity_reached.txt; do
@@ -224,6 +240,7 @@ enforce_session_size_limit() {
     cap_text_file "${path}" $((512 * 1024))
   done < <(find "${session_dir}" -maxdepth 1 -type f -name 'parameters_*.yaml' -print0)
   for path in topic_rates.csv odom_position.csv body_odom_pose.csv sdk2_commands.csv process_health.csv events.jsonl; do
+    [[ "${protect_repair_outputs}" != true ]] || continue
     cap_text_file "${session_dir}/${path}" $((8 * 1024 * 1024))
   done
 
@@ -243,6 +260,12 @@ owned_names = {
     "process_health.csv", "events.jsonl", "capacity_reached.txt",
     "rosout.identity",
 }
+repair_protected_names = {
+    "topic_rates.csv", "odom_position.csv", "body_odom_pose.csv",
+    "sdk2_commands.csv", "process_health.csv", "events.jsonl",
+    "rosout_warn_error.txt", "collector.log",
+}
+protect_repair_outputs = (root / "repair_manifest.jsonl").is_file()
 
 def files() -> list[Path]:
     return [path for path in root.rglob("*") if path.is_file() and not path.is_symlink()]
@@ -250,6 +273,8 @@ def files() -> list[Path]:
 def is_owned_text(path: Path) -> bool:
     relative = path.relative_to(root)
     if len(relative.parts) == 1:
+        if protect_repair_outputs and path.name in repair_protected_names:
+            return False
         return path.name in owned_names or (
             path.name.startswith("parameters_") and path.suffix in {".yaml", ".tmp"}
         )
@@ -400,7 +425,41 @@ stop_rosout_collector_process() {
   else
     kill -TERM "${pid}" 2>/dev/null || return 1
   fi
+  for _ in {1..50}; do
+    if ! rosout_identity_matches \
+      "${pid}" "${expected_boot_id}" "${expected_start_ticks}" "${session_dir}"; then
+      wait "${pid}" 2>/dev/null || true
+      return 0
+    fi
+    if [[ "$(process_state "${pid}" 2>/dev/null || true)" == Z ]]; then
+      wait "${pid}" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
   wait "${pid}" 2>/dev/null || true
+  rosout_identity_matches \
+    "${pid}" "${expected_boot_id}" "${expected_start_ticks}" "${session_dir}" && return 1
+  return 0
+}
+
+read_rosout_identity() {
+  local session_dir="$1"
+  local identity_file="${session_dir}/rosout.identity"
+  [[ -f "${identity_file}" && ! -L "${identity_file}" ]] || return 1
+  local key value pid='' captured_boot_id='' captured_start_ticks='' recorded_session=''
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      pid) pid="${value}" ;;
+      boot_id) captured_boot_id="${value}" ;;
+      start_ticks) captured_start_ticks="${value}" ;;
+      session_dir) recorded_session="${value}" ;;
+    esac
+  done < "${identity_file}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "${captured_start_ticks}" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "${captured_boot_id}" && "${recorded_session}" == "${session_dir}" ]] || return 1
+  printf '%s %s %s\n' "${pid}" "${captured_boot_id}" "${captured_start_ticks}"
 }
 
 active_session_dir() {
@@ -586,21 +645,25 @@ sample_topic_rate() {
   timestamp="$(utc_now)"
 
   if ! command -v ros2 >/dev/null 2>&1; then
-    printf '%s,%s,,ros_unavailable\n' "${timestamp}" "${topic}" \
-      >> "${session_dir}/topic_rates.csv"
-    return 0
+    rate=''
+    status=ros_unavailable
+  else
+    result="$(LC_ALL=C timeout 4 ros2 topic hz "${topic}" --window 100 2>&1 || true)"
+    rate="$(awk '/average rate:/ {value=$3} END {print value}' <<< "${result}")"
+    if [[ "${rate}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      status=ok
+    else
+      rate=''
+      status=no_data
+    fi
   fi
 
-  result="$(LC_ALL=C timeout 4 ros2 topic hz "${topic}" --window 100 2>&1 || true)"
-  rate="$(awk '/average rate:/ {value=$3} END {print value}' <<< "${result}")"
-  if [[ "${rate}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-    status=ok
-  else
-    rate=''
-    status=no_data
-  fi
   printf '%s,%s,%s,%s\n' "${timestamp}" "${topic}" "${rate}" "${status}" \
     >> "${session_dir}/topic_rates.csv"
+  if ! sync --data -- "${session_dir}/topic_rates.csv"; then
+    echo "go2-log: failed to fdatasync ${session_dir}/topic_rates.csv" >&2
+    return 1
+  fi
 }
 
 sample_odometry_pair() {
@@ -974,6 +1037,9 @@ start_session() {
 
   source_ros_environment
   command -v ros2 >/dev/null 2>&1 || die "ROS 2 Humble environment is required"
+  command -v sync >/dev/null 2>&1 || die "GNU sync is required"
+  sync --help 2>&1 | grep -Fq -- '--data' ||
+    die "sync must support --data for durable topic-rate logging"
   python3 -c 'import rclpy; from nav_msgs.msg import Odometry' >/dev/null 2>&1 ||
     die "ROS 2 Python packages rclpy and nav_msgs are required"
 
@@ -1029,11 +1095,25 @@ status_session() {
 
 stop_session() {
   acquire_lock
-  local session_dir pid
+  local session_dir pid rosout_details rosout_pid rosout_boot rosout_start
+  local rosout_status writers
   session_dir="$(active_session_dir 2>/dev/null)" || die "no active session"
   pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
 
   if ! collector_is_running "${pid}" "${session_dir}"; then
+    if rosout_details="$(read_rosout_identity "${session_dir}" 2>/dev/null)"; then
+      read -r rosout_pid rosout_boot rosout_start <<< "${rosout_details}"
+      rosout_status=0
+      stop_rosout_collector_process \
+        "${rosout_pid}" "${rosout_boot}" "${rosout_start}" "${session_dir}" ||
+        rosout_status=$?
+      if (( rosout_status != 0 && rosout_status != 2 )); then
+        die "stale collector has a verified rosout writer that could not be stopped"
+      fi
+    fi
+    writers="$(running_diagnostic_writers | grep -F -- "${session_dir}" || true)"
+    [[ -z "${writers}" ]] ||
+      die "stale session still has a live diagnostic writer; active state was preserved"
     rm -f -- "${ACTIVE_FILE}"
     die "removed stale active-session state; collector was not running"
   fi
@@ -1057,13 +1137,18 @@ running_robot_processes() {
 }
 
 assert_robot_idle() {
+  local action="${1:-Git push}"
   local processes
   processes="$(running_robot_processes)"
   if [[ -n "${processes}" ]]; then
-    echo "Refusing Git push while robot/SLAM/planning processes are running:" >&2
+    echo "Refusing ${action} while robot/SLAM/planning processes are running:" >&2
     echo "${processes}" >&2
     return 1
   fi
+}
+
+running_diagnostic_writers() {
+  pgrep -af '[g]o2-log (_collect|_rosout)' 2>/dev/null || true
 }
 
 validate_session_for_upload() {
@@ -1149,6 +1234,240 @@ for directory, dirnames, filenames in os.walk(root, followlinks=False):
 PY
   then
     die "session contains a forbidden or unsafe Git payload: ${session_dir}"
+  fi
+}
+
+validate_repair_evidence() {
+  local session_dir="$1"
+  if ! python3 - \
+    "${session_dir}" \
+    "${LOG_ROOT}" \
+    "${MAX_GIT_FILE_BYTES}" \
+    "${REPAIRABLE_SESSION_TEXT_FILES[@]}" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+session = Path(sys.argv[1])
+log_root = Path(sys.argv[2])
+max_file_bytes = int(sys.argv[3])
+allowed_names = set(sys.argv[4:])
+session_id = session.name
+manifest = session / "repair_manifest.jsonl"
+hash_pattern = re.compile(r"^[0-9a-f]{64}$")
+effective_uid = os.geteuid()
+manifest_fields = {
+    "file",
+    "original_sha256",
+    "original_size",
+    "quarantine_file",
+    "repaired_at",
+    "repaired_sha256",
+    "repaired_size",
+    "trailing_nul_bytes",
+}
+
+
+def reject(message: str) -> None:
+    print(f"go2-log repair evidence rejection: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def owned_directory(path: Path, description: str, missing_ok: bool = False):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return False
+        reject(f"{description} is missing: {path}")
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != effective_uid
+    ):
+        reject(f"{description} is not an owned directory: {path}")
+    return True
+
+
+def read_owned_file(path: Path, description: str, limit: int):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        reject(f"{description} is missing: {path}")
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != effective_uid
+    ):
+        reject(f"{description} is not an owned regular file: {path}")
+    if metadata.st_size > limit:
+        reject(f"{description} exceeds {limit} bytes: {path}")
+    data = path.read_bytes()
+    after = path.lstat()
+    if (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        reject(f"{description} changed while being read: {path}")
+    return data
+
+
+def validate_record(record, line_number: int):
+    if not isinstance(record, dict) or set(record) != manifest_fields:
+        reject(f"invalid manifest schema at line {line_number}")
+    if record["file"] not in allowed_names:
+        reject(f"invalid repaired filename at line {line_number}")
+    for key in ("original_sha256", "repaired_sha256"):
+        if not isinstance(record[key], str) or not hash_pattern.fullmatch(record[key]):
+            reject(f"invalid {key} at line {line_number}")
+    for key in ("original_size", "repaired_size", "trailing_nul_bytes"):
+        if not isinstance(record[key], int) or isinstance(record[key], bool) or record[key] < 0:
+            reject(f"invalid {key} at line {line_number}")
+    if (
+        record["trailing_nul_bytes"] <= 0
+        or record["repaired_size"] + record["trailing_nul_bytes"]
+        != record["original_size"]
+        or record["original_size"] > max_file_bytes
+    ):
+        reject(f"inconsistent sizes at line {line_number}")
+    if not isinstance(record["repaired_at"], str) or not record["repaired_at"]:
+        reject(f"invalid repaired_at at line {line_number}")
+    expected_quarantine = (
+        f"quarantine/{session_id}/{record['file']}."
+        f"{record['original_sha256']}.corrupt"
+    )
+    if record["quarantine_file"] != expected_quarantine:
+        reject(f"invalid quarantine path at line {line_number}")
+    return record
+
+
+owned_directory(log_root, "diagnostics root")
+owned_directory(session, "session")
+quarantine_root = log_root / "quarantine"
+quarantine = quarantine_root / session_id
+
+if not manifest.exists() and not manifest.is_symlink():
+    if owned_directory(quarantine, "session quarantine", missing_ok=True):
+        unfinished = sorted(
+            path.name
+            for path in quarantine.iterdir()
+            if path.name.endswith(".repair.json") or path.name.endswith(".corrupt")
+        )
+        if unfinished:
+            reject("quarantine evidence exists without a repair manifest; run go2-log repair")
+    raise SystemExit(0)
+
+manifest_data = read_owned_file(manifest, "repair manifest", 1024 * 1024)
+if not manifest_data or not manifest_data.endswith(b"\n"):
+    reject("repair manifest is empty or lacks a final newline")
+try:
+    manifest_text = manifest_data.decode("utf-8")
+except UnicodeDecodeError:
+    reject("repair manifest is not valid UTF-8")
+
+owned_directory(quarantine_root, "quarantine root")
+owned_directory(quarantine, "session quarantine")
+records = []
+record_keys = set()
+for line_number, line in enumerate(manifest_text.splitlines(), 1):
+    try:
+        record = validate_record(json.loads(line), line_number)
+    except json.JSONDecodeError:
+        reject(f"invalid repair manifest JSON at line {line_number}")
+    key = (record["file"], record["original_sha256"])
+    if key in record_keys:
+        reject(f"duplicate manifest record at line {line_number}")
+    record_keys.add(key)
+    records.append(record)
+
+expected_journals = {
+    f"{record['file']}.{record['original_sha256']}.repair.json"
+    for record in records
+}
+expected_originals = {
+    f"{record['file']}.{record['original_sha256']}.corrupt"
+    for record in records
+}
+actual_journals = {
+    path.name for path in quarantine.iterdir() if path.name.endswith(".repair.json")
+}
+actual_originals = {
+    path.name for path in quarantine.iterdir() if path.name.endswith(".corrupt")
+}
+if actual_journals != expected_journals or actual_originals != expected_originals:
+    reject("manifest, repair journals, and quarantined originals do not match")
+
+latest_clean = {}
+for record in records:
+    name = record["file"]
+    original_name = f"{name}.{record['original_sha256']}.corrupt"
+    journal_name = f"{name}.{record['original_sha256']}.repair.json"
+    original = read_owned_file(
+        quarantine / original_name,
+        "quarantined original",
+        max_file_bytes,
+    )
+    if (
+        len(original) != record["original_size"]
+        or hashlib.sha256(original).hexdigest() != record["original_sha256"]
+    ):
+        reject(f"quarantined original hash or size mismatch: {name}")
+    clean = original[: record["repaired_size"]]
+    suffix = original[record["repaired_size"] :]
+    if (
+        len(suffix) != record["trailing_nul_bytes"]
+        or not suffix
+        or any(suffix)
+        or not clean.endswith(b"\n")
+        or hashlib.sha256(clean).hexdigest() != record["repaired_sha256"]
+    ):
+        reject(f"quarantined original is not the recorded trailing-NUL repair: {name}")
+    try:
+        clean.decode("utf-8")
+    except UnicodeDecodeError:
+        reject(f"recorded repaired text is not valid UTF-8: {name}")
+    previous = latest_clean.get(name)
+    if previous is not None and not clean.startswith(previous):
+        reject(f"repair history is not append-only: {name}")
+    latest_clean[name] = clean
+
+    journal_data = read_owned_file(
+        quarantine / journal_name,
+        "repair journal",
+        1024 * 1024,
+    )
+    try:
+        journal = json.loads(journal_data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        reject(f"invalid repair journal JSON: {journal_name}")
+    expected_journal = dict(record, state="completed")
+    if journal != expected_journal:
+        reject(f"repair journal is not completed or disagrees with manifest: {name}")
+
+for name, clean in latest_clean.items():
+    current = read_owned_file(
+        session / name,
+        "repaired session file",
+        max_file_bytes,
+    )
+    if current != clean:
+        reject(f"repaired session file no longer matches completed evidence: {name}")
+PY
+  then
+    die "session repair evidence is incomplete or inconsistent: ${session_dir}"
   fi
 }
 
@@ -1376,6 +1695,649 @@ select_session() {
   printf '%s\n' "${SESSIONS_DIR}/${latest}"
 }
 
+repair_trailing_nul_suffixes() {
+  local log_root="$1"
+  local session_id="$2"
+  local repaired_at="$3"
+  local max_file_bytes="$4"
+
+  python3 - \
+    "${log_root}" \
+    "${session_id}" \
+    "${repaired_at}" \
+    "${max_file_bytes}" \
+    "${REPAIRABLE_SESSION_TEXT_FILES[@]}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import sys
+
+log_root = Path(sys.argv[1])
+session_id = sys.argv[2]
+repaired_at = sys.argv[3]
+max_file_bytes = int(sys.argv[4])
+names = sys.argv[5:]
+manifest_name = "repair_manifest.jsonl"
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+directory_flag = getattr(os, "O_DIRECTORY", 0)
+effective_uid = os.geteuid()
+hash_pattern = re.compile(r"^[0-9a-f]{64}$")
+manifest_payload = b""
+manifest_records = {}
+latest_manifest_key = {}
+temporary_counter = 0
+
+
+def reject(message: str) -> None:
+    print(f"go2-log repair rejection: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def open_owned_directory(path: Path, description: str) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | directory_flag | no_follow)
+    except OSError as exception:
+        reject(f"cannot open {description}: {path}: {exception}")
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != effective_uid:
+        os.close(descriptor)
+        reject(f"{description} is not an owned directory: {path}")
+    return descriptor
+
+
+def open_owned_directory_at(parent: int, name: str, description: str) -> int:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | directory_flag | no_follow,
+            dir_fd=parent,
+        )
+    except OSError as exception:
+        reject(f"cannot open {description}: {name}: {exception}")
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != effective_uid:
+        os.close(descriptor)
+        reject(f"{description} is not an owned directory: {name}")
+    return descriptor
+
+
+def ensure_owned_directory_at(parent: int, name: str, description: str) -> int:
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent)
+        os.fsync(parent)
+    except FileExistsError:
+        pass
+    return open_owned_directory_at(parent, name, description)
+
+
+def read_regular(
+    directory: int,
+    name: str,
+    description: str,
+    limit: int,
+    missing_ok: bool = False,
+):
+    try:
+        descriptor = os.open(name, os.O_RDONLY | no_follow, dir_fd=directory)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        reject(f"{description} is missing: {name}")
+    except OSError as exception:
+        reject(f"cannot open {description}: {name}: {exception}")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != effective_uid:
+            reject(f"{description} is not an owned regular file: {name}")
+        if before.st_size > limit:
+            reject(f"{description} exceeds {limit} bytes: {name}")
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                reject(f"{description} changed while being read: {name}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            reject(f"{description} grew while being read: {name}")
+        after = os.fstat(descriptor)
+        signature_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        signature_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if signature_before != signature_after:
+            reject(f"{description} changed while being read: {name}")
+        return b"".join(chunks), before
+    finally:
+        os.close(descriptor)
+
+
+def write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+def next_temporary_name(label: str) -> str:
+    global temporary_counter
+    temporary_counter += 1
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+    nonce = secrets.token_hex(8)
+    return f".{safe}.repair-{os.getpid()}-{temporary_counter}-{nonce}.tmp"
+
+
+def write_quarantine_temporary(quarantine_fd: int, label: str, payload: bytes, mode: int) -> str:
+    descriptor = None
+    temporary = ""
+    for _ in range(100):
+        temporary = next_temporary_name(label)
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow,
+                mode,
+                dir_fd=quarantine_fd,
+            )
+            break
+        except FileExistsError:
+            continue
+    if descriptor is None:
+        reject(f"could not allocate a repair temporary for: {label}")
+    try:
+        write_all(descriptor, payload)
+        os.fsync(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    return temporary
+
+
+def atomic_replace_from_quarantine(
+    quarantine_fd: int,
+    target_fd: int,
+    target_name: str,
+    payload: bytes,
+    mode: int,
+) -> None:
+    temporary = write_quarantine_temporary(
+        quarantine_fd, target_name, payload, mode
+    )
+    try:
+        os.replace(
+            temporary,
+            target_name,
+            src_dir_fd=quarantine_fd,
+            dst_dir_fd=target_fd,
+        )
+        os.fsync(quarantine_fd)
+        os.fsync(target_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=quarantine_fd)
+        except FileNotFoundError:
+            pass
+
+
+def ensure_quarantined_original(
+    quarantine_fd: int,
+    name: str,
+    payload: bytes,
+) -> None:
+    existing = read_regular(
+        quarantine_fd,
+        name,
+        "quarantined original",
+        max_file_bytes,
+        missing_ok=True,
+    )
+    if existing is not None:
+        if existing[0] != payload:
+            reject(f"quarantine hash collision: {name}")
+        return
+
+    temporary = write_quarantine_temporary(
+        quarantine_fd, name, payload, 0o600
+    )
+    try:
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=quarantine_fd,
+                dst_dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            existing = read_regular(
+                quarantine_fd,
+                name,
+                "quarantined original",
+                max_file_bytes,
+            )
+            if existing[0] != payload:
+                reject(f"quarantine hash collision: {name}")
+        os.unlink(temporary, dir_fd=quarantine_fd)
+        os.fsync(quarantine_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=quarantine_fd)
+        except FileNotFoundError:
+            pass
+
+
+def analyze_trailing_nul(data: bytes, name: str):
+    first_nul = data.find(b"\0")
+    if first_nul < 0:
+        return None
+    if any(memoryview(data)[first_nul:]):
+        reject(f"NUL bytes are not a trailing suffix: {name}")
+    if first_nul == 0 or data[first_nul - 1] != 0x0A:
+        reject(f"text before the trailing NUL suffix is not a complete line: {name}")
+    clean = data[:first_nul]
+    try:
+        clean.decode("utf-8")
+    except UnicodeDecodeError:
+        reject(f"text before the trailing NUL suffix is not valid UTF-8: {name}")
+    return {
+        "original_sha256": hashlib.sha256(data).hexdigest(),
+        "original_size": len(data),
+        "repaired_sha256": hashlib.sha256(clean).hexdigest(),
+        "repaired_size": len(clean),
+        "trailing_nul_bytes": len(data) - first_nul,
+        "clean": clean,
+    }
+
+
+manifest_fields = {
+    "file",
+    "original_sha256",
+    "original_size",
+    "quarantine_file",
+    "repaired_at",
+    "repaired_sha256",
+    "repaired_size",
+    "trailing_nul_bytes",
+}
+
+
+def validate_record(record, description: str, allow_state: bool):
+    expected = manifest_fields | ({"state"} if allow_state else set())
+    if not isinstance(record, dict) or set(record) != expected:
+        reject(f"invalid {description} schema")
+    if record["file"] not in names:
+        reject(f"invalid {description} file: {record['file']}")
+    for key in ("original_sha256", "repaired_sha256"):
+        if not isinstance(record[key], str) or not hash_pattern.fullmatch(record[key]):
+            reject(f"invalid {description} {key}")
+    for key in (
+        "original_size",
+        "repaired_size",
+        "trailing_nul_bytes",
+    ):
+        if not isinstance(record[key], int) or isinstance(record[key], bool) or record[key] < 0:
+            reject(f"invalid {description} {key}")
+    if (
+        record["trailing_nul_bytes"] <= 0
+        or record["repaired_size"] + record["trailing_nul_bytes"]
+        != record["original_size"]
+        or record["original_size"] > max_file_bytes
+    ):
+        reject(f"inconsistent {description} sizes")
+    if not isinstance(record["repaired_at"], str) or not record["repaired_at"]:
+        reject(f"invalid {description} repaired_at")
+    expected_quarantine = (
+        f"quarantine/{session_id}/{record['file']}."
+        f"{record['original_sha256']}.corrupt"
+    )
+    if record["quarantine_file"] != expected_quarantine:
+        reject(f"invalid {description} quarantine_file")
+    if allow_state and record["state"] not in {"prepared", "completed"}:
+        reject(f"invalid {description} state")
+    return record
+
+
+def json_line(record) -> bytes:
+    return (
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+root_fd = sessions_fd = session_fd = quarantine_root_fd = quarantine_fd = None
+try:
+    root_fd = open_owned_directory(log_root, "diagnostics root")
+    sessions_fd = open_owned_directory_at(root_fd, "sessions", "sessions root")
+    session_fd = open_owned_directory_at(sessions_fd, session_id, "session")
+    quarantine_root_fd = ensure_owned_directory_at(
+        root_fd, "quarantine", "quarantine root"
+    )
+    quarantine_fd = ensure_owned_directory_at(
+        quarantine_root_fd, session_id, "session quarantine"
+    )
+
+    manifest = read_regular(
+        session_fd,
+        manifest_name,
+        "repair manifest",
+        1024 * 1024,
+        missing_ok=True,
+    )
+    if manifest is not None:
+        manifest_payload = manifest[0]
+        if manifest_payload and not manifest_payload.endswith(b"\n"):
+            reject("existing repair manifest does not end with a newline")
+        try:
+            manifest_text = manifest_payload.decode("utf-8")
+        except UnicodeDecodeError:
+            reject("existing repair manifest is not valid UTF-8")
+        for line_number, line in enumerate(manifest_text.splitlines(), 1):
+            try:
+                record = validate_record(
+                    json.loads(line),
+                    f"repair manifest record at line {line_number}",
+                    False,
+                )
+            except json.JSONDecodeError:
+                reject(f"invalid repair manifest JSON at line {line_number}")
+            key = (record["file"], record["original_sha256"])
+            if key in manifest_records:
+                reject(f"duplicate repair manifest record: {record['file']}")
+            manifest_records[key] = record
+            latest_manifest_key[record["file"]] = key
+
+    journals = {}
+    for entry in sorted(os.listdir(quarantine_fd)):
+        if not entry.endswith(".repair.json"):
+            continue
+        journal_data = read_regular(
+            quarantine_fd,
+            entry,
+            "repair journal",
+            1024 * 1024,
+        )[0]
+        try:
+            journal_record = validate_record(
+                json.loads(journal_data.decode("utf-8")),
+                f"repair journal {entry}",
+                True,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            reject(f"invalid repair journal JSON: {entry}")
+        expected_entry = (
+            f"{journal_record['file']}."
+            f"{journal_record['original_sha256']}.repair.json"
+        )
+        if entry != expected_entry:
+            reject(f"repair journal filename does not match its record: {entry}")
+        key = (journal_record["file"], journal_record["original_sha256"])
+        if key in journals:
+            reject(f"duplicate repair journal: {entry}")
+        journals[key] = journal_record
+
+    plans = {}
+    for name in names:
+        current = read_regular(
+            session_fd,
+            name,
+            "repairable session file",
+            max_file_bytes,
+            missing_ok=True,
+        )
+        if current is None:
+            continue
+        analysis = analyze_trailing_nul(current[0], name)
+        if analysis is None:
+            continue
+        record = {
+            "file": name,
+            "original_sha256": analysis["original_sha256"],
+            "original_size": analysis["original_size"],
+            "quarantine_file": (
+                f"quarantine/{session_id}/{name}."
+                f"{analysis['original_sha256']}.corrupt"
+            ),
+            "repaired_at": repaired_at,
+            "repaired_sha256": analysis["repaired_sha256"],
+            "repaired_size": analysis["repaired_size"],
+            "trailing_nul_bytes": analysis["trailing_nul_bytes"],
+        }
+        plans[(name, analysis["original_sha256"])] = record
+
+    actions = {}
+    for key, journal in journals.items():
+        name = journal["file"]
+        evidence_name = f"{name}.{journal['original_sha256']}.corrupt"
+        evidence = read_regular(
+            quarantine_fd,
+            evidence_name,
+            "quarantined original",
+            max_file_bytes,
+        )[0]
+        analysis = analyze_trailing_nul(evidence, evidence_name)
+        if analysis is None:
+            reject(f"quarantined original has no trailing NUL suffix: {evidence_name}")
+        for field in (
+            "original_sha256",
+            "original_size",
+            "repaired_sha256",
+            "repaired_size",
+            "trailing_nul_bytes",
+        ):
+            if journal[field] != analysis[field]:
+                reject(f"repair journal does not match quarantined original: {evidence_name}")
+        manifest_record = {key: value for key, value in journal.items() if key != "state"}
+        existing_record = manifest_records.get(key)
+        if existing_record is not None and existing_record != manifest_record:
+            reject(f"repair manifest conflicts with journal: {name}")
+        current = read_regular(
+            session_fd,
+            name,
+            "repairable session file",
+            max_file_bytes,
+            missing_ok=True,
+        )
+        if current is None:
+            reject(f"repaired session file is missing: {name}")
+        current_sha = hashlib.sha256(current[0]).hexdigest()
+        if current_sha == journal["original_sha256"] and current[0] == evidence:
+            current_state = "original"
+        elif current_sha == journal["repaired_sha256"] and current[0] == analysis["clean"]:
+            current_state = "repaired"
+        else:
+            current_state = "other"
+        if journal["state"] == "completed":
+            if existing_record is None:
+                reject(f"completed repair journal has no manifest record: {name}")
+            if key != latest_manifest_key.get(name):
+                continue
+            if current_state == "original":
+                actions[key] = manifest_record
+            continue
+        if current_state == "other":
+            reject(f"session file no longer matches its prepared repair journal: {name}")
+        actions[key] = manifest_record
+
+    for key, record in plans.items():
+        if key in actions:
+            continue
+        if key in journals:
+            continue
+        if key in manifest_records:
+            reject(f"corrupt file already has a completed manifest record: {record['file']}")
+        actions[key] = record
+
+    if not actions:
+        print(f"No repairable trailing NUL suffix found in session: {session_id}")
+    else:
+        for key in sorted(actions):
+            record = actions[key]
+            name = record["file"]
+            evidence_name = f"{name}.{record['original_sha256']}.corrupt"
+            journal_name = f"{name}.{record['original_sha256']}.repair.json"
+
+            if key not in journals:
+                source = read_regular(
+                    session_fd,
+                    name,
+                    "repairable session file",
+                    max_file_bytes,
+                )
+                current = source[0]
+                analysis = analyze_trailing_nul(current, name)
+                if (
+                    analysis is None
+                    or analysis["original_sha256"] != record["original_sha256"]
+                    or analysis["repaired_sha256"] != record["repaired_sha256"]
+                ):
+                    reject(f"session file changed before quarantine: {name}")
+                clean = analysis["clean"]
+                ensure_quarantined_original(quarantine_fd, evidence_name, current)
+                prepared = dict(record, state="prepared")
+                atomic_replace_from_quarantine(
+                    quarantine_fd,
+                    quarantine_fd,
+                    journal_name,
+                    json_line(prepared),
+                    0o600,
+                )
+            else:
+                current = read_regular(
+                    quarantine_fd,
+                    evidence_name,
+                    "quarantined original",
+                    max_file_bytes,
+                )[0]
+                analysis = analyze_trailing_nul(current, evidence_name)
+                if analysis is None:
+                    reject(f"quarantined original has no trailing NUL suffix: {evidence_name}")
+                clean = analysis["clean"]
+
+            latest = read_regular(
+                session_fd,
+                name,
+                "repairable session file",
+                max_file_bytes,
+            )
+            latest_sha = hashlib.sha256(latest[0]).hexdigest()
+            if latest_sha == record["original_sha256"] and latest[0] == current:
+                atomic_replace_from_quarantine(
+                    quarantine_fd,
+                    session_fd,
+                    name,
+                    clean,
+                    stat.S_IMODE(latest[1].st_mode),
+                )
+            elif latest_sha != record["repaired_sha256"] or latest[0] != clean:
+                reject(f"session file changed during repair: {name}")
+
+            if key not in manifest_records:
+                manifest_payload += json_line(record)
+                atomic_replace_from_quarantine(
+                    quarantine_fd,
+                    session_fd,
+                    manifest_name,
+                    manifest_payload,
+                    0o600,
+                )
+                manifest_records[key] = record
+                latest_manifest_key[name] = key
+
+            completed = dict(record, state="completed")
+            atomic_replace_from_quarantine(
+                quarantine_fd,
+                quarantine_fd,
+                journal_name,
+                json_line(completed),
+                0o600,
+            )
+            print(
+                f"Repaired trailing NUL suffix: {name} "
+                f"({record['trailing_nul_bytes']} bytes)"
+            )
+            print(
+                "Preserved original: "
+                f"{log_root / record['quarantine_file']}"
+            )
+
+        print(f"Repair manifest: {log_root / 'sessions' / session_id / manifest_name}")
+finally:
+    for descriptor in (
+        quarantine_fd,
+        quarantine_root_fd,
+        session_fd,
+        sessions_fd,
+        root_fd,
+    ):
+        if descriptor is not None:
+            os.close(descriptor)
+PY
+}
+
+repair_session() {
+  acquire_lock
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+  local session_dir session_id active collector_pid writers size
+  session_dir="$(select_session "${1:-}")"
+  session_id="$(basename -- "${session_dir}")"
+  validate_session_id "${session_id}"
+
+  [[ -d "${session_dir}" && ! -L "${session_dir}" ]] ||
+    die "invalid or symbolic-link session directory: ${session_dir}"
+  [[ ! -e "${session_dir}/.uploaded" && ! -L "${session_dir}/.uploaded" ]] ||
+    die "refusing to modify an already uploaded session: ${session_id}"
+  size="$(session_bytes "${session_dir}")"
+  (( size <= SESSION_MAX_BYTES )) ||
+    die "session exceeds 100 MiB; preserve it with SCP instead of repairing in place"
+  if active="$(active_session_dir 2>/dev/null)"; then
+    die "collection is active ($(basename -- "${active}")); stop it before repair"
+  fi
+  collector_pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+  if collector_is_running "${collector_pid}" "${session_dir}"; then
+    die "selected session is still being collected by PID ${collector_pid}"
+  fi
+  writers="$(running_diagnostic_writers)"
+  if [[ -n "${writers}" ]]; then
+    echo "${writers}" >&2
+    die "stop all diagnostic writers before repair"
+  fi
+  assert_robot_idle "diagnostic repair" ||
+    die "stop all robot processes before repairing diagnostics"
+
+  repair_trailing_nul_suffixes \
+    "${LOG_ROOT}" "${session_id}" "$(utc_now)" "${MAX_GIT_FILE_BYTES}"
+  validate_repair_evidence "${session_dir}"
+  validate_session_for_upload "${session_dir}" true
+  echo "Session text validation passed after repair: ${session_id}"
+}
+
 validate_staged_session() {
   local session_id="$1"
   local session_path="sessions/${session_id}"
@@ -1405,7 +2367,7 @@ validate_staged_session() {
 upload_session() {
   acquire_lock
   command -v python3 >/dev/null 2>&1 || die "python3 is required"
-  local session_dir session_id active destination local_sha remote_sha collector_pid
+  local session_dir session_id active destination local_sha remote_sha collector_pid writers
   session_dir="$(select_session "${1:-}")"
   session_id="$(basename -- "${session_dir}")"
   validate_session_id "${session_id}"
@@ -1423,13 +2385,21 @@ upload_session() {
   if collector_is_running "${collector_pid}" "${session_dir}"; then
     die "selected session is still being collected by PID ${collector_pid}"
   fi
-  assert_robot_idle || die "stop all robot processes before uploading diagnostics"
+  writers="$(running_diagnostic_writers)"
+  if [[ -n "${writers}" ]]; then
+    echo "${writers}" >&2
+    die "stop all diagnostic writers before upload"
+  fi
+  assert_robot_idle "diagnostic upload" ||
+    die "stop all robot processes before uploading diagnostics"
 
   # Reject artifacts and binary data before any optional text compaction can
   # alter a stopped session. The strict size checks run after compaction.
+  validate_repair_evidence "${session_dir}"
   validate_session_for_upload "${session_dir}" true
   enforce_session_size_limit "${session_dir}" ||
     die "session remains oversized; preserve it with SCP before removing it"
+  validate_repair_evidence "${session_dir}"
   validate_session_for_upload "${session_dir}"
 
   prepare_log_repository "${session_id}"
@@ -1448,7 +2418,8 @@ upload_session() {
 
   # The clone/copy/commit phase can take long enough for a robot process to
   # start after the first check. Re-check immediately before network push.
-  assert_robot_idle || die "robot process started during upload; the local commit is retained for retry"
+  assert_robot_idle "Git push" ||
+    die "robot process started during upload; the local commit is retained for retry"
   git_with_proxy -C "${LOG_REPO}" push origin "HEAD:refs/heads/${LOG_BRANCH}"
   local_sha="$(git -C "${LOG_REPO}" rev-parse HEAD)"
   remote_sha="$(git_with_proxy -C "${LOG_REPO}" ls-remote origin "refs/heads/${LOG_BRANCH}" | awk '{print $1}')"
@@ -1475,6 +2446,7 @@ Commands:
   start                 Start a bounded diagnostic session.
   status                Show collector state and session size.
   stop                  Stop the active diagnostic session cleanly.
+  repair [SESSION_ID]   Quarantine and trim a verified trailing-NUL text suffix.
   upload [SESSION_ID]   Push a stopped session to Aphra-neck/G02_log.
 
 Environment:
@@ -1501,6 +2473,10 @@ main() {
     stop)
       [[ $# -eq 1 ]] || die "stop takes no arguments"
       stop_session
+      ;;
+    repair)
+      [[ $# -le 2 ]] || die "repair accepts at most one session ID"
+      repair_session "${2:-}"
       ;;
     upload)
       [[ $# -le 2 ]] || die "upload accepts at most one session ID"

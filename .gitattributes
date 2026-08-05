@@ -4,3 +4,4 @@
 *.yaml text eol=lf
 *.xml text eol=lf
 CMakeLists.txt text eol=lf
+tools/go2-log text eol=lf

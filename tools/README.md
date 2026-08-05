@@ -65,6 +65,28 @@ go2-log stop
 go2-log upload
 ```
 
+If `upload` rejects an old session because an allowlisted collector-owned text
+file contains a trailing NUL suffix, repair that stopped session explicitly and
+retry the same upload:
+
+```bash
+go2-log repair 20260804T010203Z-unitree-1234
+go2-log upload 20260804T010203Z-unitree-1234
+```
+
+`repair` is deliberately narrow. It runs only while collection and all known
+robot processes are stopped, accepts only one contiguous NUL suffix after a
+complete UTF-8 line, and refuses symbolic links, middle NUL bytes, incomplete
+lines, oversized files, or malformed prior repair records. Before replacing a
+file it durably preserves the byte-identical original under
+`~/go2_logs/quarantine/<session-id>/`. A recoverable per-file journal handles a
+power loss during repair, while the completed evidence record is written to
+the session's `repair_manifest.jsonl` and uploaded with the cleaned text. The
+normal upload validator remains strict; `repair` does not create a general
+binary-file bypass. Files covered by a completed repair record are never
+compacted later; if the remaining session cannot fit below the upload ceiling
+without changing audited bytes, preserve it with SCP instead of Git.
+
 `upload` defaults to the newest unuploaded session. A particular stopped
 session can be selected explicitly:
 
@@ -136,7 +158,9 @@ session closes or before upload. This keeps a normal collector session within
 the 100 MiB Git limit instead of leaving an oversized, unuploadable session.
 Unknown or explicitly forbidden artifacts are never truncated to make them fit;
 they must be preserved with SCP and removed from the diagnostics session before
-upload.
+upload. Each `topic_rates.csv` row is also followed by a low-frequency
+`fdatasync`; this reduces the delayed-write window after an unexpected reboot
+without adding synchronous disk I/O to high-rate sensor topics.
 
 ## Analyze after pulling on the local computer
 

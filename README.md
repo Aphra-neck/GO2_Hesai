@@ -682,6 +682,19 @@ go2-log stop
 go2-log upload
 ```
 
+如果旧会话因采集器文本文件末尾出现 NUL 字节而被 `upload` 拒绝，保持所有机器人
+进程停止，显式修复该会话后再上传：
+
+```bash
+go2-log repair <session-id>
+go2-log upload <session-id>
+```
+
+`repair` 只接受“完整 UTF-8 行之后连续到文件末尾”的 NUL 后缀；中间 NUL、未完整
+行、符号链接、超限文件或异常修复记录仍会被拒绝。损坏原件会先按字节原样保存到
+`~/go2_logs/quarantine/<session-id>/`，修复证据写入会话内的
+`repair_manifest.jsonl`。该命令不会放宽正常上传的二进制和大型文件校验。
+
 `upload` 会在发现任一雷达、IMU、SLAM、规划、SDK2 或 RL 控制进程时拒绝 Git
 push。每个会话最多 100 MiB，本地最多保留 20 个；只有远端提交验证成功的旧会话
 才允许被清理。默认上传到公开仓库 `Aphra-neck/G02_log` 的 `main` 分支，并使用：
