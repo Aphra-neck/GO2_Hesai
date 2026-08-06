@@ -15,7 +15,7 @@ namespace utree_dog_navigation
 
 struct TerrainMapConfig
 {
-  double resolution{0.05};
+  double resolution{0.20};
   double size_x{40.0};
   double size_y{40.0};
   double origin_x{-20.0};

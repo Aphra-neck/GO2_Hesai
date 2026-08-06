@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PLANNING_RVIZ="${PLANNING_RVIZ:-false}"
 BODY_YAW_OFFSET="${GO2_BODY_YAW_OFFSET_RAD:--1.5707963267948966}"
+NAVIGATION_CONFIG="${GO2_NAVIGATION_CONFIG:-${WORKSPACE_DIR}/src/utree_dog_navigation/config/terrain_navigation.yaml}"
 GO2_BODY_YAW_OFFSET_RAD="${BODY_YAW_OFFSET}"
 export GO2_BODY_YAW_OFFSET_RAD
 
@@ -21,6 +22,11 @@ source "${SCRIPT_DIR}/ros2_environment.sh"
 if ! ros2 pkg prefix utree_dog_navigation >/dev/null 2>&1; then
   echo "ROS 2 package is not installed: utree_dog_navigation" >&2
   echo "Rebuild the workspace after pulling the planning packages." >&2
+  exit 1
+fi
+
+if [[ ! -r "${NAVIGATION_CONFIG}" ]]; then
+  echo "Navigation configuration is not readable: ${NAVIGATION_CONFIG}" >&2
   exit 1
 fi
 
@@ -61,6 +67,7 @@ echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Planning RViz: ${PLANNING_RVIZ}"
 echo " Body yaw offset: ${BODY_YAW_OFFSET} rad"
+echo " Navigation config: ${NAVIGATION_CONFIG}"
 echo "======================================"
 
 echo "Checking Super-LIO inputs..."
@@ -76,5 +83,6 @@ fi
 echo "Starting terrain mapper and body lattice planner..."
 echo "Set a goal with RViz or publish geometry_msgs/msg/PoseStamped to /goal_pose."
 ros2 launch utree_dog_navigation terrain_navigation.launch.py \
+  "config:=${NAVIGATION_CONFIG}" \
   "rviz:=${PLANNING_RVIZ}" \
   "body_yaw_offset:=${BODY_YAW_OFFSET}"

@@ -17,7 +17,7 @@ TerrainMapperNode::TerrainMapperNode() : Node("terrain_mapper")
   cloud_topic_ = declare_parameter("cloud_topic", "/lio/cloud_world");
   odom_topic_ = declare_parameter("odom_topic", "/lio/body_odom");
   TerrainMapConfig config;
-  config.resolution = declare_parameter("resolution", 0.05);
+  config.resolution = declare_parameter("resolution", 0.20);
   config.size_x = declare_parameter("size_x", 40.0);
   config.size_y = declare_parameter("size_y", 40.0);
   config.origin_x = declare_parameter("origin_x", -20.0);
