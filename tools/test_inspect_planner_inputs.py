@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stderr
+from io import StringIO
 import json
 import os
 import tempfile
@@ -21,6 +23,7 @@ from inspect_planner_inputs import (
     _capture_stage,
     _write_session_record_atomic,
     _grid_snapshot,
+    _mark_goal_capture_failure,
     _terrain_layer_stats,
     analyze_planner_inputs,
 )
@@ -88,8 +91,13 @@ class FakeSubscription:
 
 
 class FakeNode:
-    def __init__(self, fail_topic: str | None = None) -> None:
+    def __init__(
+        self,
+        fail_topic: str | None = None,
+        publisher_count: int = 1,
+    ) -> None:
         self.fail_topic = fail_topic
+        self.publisher_count = publisher_count
         self.active: list[FakeSubscription] = []
         self.events: list[tuple[str, str, object]] = []
 
@@ -111,6 +119,10 @@ class FakeNode:
     def destroy_subscription(self, subscription: FakeSubscription) -> None:
         self.active.remove(subscription)
         self.events.append(("destroy", subscription.topic, subscription.qos))
+
+    def count_publishers(self, topic: str) -> int:
+        del topic
+        return self.publisher_count
 
     def publish(self, topic: str, message: object) -> None:
         for subscription in list(self.active):
@@ -354,6 +366,24 @@ class PlannerInputInspectionTests(unittest.TestCase):
         )
         self.assertEqual(_diagnosis_exit_code("start_ready_waiting_for_goal"), 0)
         self.assertEqual(_diagnosis_exit_code("goal_stale"), 2)
+        self.assertEqual(_diagnosis_exit_code("goal_wait_timeout"), 2)
+        self.assertEqual(
+            _diagnosis_exit_code("goal_publisher_discovery_timeout"), 2
+        )
+
+    def test_goal_capture_failure_preserves_start_map_diagnosis(self) -> None:
+        result: dict[str, object] = {
+            "diagnosis": "start_has_no_valid_cell_in_snap_square"
+        }
+
+        _mark_goal_capture_failure(result, "goal_wait_timeout")
+
+        self.assertEqual(result["diagnosis"], "goal_wait_timeout")
+        self.assertEqual(
+            result["start_map_diagnosis"],
+            "start_has_no_valid_cell_in_snap_square",
+        )
+        self.assertEqual(result["goal_capture_failure"], "goal_wait_timeout")
 
     def test_flat_map_reports_continuous_ground_only(self) -> None:
         result = analyze_planner_inputs(
@@ -587,6 +617,74 @@ class PlannerInputInspectionTests(unittest.TestCase):
 
 
 class SubscriptionLifecycleTests(unittest.TestCase):
+    def test_goal_wait_starts_after_publisher_discovery(self) -> None:
+        class DelayedPublisherNode(FakeNode):
+            def __init__(self) -> None:
+                super().__init__(publisher_count=0)
+                self.publisher_queries = 0
+
+            def count_publishers(self, topic: str) -> int:
+                del topic
+                self.publisher_queries += 1
+                return 0 if self.publisher_queries == 1 else 1
+
+        node = DelayedPublisherNode()
+        initial_map = stamped_message(1_000_000_000)
+        initial_odom = stamped_message(1_100_000_000)
+        goal = stamped_message(1_200_000_000)
+        fresh_map = stamped_message(1_500_000_000)
+        fresh_odom = stamped_message(1_600_000_000)
+        stage_payloads = [
+            {
+                "/terrain_map": [initial_map],
+                "/lio/body_odom": [initial_odom],
+            },
+            {},
+            {"/goal_pose": [goal]},
+            {
+                "/terrain_map": [fresh_map],
+                "/lio/body_odom": [fresh_odom],
+            },
+        ]
+        stderr = StringIO()
+        wait_calls = 0
+
+        def wait_fn(
+            fake_node: object,
+            predicate: object,
+            timeout: float,
+        ) -> bool:
+            nonlocal wait_calls
+            del fake_node, timeout
+            wait_calls += 1
+            if wait_calls == 2:
+                self.assertNotIn("Goal listener ready", stderr.getvalue())
+            if wait_calls == 3:
+                self.assertIn("Goal listener ready", stderr.getvalue())
+            payloads = stage_payloads.pop(0)
+            for topic, messages in payloads.items():
+                for message in messages:
+                    node.publish(topic, message)
+            return predicate()
+
+        with redirect_stderr(stderr):
+            captured = _capture_runtime_messages(
+                node,
+                make_specs(),
+                wait_for_goal=True,
+                input_timeout=1.0,
+                goal_timeout=1.0,
+                goal_discovery_timeout=1.0,
+                wait_fn=wait_fn,
+            )
+
+        self.assertIs(captured["goal"], goal)
+        self.assertIs(captured["map"], fresh_map)
+        self.assertIs(captured["odom"], fresh_odom)
+        self.assertGreaterEqual(node.publisher_queries, 3)
+        self.assertEqual(stage_payloads, [])
+        self.assertEqual(node.active, [])
+
     def test_goal_wait_has_only_goal_subscription_and_recaptures_inputs(self) -> None:
         node = FakeNode()
         initial_map = stamped_message(1_000_000_000)
@@ -606,6 +704,7 @@ class SubscriptionLifecycleTests(unittest.TestCase):
             },
         ]
         active_topics: list[set[str]] = []
+        stderr = StringIO()
 
         def wait_fn(
             fake_node: object,
@@ -614,21 +713,25 @@ class SubscriptionLifecycleTests(unittest.TestCase):
         ) -> bool:
             del timeout
             self.assertIs(fake_node, node)
-            active_topics.append({subscription.topic for subscription in node.active})
+            topics = {subscription.topic for subscription in node.active}
+            active_topics.append(topics)
+            if topics == {"/goal_pose"}:
+                self.assertIn("Goal listener ready", stderr.getvalue())
             payloads = stage_payloads.pop(0)
             for topic, messages in payloads.items():
                 for message in messages:
                     node.publish(topic, message)
             return predicate()
 
-        captured = _capture_runtime_messages(
-            node,
-            make_specs(),
-            wait_for_goal=True,
-            input_timeout=1.0,
-            goal_timeout=1.0,
-            wait_fn=wait_fn,
-        )
+        with redirect_stderr(stderr):
+            captured = _capture_runtime_messages(
+                node,
+                make_specs(),
+                wait_for_goal=True,
+                input_timeout=1.0,
+                goal_timeout=1.0,
+                wait_fn=wait_fn,
+            )
 
         self.assertIs(captured["map"], fresh_map)
         self.assertIs(captured["odom"], fresh_odom)
@@ -689,6 +792,114 @@ class SubscriptionLifecycleTests(unittest.TestCase):
         self.assertEqual(active_topics, [{"/terrain_map", "/lio/body_odom"}])
         self.assertEqual(node.active, [])
         self.assertIn(("create", "/terrain_map", "live"), node.events)
+
+    def test_goal_timeout_can_recapture_fresh_start_inputs(self) -> None:
+        node = FakeNode()
+        initial_map = stamped_message(1_000_000_000)
+        initial_odom = stamped_message(1_100_000_000)
+        fresh_map = stamped_message(1_500_000_000)
+        fresh_odom = stamped_message(1_600_000_000)
+        stage_payloads = [
+            {
+                "/terrain_map": [initial_map],
+                "/lio/body_odom": [initial_odom],
+            },
+            {},
+            {
+                "/terrain_map": [initial_map, fresh_map],
+                "/lio/body_odom": [initial_odom, fresh_odom],
+            },
+        ]
+        active_topics: list[set[str]] = []
+
+        def wait_fn(
+            fake_node: object,
+            predicate: object,
+            timeout: float,
+        ) -> bool:
+            del timeout
+            self.assertIs(fake_node, node)
+            active_topics.append({subscription.topic for subscription in node.active})
+            payloads = stage_payloads.pop(0)
+            for topic, messages in payloads.items():
+                for message in messages:
+                    node.publish(topic, message)
+            return predicate()
+
+        captured = _capture_runtime_messages(
+            node,
+            make_specs(),
+            wait_for_goal=True,
+            input_timeout=1.0,
+            goal_timeout=1.0,
+            record_start_on_goal_timeout=True,
+            wait_fn=wait_fn,
+        )
+
+        self.assertIs(captured["map"], fresh_map)
+        self.assertIs(captured["odom"], fresh_odom)
+        self.assertNotIn("goal", captured)
+        self.assertEqual(captured["goal_capture_failure"], "goal_wait_timeout")
+        self.assertEqual(
+            active_topics,
+            [
+                {"/terrain_map", "/lio/body_odom"},
+                {"/goal_pose"},
+                {"/terrain_map", "/lio/body_odom"},
+            ],
+        )
+        self.assertEqual(stage_payloads, [])
+        self.assertEqual(node.active, [])
+
+    def test_goal_publisher_discovery_timeout_recaptures_start_inputs(self) -> None:
+        node = FakeNode(publisher_count=0)
+        initial_map = stamped_message(1_000_000_000)
+        initial_odom = stamped_message(1_100_000_000)
+        fresh_map = stamped_message(1_500_000_000)
+        fresh_odom = stamped_message(1_600_000_000)
+        stage_payloads = [
+            {
+                "/terrain_map": [initial_map],
+                "/lio/body_odom": [initial_odom],
+            },
+            {},
+            {
+                "/terrain_map": [fresh_map],
+                "/lio/body_odom": [fresh_odom],
+            },
+        ]
+
+        def wait_fn(
+            fake_node: object,
+            predicate: object,
+            timeout: float,
+        ) -> bool:
+            del fake_node, timeout
+            payloads = stage_payloads.pop(0)
+            for topic, messages in payloads.items():
+                for message in messages:
+                    node.publish(topic, message)
+            return predicate()
+
+        captured = _capture_runtime_messages(
+            node,
+            make_specs(),
+            wait_for_goal=True,
+            input_timeout=1.0,
+            goal_timeout=1.0,
+            goal_discovery_timeout=1.0,
+            record_start_on_goal_timeout=True,
+            wait_fn=wait_fn,
+        )
+
+        self.assertIs(captured["map"], fresh_map)
+        self.assertIs(captured["odom"], fresh_odom)
+        self.assertEqual(
+            captured["goal_capture_failure"],
+            "goal_publisher_discovery_timeout",
+        )
+        self.assertEqual(stage_payloads, [])
+        self.assertEqual(node.active, [])
 
     def test_timeout_destroys_every_subscription(self) -> None:
         node = FakeNode()

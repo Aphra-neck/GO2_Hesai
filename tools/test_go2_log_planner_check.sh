@@ -6,8 +6,13 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 GO2_LOG="${REPO_ROOT}/tools/go2-log"
 FIXTURE_ROOT="$(mktemp -d)"
 COLLECTOR_PID=''
+STREAM_PID=''
 
 cleanup() {
+  if [[ "${STREAM_PID}" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "${STREAM_PID}" 2>/dev/null || true
+    wait "${STREAM_PID}" 2>/dev/null || true
+  fi
   if [[ "${COLLECTOR_PID}" =~ ^[1-9][0-9]*$ ]]; then
     kill -TERM "${COLLECTOR_PID}" 2>/dev/null || true
     wait "${COLLECTOR_PID}" 2>/dev/null || true
@@ -119,6 +124,17 @@ if __name__ == "__main__":
     if "--capture-error" in sys.argv:
         print("fake planner capture failed", file=sys.stderr)
         raise SystemExit(1)
+    if "--stream-probe" in sys.argv:
+        import time
+
+        gate = Path(os.environ["FAKE_STREAM_GATE"])
+        print("FAKE_PLANNER_READY", file=sys.stderr, flush=True)
+        deadline = time.monotonic() + 5.0
+        while not gate.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not gate.exists():
+            print("stream probe gate timed out", file=sys.stderr)
+            raise SystemExit(1)
     diagnostic_failure = "--diagnostic-failure" in sys.argv
     print(json.dumps({
         "diagnosis": (
@@ -160,6 +176,23 @@ common_environment=(
   GO2_WORKSPACE="${workspace}"
   GO2_REAL_INSPECTOR="${REPO_ROOT}/tools/inspect_planner_inputs.py"
 )
+
+stream_output="${runtime}/planner-check-stream.txt"
+stream_gate="${runtime}/planner-check-stream.release"
+env "${common_environment[@]}" FAKE_STREAM_GATE="${stream_gate}" \
+  "${GO2_LOG}" planner-check --stream-probe > "${stream_output}" 2>&1 &
+STREAM_PID="$!"
+for _ in $(seq 1 100); do
+  grep -Fq 'FAKE_PLANNER_READY' "${stream_output}" && break
+  kill -0 "${STREAM_PID}" 2>/dev/null || break
+  sleep 0.02
+done
+grep -Fq 'FAKE_PLANNER_READY' "${stream_output}"
+kill -0 "${STREAM_PID}" 2>/dev/null
+: > "${stream_gate}"
+wait "${STREAM_PID}"
+STREAM_PID=''
+: > "${session_dir}/planner_input_inspections.jsonl"
 
 before_graph_failure="$(sha256sum "${session_dir}/planner_input_inspections.jsonl")"
 set +e
@@ -249,8 +282,10 @@ assert records[0]["inspection"]["diagnosis"] == (
     "start_has_no_valid_cell_in_snap_square"
 )
 arguments = records[0]["inspection"]["arguments"]
-assert arguments[:2] == ["--json", "--diagnostic-failure"]
-assert arguments[2:] == [
+assert arguments[:3] == [
+    "--json", "--record-start-on-goal-timeout", "--diagnostic-failure"
+]
+assert arguments[3:] == [
     "--min-observed-frames", "6",
     "--mapper-max-slope", "0.58",
     "--max-roughness", "0.07",

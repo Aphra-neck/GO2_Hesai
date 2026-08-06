@@ -695,8 +695,8 @@ PY
 
 planner_check() {
   local session_dir collector_pid current
-  local inspector_status value parameter_error='' postflight_error=''
-  local -a runtime_arguments=()
+  local inspector_status tee_status value parameter_error='' postflight_error=''
+  local -a runtime_arguments=() pipeline_status=()
 
   session_dir="$(active_session_dir 2>/dev/null)" ||
     die "no active diagnostic session; run ./tools/go2-log start first"
@@ -768,15 +768,27 @@ planner_check() {
     inspector_status=1
   else
     set +e
-    (
+    {
+      (
+        ulimit -f $((COMMAND_CAPTURE_BYTES / 1024))
+        exec python3 "${REPO_ROOT}/tools/inspect_planner_inputs.py" --json \
+          --record-start-on-goal-timeout \
+          "$@" "${runtime_arguments[@]}"
+      ) > "${PLANNER_RESULT_FILE}"
+    } 2>&1 | (
       ulimit -f $((COMMAND_CAPTURE_BYTES / 1024))
-      exec python3 "${REPO_ROOT}/tools/inspect_planner_inputs.py" --json \
-        "$@" "${runtime_arguments[@]}"
-    ) > "${PLANNER_RESULT_FILE}" 2> "${PLANNER_ERROR_FILE}"
-    inspector_status=$?
+      exec tee -- "${PLANNER_ERROR_FILE}" >&2
+    )
+    pipeline_status=("${PIPESTATUS[@]}")
     set -e
-    if [[ -s "${PLANNER_ERROR_FILE}" ]]; then
-      tail -c 65536 -- "${PLANNER_ERROR_FILE}" >&2
+    inspector_status="${pipeline_status[0]:-1}"
+    tee_status="${pipeline_status[1]:-1}"
+    if (( ${#pipeline_status[@]} != 2 || tee_status != 0 )); then
+      printf '%s\n' 'planner-check stderr streaming failed' >&2
+      printf '%s\n' 'planner-check stderr streaming failed' \
+        > "${PLANNER_ERROR_FILE}"
+      : > "${PLANNER_RESULT_FILE}"
+      inspector_status=1
     fi
   fi
 

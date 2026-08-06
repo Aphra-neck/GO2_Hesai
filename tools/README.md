@@ -192,13 +192,23 @@ mapper and planner thresholds. It records one bounded atomic JSONL entry in
 does not mean the program crashed. Use `planner-check --no-goal` for a start-only
 sample.
 
-Start this command before clicking Set Goal in the WSL2 planning RViz. The
-`Initial samples captured but not yet validated` prompt means only that initial
-messages were found; it is not a validity result. The inspector releases both
-subscriptions before waiting with only `/goal_pose` subscribed. After the goal
-arrives, it independently captures a `/terrain_map` and `/lio/body_odom` message
-newer than each topic's initial sample, releases all subscriptions, and then
-reports. These messages are not a synchronized pair.
+The wrapper first creates the goal subscription and waits up to 10 seconds for
+a compatible `/goal_pose` publisher. Only then does it print `Goal listener
+ready` and start the goal timeout. If publisher discovery or the RViz goal wait
+expires, the wrapper recaptures a fresh terrain map and body odometry sample
+instead of discarding the session. It records `goal_publisher_discovery_timeout`
+or `goal_wait_timeout` plus `start_map_diagnosis`, returns diagnostic exit `2`,
+and still preserves the full-map and start-area rejection-layer statistics.
+This fallback does not publish a goal or any motion command.
+
+Start this command before clicking Set Goal in the WSL2 planning RViz. Wait for
+the live `Goal listener ready with N publisher(s)` message before clicking. The
+inspector releases the initial map and odometry subscriptions, creates the
+`/goal_pose` subscription, confirms a compatible publisher, and only then starts
+the goal timeout. After the goal arrives, it independently captures a
+`/terrain_map` and `/lio/body_odom` message newer than each topic's initial
+sample, releases all subscriptions, and then reports. These messages are not a
+synchronized pair.
 
 - observation, elevation, feature, threshold, and planner-valid counts for the
   full map and each endpoint's square snap area;

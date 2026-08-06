@@ -256,6 +256,29 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
             ["map", "start"],
         )
 
+    def test_goal_timeout_retains_start_map_rows_and_diagnosis(self) -> None:
+        record = no_goal_record()
+        record["exit_code"] = 2
+        record["status"] = "diagnostic_failure"
+        inspection = record["inspection"]
+        assert isinstance(inspection, dict)
+        inspection["diagnosis"] = "goal_wait_timeout"
+        inspection["start_map_diagnosis"] = "start_ready_waiting_for_goal"
+        inspection["goal_capture_failure"] = "goal_wait_timeout"
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 0)
+        self.assertEqual(
+            [row["scope"] for row in summary["rows"]],
+            ["map", "start"],
+        )
+        self.assertEqual(
+            summary["rows"][0]["start_map_diagnosis"],
+            "start_ready_waiting_for_goal",
+        )
+        self.assertEqual(summary["diagnoses"]["goal_wait_timeout"], 1)
+
     def test_outside_endpoint_accepts_explicit_null_layer_stats(self) -> None:
         record = copy.deepcopy(inspection_record())
         inspection = record["inspection"]

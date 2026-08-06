@@ -647,12 +647,54 @@ def _capture_stage(
             node.destroy_subscription(subscription)
 
 
+def _capture_goal_stage(
+    node: object,
+    spec: SubscriptionSpec,
+    publisher_timeout: float,
+    goal_timeout: float,
+    wait_fn: WaitFunction,
+) -> tuple[dict[str, object] | None, str | None]:
+    received: dict[str, object] = {}
+
+    def callback(message: object) -> None:
+        received[spec.key] = message
+
+    subscription = node.create_subscription(
+        spec.message_type,
+        spec.topic,
+        callback,
+        spec.qos,
+    )
+    try:
+        publisher_ready = lambda: node.count_publishers(spec.topic) > 0
+        if not publisher_ready() and not wait_fn(
+            node,
+            publisher_ready,
+            publisher_timeout,
+        ):
+            return None, "goal_publisher_discovery_timeout"
+        publisher_count = node.count_publishers(spec.topic)
+        print(
+            f"Goal listener ready with {publisher_count} publisher(s). "
+            f"Set one RViz goal within {goal_timeout:.0f} seconds...",
+            file=sys.stderr,
+            flush=True,
+        )
+        if not wait_fn(node, lambda: spec.key in received, goal_timeout):
+            return None, "goal_wait_timeout"
+        return received, None
+    finally:
+        node.destroy_subscription(subscription)
+
+
 def _capture_runtime_messages(
     node: object,
     specs: Mapping[str, SubscriptionSpec],
     wait_for_goal: bool,
     input_timeout: float,
     goal_timeout: float,
+    goal_discovery_timeout: float = 10.0,
+    record_start_on_goal_timeout: bool = False,
     wait_fn: WaitFunction = _wait_for,
 ) -> dict[str, object]:
     """Capture live inputs without retaining TerrainGrid while waiting for a goal."""
@@ -688,15 +730,43 @@ def _capture_runtime_messages(
 
     initial_map_stamp = _stamp_ns(getattr(initial["map"], "header"))
     initial_odom_stamp = _stamp_ns(getattr(initial["odom"], "header"))
-    print(
-        "Initial samples captured but not yet validated. "
-        f"Set one RViz goal within {goal_timeout:.0f} seconds...",
-        file=sys.stderr,
-        flush=True,
+    del initial
+    goal, goal_capture_failure = _capture_goal_stage(
+        node,
+        specs["goal"],
+        goal_discovery_timeout,
+        goal_timeout,
+        wait_fn,
     )
-    goal = _capture_stage(node, (specs["goal"],), goal_timeout, wait_fn)
     if goal is None:
-        raise RuntimeError("timed out waiting for a new goal message")
+        if not record_start_on_goal_timeout:
+            if goal_capture_failure == "goal_publisher_discovery_timeout":
+                raise RuntimeError("timed out waiting for a /goal_pose publisher")
+            raise RuntimeError("timed out waiting for a new goal message")
+        print(
+            "No goal captured. Recording fresh map and start diagnostics...",
+            file=sys.stderr,
+            flush=True,
+        )
+        live_inputs = _capture_stage(
+            node,
+            (specs["live_map"], specs["odom"]),
+            input_timeout,
+            wait_fn,
+            accept={
+                "map": lambda message: _stamp_ns(getattr(message, "header"))
+                > initial_map_stamp,
+                "odom": lambda message: _stamp_ns(getattr(message, "header"))
+                > initial_odom_stamp,
+            },
+        )
+        if live_inputs is None:
+            raise RuntimeError(
+                "timed out waiting for fresh terrain map and body odometry "
+                "after goal timeout"
+            )
+        live_inputs["goal_capture_failure"] = goal_capture_failure
+        return live_inputs
 
     print(
         "Goal captured. Waiting for independently newer terrain and odometry "
@@ -782,7 +852,7 @@ def _goal_pose(message: object) -> Pose2D:
 
 def collect_ros_inputs(
     args: argparse.Namespace,
-) -> tuple[GridSnapshot, Pose2D, Pose2D | None, int]:
+) -> tuple[GridSnapshot, Pose2D, Pose2D | None, int, str | None]:
     try:
         import rclpy
         from geometry_msgs.msg import PoseStamped
@@ -840,6 +910,8 @@ def collect_ros_inputs(
             wait_for_goal=not args.no_goal and args.goal_x is None,
             input_timeout=args.input_timeout,
             goal_timeout=args.goal_timeout,
+            goal_discovery_timeout=args.goal_discovery_timeout,
+            record_start_on_goal_timeout=args.record_start_on_goal_timeout,
         )
         grid = _grid_snapshot(received["map"])
         start = _odom_pose(received["odom"])
@@ -856,7 +928,13 @@ def collect_ros_inputs(
             )
         elif "goal" in received:
             goal = _goal_pose(received["goal"])
-        return grid, start, goal, now_ns
+        return (
+            grid,
+            start,
+            goal,
+            now_ns,
+            received.get("goal_capture_failure"),
+        )
     finally:
         if node is not None:
             node.destroy_node()
@@ -990,6 +1068,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-topic", default="/goal_pose")
     parser.add_argument("--input-timeout", type=float, default=10.0)
     parser.add_argument("--goal-timeout", type=float, default=60.0)
+    parser.add_argument("--goal-discovery-timeout", type=float, default=10.0)
+    parser.add_argument(
+        "--record-start-on-goal-timeout",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument(
         "--no-goal",
         action="store_true",
@@ -1027,6 +1111,7 @@ def parse_args() -> argparse.Namespace:
     for name in (
         "input_timeout",
         "goal_timeout",
+        "goal_discovery_timeout",
         "max_slope",
         "mapper_max_slope",
         "max_roughness",
@@ -1067,6 +1152,14 @@ def _diagnosis_exit_code(diagnosis: object) -> int:
         }
         else 2
     )
+
+
+def _mark_goal_capture_failure(
+    result: dict[str, object], diagnosis: str
+) -> None:
+    result["start_map_diagnosis"] = result["diagnosis"]
+    result["diagnosis"] = diagnosis
+    result["goal_capture_failure"] = diagnosis
 
 
 def _write_session_record_atomic(
@@ -1199,7 +1292,7 @@ def _write_session_record_atomic(
 def main() -> int:
     args = parse_args()
     try:
-        grid, start, goal, now_ns = collect_ros_inputs(args)
+        grid, start, goal, now_ns, goal_capture_failure = collect_ros_inputs(args)
         result = analyze_planner_inputs(
             grid,
             start,
@@ -1223,6 +1316,8 @@ def main() -> int:
             ),
             now_ns=now_ns,
         )
+        if goal_capture_failure is not None:
+            _mark_goal_capture_failure(result, goal_capture_failure)
     except (RuntimeError, ValueError) as error:
         print(f"inspect_planner_inputs: {error}", file=sys.stderr)
         return 1

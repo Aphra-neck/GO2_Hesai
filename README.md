@@ -564,11 +564,18 @@ cd ~/catkin_ws
 ./tools/go2-log planner-check --no-goal
 ```
 
-等待出现 `Initial samples captured but not yet validated` 后，在 WSL2 RViz 中使用
-Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。该提示只表示发现了初始消息，
-不是输入有效性结论。检查器先释放大地图和里程计订阅；等待目标期间只订阅
-`/goal_pose`，收到目标后再分别抓取一条比各自初始样本更新的 `/terrain_map` 和
-`/lio/body_odom`。两条消息并非时间同步的数据对。检查器不会发布目标、路径或运动命令。
+`planner-check` 会先创建目标订阅，并等待最多 10 秒确认兼容的 `/goal_pose` 发布者；只有
+终端实时出现 `Goal listener ready` 后，60 秒目标窗口才开始计时。若发布者发现或 RViz
+目标等待超时，它会重新抓取一组新鲜的 `/terrain_map` 和 `/lio/body_odom`，记录
+`goal_publisher_discovery_timeout` 或 `goal_wait_timeout` 以及原始的
+`start_map_diagnosis`，并以诊断返回码 `2` 结束。这样日志仍包含全图和起点附近各拒绝层
+统计；该兜底流程不会发布目标、路径或任何运动命令。
+
+等待终端实时出现 `Goal listener ready with N publisher(s)` 后，再在 WSL2 RViz 中使用
+Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。检查器会先释放初始大地图和
+里程计订阅，再创建 `/goal_pose` 订阅并确认兼容发布者，随后才开始目标倒计时；收到目标
+后再分别抓取一条比各自初始样本更新的 `/terrain_map` 和 `/lio/body_odom`。两条消息并非
+时间同步的数据对。检查器不会发布目标、路径或运动命令。
 
 检查器会分别统计整张地图、起点吸附方框和目标吸附方框。`observation_below_min`
 较多表示单元格在积分窗口内被观测的帧数不足；`elevation_known` 明显多于

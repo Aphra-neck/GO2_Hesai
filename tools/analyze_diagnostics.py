@@ -123,6 +123,7 @@ PLANNER_CSV_FIELDS = (
     "snapped",
     "snap_grid_distance_m",
     "snap_world_to_center_distance_m",
+    "start_map_diagnosis",
 )
 
 
@@ -614,6 +615,7 @@ def _planner_layer_row(
             "status": record.get("status", ""),
             "exit_code": record.get("exit_code", ""),
             "diagnosis": inspection.get("diagnosis", ""),
+            "start_map_diagnosis": inspection.get("start_map_diagnosis", ""),
             "scope": scope,
             "map_frame": map_data.get("frame_id", ""),
             "map_width": map_data.get("width", ""),
@@ -1309,6 +1311,16 @@ def planner_inspection_observations(
         return observations
     inspection = latest["inspection"]
     diagnosis = inspection["diagnosis"]
+    if diagnosis in {
+        "goal_wait_timeout",
+        "goal_publisher_discovery_timeout",
+    }:
+        start_map_diagnosis = inspection.get("start_map_diagnosis", "unknown")
+        observations.append(
+            f"Planner goal capture failed with `{diagnosis}`; fresh map/start "
+            "evidence was retained "
+            f"with start-map diagnosis `{start_map_diagnosis}`."
+        )
     if diagnosis not in {
         "start_ready_waiting_for_goal",
         "same_continuous_ground_component_not_planner_approval",
