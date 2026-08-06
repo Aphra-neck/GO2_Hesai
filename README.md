@@ -426,7 +426,7 @@ Jetson 检查残留进程：
 
 ```bash
 pgrep -af \
-  'hesai_ros_driver|go2_imu_bridge|super_lio|utree_dog_navigation|go2_sdk2_bridge|rl_controller|rviz2' \
+  'hesai_ros_driver|go2_imu_bridge|super_lio|utree_dog_navigation|go2_sdk2_bridge|rl_controller|rviz2|fastdds.*discovery' \
   || true
 ```
 
@@ -436,8 +436,25 @@ pgrep -af \
 
 ```bash
 cd ~/catkin_ws
-./shell/start_slam.sh
+GO2_LIO_DENSE_OUTPUT=false ./shell/start_slam.sh
 ```
+
+平地闭环第一轮必须保持 Hesai 配置中的 `lio.output.dense: false`；上面的显式开关会让
+日志明确标记该轮为基线。
+
+完成基线连续起点检查后，无论结果是否通过，都停止该轮全部节点和日志会话，再用下面的
+命令新开第二轮，让 `/lio/cloud_world` 发布完整去畸变帧：
+
+```bash
+cd ~/catkin_ws
+GO2_LIO_DENSE_OUTPUT=true ./shell/start_slam.sh
+```
+
+该开关只改变 Super-LIO 完成估计后的点云输出，不改变内部配准使用的
+`lio.sensor.voxel_fliter_size: 0.3`；`lio.output.pub_step` 必须保持 `1`。完整 XT-16
+帧会增加 Jetson 的点云变换、序列化和 DDS 负载，首次 A/B 时先关闭 WSL2 RViz 的
+PointCloud 显示，再核对 `/lio/odom` 和 `/lio/cloud_world` 频率。不要同时修改其他参数，
+也不要调整坡度、台阶、粗糙度或通行度阈值。
 
 保持该终端运行。正常启动顺序：
 
@@ -447,6 +464,16 @@ cd ~/catkin_ws
 [3/3] Starting Super-LIO...
 ... KF init done
 ... Map init done
+```
+
+`Map init done` 后在另一个 Jetson 终端确认本轮实际参数；第一轮 dense 必须为 `False`，
+第二轮对照必须为 `True`，`pub_step` 两轮都必须为 `1`：
+
+```bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+ros2 param get /super_lio_node lio.output.dense
+ros2 param get /super_lio_node lio.output.pub_step
 ```
 
 `start_slam.sh` 固定使用 `rviz:=false`。不要在 Jetson 启动 Super-LIO 自带 RViz。
@@ -549,7 +576,6 @@ Jetson 和 WSL2 必须使用同步的系统时钟且 `use_sim_time` 设置一致
 ```bash
 cd ~/catkin_ws
 ./tools/go2-log status
-./tools/go2-log planner-check --goal-timeout 60
 ```
 
 `planner-check` 自动加载项目 ROS/Fast DDS 环境，确认 SDK2/RL 控制进程未运行且
@@ -562,6 +588,42 @@ cd ~/catkin_ws
 
 ```bash
 ./tools/go2-log planner-check --no-goal
+```
+
+平地 A/B 先采集连续的起点和地图摘要，不需要在 RViz 发点：
+
+```bash
+./tools/go2-log planner-series --no-goal --samples 10 --interval 1.0
+```
+
+该命令顺序执行 10 次完整安全检查，每次只把有界摘要写入当前诊断会话，不保存完整
+`TerrainGrid` 数组。单帧诊断返回 `2` 时继续采集并最终返回 `2`；采集或安全检查返回
+`1` 时立即停止。比较 `GO2_LIO_DENSE_OUTPUT=false/true` 时，除该开关外保持场景、
+机器人姿态、`pub_step=1` 和规划配置完全一致。
+
+平地起点门禁必须同时满足以下条件，缺一项都不要发目标：
+
+- `planner-series` 最终退出码为 `0`；
+- 10 个样本全部为 `diagnosis=start_ready_waiting_for_goal`；
+- 每个样本都为 `snapped=true`、`valid_in_snap_radius>=1` 且
+  `start_component_cells>0`；
+- 没有 capture error、frame mismatch、stale 或 timestamp future 诊断。
+
+`dense=false` 和 `dense=true` 两轮都必须采集。第一轮结束后，先在规划终端和 SLAM
+终端分别按 `Ctrl+C`，确认相关机器人节点全部退出，再执行 `./tools/go2-log stop`。第二轮
+必须创建新的诊断会话；`go2-log` 会拒绝在同一活动会话内切换 dense 模式，避免两组证据
+混在一起。所有机器人进程停止前不要上传日志。
+
+完成两轮后，只能选择通过上述门禁的模式进入目标验证。两轮都通过时优先使用
+`dense=false`，因为它的 Jetson 与 DDS 负载更低；只有 `dense=true` 通过时才使用完整帧。
+两轮都未通过时停止在这里，关闭节点并上传两场日志，不要发目标。若选定模式不是当前
+正在运行的第二轮模式，先正常停止第二轮和日志会话，再用选定模式新开一轮，并重新通过
+一次 `planner-series` 门禁。
+
+选定模式通过门禁且仍在运行后，才执行目标检查：
+
+```bash
+./tools/go2-log planner-check --goal-timeout 60
 ```
 
 `planner-check` 会先创建目标订阅，并等待最多 10 秒确认兼容的 `/goal_pose` 发布者；只有
@@ -577,9 +639,10 @@ Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。检查器会�
 后再分别抓取一条比各自初始样本更新的 `/terrain_map` 和 `/lio/body_odom`。两条消息并非
 时间同步的数据对。检查器不会发布目标、路径或运动命令。
 
-检查器会分别统计整张地图、起点吸附方框和目标吸附方框。`observation_below_min`
+检查器会分别统计整张地图、起点/目标吸附方框以及规划器实际使用的欧氏圆半径。吸附
+结论只使用圆半径内的候选；方框只保留为诊断上下文。`observation_below_min`
 较多表示单元格在积分窗口内被观测的帧数不足；`elevation_known` 明显多于
-`features_known` 表示已有高程，但 5 cm 网格在 X 或 Y 方向缺少可计算坡度的邻格；
+`features_known` 表示已有高程，但 `0.20 m` 网格在 X 或 Y 方向缺少可计算地形特征的邻格；
 `slope_over` 是 planner 坡度门槛，`mapper_slope_at_or_above` 和 `roughness_over`
 是 mapper 生成通行度时的门槛，`traversability_low` 是 planner 通行度门槛。
 `hard_reject_candidate` 只表示坡度和粗糙度均严格低于 mapper 阈值、但通行度仍为零，通常指向
@@ -587,11 +650,13 @@ Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。检查器会�
 这些计数是可重叠的层统计，不是互斥分类。补洞逻辑也可能让观测帧数不足的格子拥有高程，
 因此不要把观测、高程和地形特征计数当成严格单调漏斗，更不要仅凭一个计数修改安全阈值。
 
-`start_has_no_valid_cell_in_snap_square`、
-`goal_has_no_valid_cell_in_snap_square` 和
+新日志中的 `start_has_no_valid_cell_in_snap_radius`、
+`goal_has_no_valid_cell_in_snap_radius` 和
 `start_and_goal_continuous_ground_disconnected` 分别用于区分起点无有效格、目标无有效格和
 连续地面不连通；`*_frame_mismatch`、`*_stale` 或 `*_stamp_from_future` 表示坐标契约或
 时间新鲜度不满足，`*_elevation_invalid_for_ground_topology` 表示吸附格缺少有效高程。
+旧日志可能保留名称 `*_snap_square`，但新检查器与 C++ 规划器均按同一个
+`snap_radius` 欧氏圆进行吸附。
 此操作只应让规划节点生成 `/body_path`，不会自动控制机器人，因为 SDK2 bridge 尚未启动。
 
 退出码 `0` 只表示起点检查通过，或起终点属于同一连续地面区域；其他诊断结论返回 `2`，
@@ -643,6 +708,7 @@ pgrep -af \
 | `ROS_LOCALHOST_ONLY` | `0` | 允许跨主机 ROS 2 通信 |
 | `GO2_NETWORK_INTERFACE` | `enP8p1s0` | Unitree SDK2 LowState 网卡 |
 | `GO2_IMU_RATE` | `200.0` | IMU 最大发布频率，单位 Hz |
+| `GO2_LIO_DENSE_OUTPUT` | `false` | 平地 A/B 时设为 `true`，让 `/lio/cloud_world` 发布完整去畸变帧 |
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
 | `UNITREE_SDK_LIBRARY_DIR` | `/usr/local/lib` | Unitree SDK 配套 DDS 动态库目录 |
 | `GO2_BODY_YAW_OFFSET_RAD` | `-1.5707963267948966` | IMU 到 `base_link` 的 yaw 校正 |
@@ -938,6 +1004,8 @@ lio.sensor.blind: 0.5
 lio.sensor.filter_rate: 1
 lio.sensor.voxel_fliter_size: 0.3
 lio.sensor.gravity_norm: 9.4188
+lio.output.dense: false
+lio.output.pub_step: 1
 lio.extrinsic.lidar_imu: [0.171, 0.0, 0.0908,
                           1.0, 0.0, 0.0,
                           0.0, 1.0, 0.0,

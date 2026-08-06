@@ -15,6 +15,7 @@ from analyze_diagnostics import (
     generate_report,
     read_jsonl,
     summarize_planner_inspections,
+    summarize_planner_series,
 )
 from inspect_planner_inputs import (
     GridSnapshot,
@@ -51,6 +52,72 @@ def layer_stats(seed: int, planner_valid: int = 30) -> dict[str, int]:
     }
 
 
+def add_slope_quantiles(
+    stats: dict[str, object],
+    *,
+    minimum: float,
+) -> None:
+    stats.update(
+        {
+            "slope_min_rad": minimum,
+            "slope_p50_rad": minimum + 0.1,
+            "slope_p90_rad": minimum + 0.2,
+            "slope_p95_rad": minimum + 0.3,
+            "slope_max_rad": minimum + 0.4,
+        }
+    )
+
+
+def series_record(
+    index: int,
+    *,
+    recorded_second: int,
+    planner_valid: int,
+    slope_over: int,
+    slope_minimum: float,
+    start_component_cells: int,
+    goal_connected: bool | None,
+) -> dict[str, object]:
+    record = copy.deepcopy(inspection_record())
+    record["recorded_at"] = (
+        f"2026-08-06T00:00:{recorded_second:02d}+00:00"
+    )
+    inspection = record["inspection"]
+    assert isinstance(inspection, dict)
+    inspection["series"] = {
+        "id": "slope-run-a",
+        "index": index,
+        "count": 3,
+        "interval_sec": 2.0,
+    }
+    inspection["start_component_cells"] = start_component_cells
+    inspection["start_component_percent_of_ground"] = (
+        100.0 * start_component_cells / planner_valid
+    )
+    inspection["goal_in_start_component"] = goal_connected
+
+    map_data = inspection["map"]
+    map_layers = map_data["terrain_layers"]
+    map_layers["planner_valid"] = planner_valid
+    map_layers["slope_over_limit"] = slope_over
+    map_data["valid_cells"] = planner_valid
+    map_data["continuous_ground_cells"] = planner_valid
+    map_data["valid_percent"] = float(planner_valid)
+    map_data["continuous_ground_percent"] = float(planner_valid)
+    add_slope_quantiles(map_layers, minimum=slope_minimum)
+    for endpoint_data in (inspection["start"], inspection["goal"]):
+        for key in (
+            "snap_square_terrain_layers",
+            "snap_radius_terrain_layers",
+        ):
+            endpoint_layers = endpoint_data[key]
+            add_slope_quantiles(
+                endpoint_layers,
+                minimum=slope_minimum + 0.01,
+            )
+    return record
+
+
 def endpoint(
     scope: str,
     seed: int,
@@ -71,6 +138,7 @@ def endpoint(
         "inside_map": inside,
         "exact_cell_valid": False,
         "valid_cells_in_snap_square": valid_cells if inside else 0,
+        "valid_cells_in_snap_radius": valid_cells if inside else 0,
         "snapped": snapped if inside else False,
         "snapped_grid_x": 4 + seed if snapped and inside else None,
         "snapped_grid_y": 5 + seed if snapped and inside else None,
@@ -80,6 +148,9 @@ def endpoint(
         "snap_world_to_center_distance_m": 0.07 if snapped and inside else None,
         "snap_grid_distance_outside_nominal_radius": False,
         "snap_square_terrain_layers": (
+            layer_stats(seed, valid_cells) if inside else None
+        ),
+        "snap_radius_terrain_layers": (
             layer_stats(seed, valid_cells) if inside else None
         ),
     }
@@ -214,6 +285,10 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
                 inspection=inspection,
                 recorded_at="2026-08-06T00:00:00+00:00",
             )
+            (session / "ros_dds_environment.txt").write_text(
+                "GO2_LIO_DENSE_OUTPUT=false\n",
+                encoding="utf-8",
+            )
             products = generate_report(session, output)
             report = products[0].read_text(encoding="utf-8")
             with products[5].open(encoding="utf-8", newline="") as stream:
@@ -222,6 +297,7 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
         self.assertEqual([row["scope"] for row in rows], ["map", "start"])
         self.assertIn("Accepted records: 1", report)
         self.assertIn("start_ready_waiting_for_goal", report)
+        self.assertIn("| LIO dense cloud output | false |", report)
 
     def test_completed_inspection_expands_to_map_start_and_goal_rows(self) -> None:
         summary = summarize_planner_inspections([inspection_record()])
@@ -243,10 +319,136 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
         self.assertEqual(summary["rows"][0]["map_odom_stamp_delta_sec"], 0.05)
         self.assertEqual(summary["rows"][0]["map_planner_gate_known_cells"], 50)
         self.assertEqual(summary["rows"][0]["map_continuous_ground_cells"], 25)
+        self.assertEqual(summary["rows"][0]["slope_p95_rad"], "")
         self.assertEqual(
             summary["diagnoses"]["start_has_no_valid_cell_in_snap_square"],
             1,
         )
+
+    def test_radius_fields_allow_square_only_candidate_without_snap(self) -> None:
+        record = inspection_record()
+        inspection = record["inspection"]
+        start = inspection["start"]
+        start["valid_cells_in_snap_square"] = 1
+        start["snap_square_terrain_layers"] = layer_stats(1, 1)
+        inspection["diagnosis"] = "start_has_no_valid_cell_in_snap_radius"
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 0)
+        self.assertEqual(len(summary["completed_records"]), 1)
+        self.assertEqual(summary["rows"][1]["valid_cells_in_snap_square"], 1)
+        self.assertEqual(summary["rows"][1]["valid_cells_in_snap_radius"], 0)
+
+    def test_legacy_endpoints_without_radius_fields_remain_readable(self) -> None:
+        record = inspection_record()
+        inspection = record["inspection"]
+        for endpoint_data in (inspection["start"], inspection["goal"]):
+            endpoint_data.pop("valid_cells_in_snap_radius")
+            endpoint_data.pop("snap_radius_terrain_layers")
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 0)
+        self.assertEqual(len(summary["completed_records"]), 1)
+
+    def test_optional_slope_quantiles_and_series_metadata_are_accepted(self) -> None:
+        record = series_record(
+            1,
+            recorded_second=0,
+            planner_valid=20,
+            slope_over=4,
+            slope_minimum=0.1,
+            start_component_cells=10,
+            goal_connected=True,
+        )
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 0)
+        self.assertEqual(summary["rows"][0]["series_id"], "slope-run-a")
+        self.assertEqual(summary["rows"][0]["series_index"], 1)
+        self.assertAlmostEqual(summary["rows"][0]["slope_p90_rad"], 0.3)
+
+    def test_partial_or_nonmonotonic_slope_quantiles_are_rejected(self) -> None:
+        partial = copy.deepcopy(inspection_record())
+        partial_layers = partial["inspection"]["map"]["terrain_layers"]
+        partial_layers["slope_min_rad"] = 0.1
+
+        nonmonotonic = series_record(
+            1,
+            recorded_second=0,
+            planner_valid=20,
+            slope_over=4,
+            slope_minimum=0.1,
+            start_component_cells=10,
+            goal_connected=True,
+        )
+        nonmonotonic_layers = nonmonotonic["inspection"]["map"][
+            "terrain_layers"
+        ]
+        nonmonotonic_layers["slope_p95_rad"] = 0.05
+
+        summary = summarize_planner_inspections([partial, nonmonotonic])
+
+        self.assertEqual(summary["schema_invalid"], 2)
+        self.assertEqual(summary["rows"], [])
+
+    def test_series_summary_aggregates_each_scope_without_bridging_null_flips(
+        self,
+    ) -> None:
+        records = [
+            series_record(
+                1,
+                recorded_second=0,
+                planner_valid=10,
+                slope_over=3,
+                slope_minimum=0.1,
+                start_component_cells=5,
+                goal_connected=True,
+            ),
+            series_record(
+                2,
+                recorded_second=2,
+                planner_valid=20,
+                slope_over=6,
+                slope_minimum=0.2,
+                start_component_cells=15,
+                goal_connected=False,
+            ),
+            series_record(
+                3,
+                recorded_second=4,
+                planner_valid=15,
+                slope_over=9,
+                slope_minimum=0.3,
+                start_component_cells=10,
+                goal_connected=None,
+            ),
+        ]
+        inspection_summary = summarize_planner_inspections(records)
+
+        rows = summarize_planner_series(inspection_summary["rows"])
+
+        self.assertEqual([row["scope"] for row in rows], ["map", "start", "goal"])
+        map_row = rows[0]
+        self.assertEqual(map_row["captured"], 3)
+        self.assertEqual(map_row["expected"], 3)
+        self.assertEqual(map_row["first_recorded_at"], "2026-08-06T00:00:00+00:00")
+        self.assertEqual(map_row["last_recorded_at"], "2026-08-06T00:00:04+00:00")
+        self.assertEqual(map_row["duration_sec"], 4.0)
+        self.assertEqual(map_row["planner_valid_min"], 10)
+        self.assertEqual(map_row["planner_valid_max"], 20)
+        self.assertEqual(map_row["planner_valid_mean"], 15.0)
+        self.assertEqual(map_row["slope_over_limit_mean"], 6.0)
+        self.assertAlmostEqual(map_row["slope_p90_rad_mean"], 0.4)
+        self.assertEqual(map_row["start_component_cells_min"], 5)
+        self.assertEqual(map_row["start_component_cells_max"], 15)
+        self.assertEqual(map_row["start_component_cells_mean"], 10.0)
+        self.assertEqual(map_row["goal_connectivity_true"], 1)
+        self.assertEqual(map_row["goal_connectivity_false"], 1)
+        self.assertEqual(map_row["goal_connectivity_unknown"], 1)
+        self.assertEqual(map_row["goal_connectivity_bool_flips"], 1)
 
     def test_no_goal_inspection_expands_to_map_and_start_rows(self) -> None:
         summary = summarize_planner_inspections([no_goal_record()])
@@ -458,7 +660,7 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
             with products[5].open(encoding="utf-8", newline="") as stream:
                 rows = list(csv.DictReader(stream))
 
-        self.assertEqual(len(products), 6)
+        self.assertEqual(len(products), 7)
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["max_step_height"], "0.24")
         self.assertEqual(rows[0]["snap_radius"], "0.5")
@@ -473,6 +675,45 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
         self.assertIn("mapper_max_slope=0.65", report)
         self.assertIn("Slope >= mapper", report)
         self.assertIn("start_has_no_valid_cell_in_snap_square", report)
+
+    def test_report_writes_planner_series_summary_and_overview(self) -> None:
+        records = [
+            series_record(
+                index,
+                recorded_second=2 * (index - 1),
+                planner_valid=5 * index,
+                slope_over=2 * index,
+                slope_minimum=0.1 * index,
+                start_component_cells=index,
+                goal_connected=connected,
+            )
+            for index, connected in ((1, True), (2, False), (3, None))
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "sessions" / "series-session"
+            output = session / "analysis"
+            session.mkdir(parents=True)
+            (session / "metadata.json").write_text(
+                json.dumps({"session_id": "series-session"}),
+                encoding="utf-8",
+            )
+            (session / "planner_input_inspections.jsonl").write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            products = generate_report(session, output)
+            report = products[0].read_text(encoding="utf-8")
+            with products[6].open(encoding="utf-8", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+
+        self.assertEqual(products[6].name, "planner_input_series_summary.csv")
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["series_id"], "slope-run-a")
+        self.assertEqual(rows[0]["captured"], "3")
+        self.assertEqual(rows[0]["goal_connectivity_bool_flips"], "1")
+        self.assertIn("### Planner Input Series", report)
+        self.assertIn("slope-run-a", report)
 
     def test_missing_planner_log_remains_backward_compatible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

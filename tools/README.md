@@ -182,7 +182,6 @@ instead of invoking the Python inspector directly:
 ```bash
 cd ~/catkin_ws
 ./tools/go2-log status
-./tools/go2-log planner-check --goal-timeout 60
 ```
 
 The wrapper sources the project ROS/Fast DDS environment, fails closed if the
@@ -191,6 +190,43 @@ mapper and planner thresholds. It records one bounded atomic JSONL entry in
 `planner_input_inspections.jsonl`. A diagnostic exit `2` is still recorded and
 does not mean the program crashed. Use `planner-check --no-goal` for a start-only
 sample.
+
+For a stationary flat-ground A/B, capture a bounded series without publishing a
+goal:
+
+```bash
+./tools/go2-log planner-series --no-goal --samples 10 --interval 1.0
+```
+
+`planner-series` accepts 2 through 30 samples, an interval from 0.5 through 5
+seconds, and a maximum scheduled span of 30 seconds. It requires either
+`--no-goal` or both manual `--goal-x` and `--goal-y` coordinates. Each sample
+reuses the full `planner-check` preflight, postflight, parameter read, and atomic
+recording path. Exit `0` and diagnostic exit `2` continue the series; a capture
+or safety exit stops it immediately. Only summaries and series metadata are
+written, never full `TerrainGrid` arrays.
+
+For the flat-ground gate, all samples must diagnose
+`start_ready_waiting_for_goal`, report `snapped=true`, contain at least one
+`valid_in_snap_radius` cell, and have `start_component_cells>0`. The aggregate
+command must exit `0`. Do not publish a goal when any sample fails this gate.
+Run the `dense=false` baseline first, then run `dense=true` as a separate second
+arm even when the baseline passes. Stop the current diagnostic session before
+switching; `go2-log start` rejects a dense-mode change in an active session. Do
+not tune slope, step, roughness, or traversability limits during this comparison.
+The generated `analysis/report.md` lists the effective mode as
+`LIO dense cloud output`; verify it matches the arm being analyzed.
+
+The endpoint JSON keeps both square-context counts and the Euclidean-radius
+counts used by `LatticePlanner`. Snapping and readiness use only the radius
+counts. Older records without radius fields remain readable by the analyzer.
+
+Only after both A/B arms are captured and the selected mode passes the full
+flat-ground gate, start the goal check:
+
+```bash
+./tools/go2-log planner-check --goal-timeout 60
+```
 
 The wrapper first creates the goal subscription and waits up to 10 seconds for
 a compatible `/goal_pose` publisher. Only then does it print `Goal listener
@@ -221,15 +257,16 @@ synchronized pair.
 - whether the snapped endpoints share one edge-adjacent, finite-elevation,
   step-height-limited continuous-ground component.
 
-The command never publishes a goal, path, SDK2 command, or motion request. The
-diagnoses `start_has_no_valid_cell_in_snap_square`,
-`goal_has_no_valid_cell_in_snap_square`, and
-`start_and_goal_continuous_ground_disconnected` distinguish the main causes of
+The command never publishes a goal, path, SDK2 command, or motion request. New
+records use the diagnoses `start_has_no_valid_cell_in_snap_radius`,
+`goal_has_no_valid_cell_in_snap_radius`, and
+`start_and_goal_continuous_ground_disconnected` to distinguish the main causes of
 a zero-expansion or exhausted-search failure. Frame mismatches and stale,
 missing, or future timestamps are reported before a topology claim. An
 `*_elevation_invalid_for_ground_topology` result means the planner-valid snapped
 cell has no finite elevation for this topology check. Use `--no-goal` to inspect
 only the current map and robot start, or `--json` for machine-readable output.
+Older sessions may contain the legacy `*_snap_square` diagnosis.
 The wrapper requires live values for `/terrain_mapper` `min_observed_frames`,
 `max_slope`, and `max_roughness`, and for `/body_lattice_planner`
 `min_traversability`, `max_slope`, `max_step_height`, and `snap_radius`. The two
@@ -242,7 +279,7 @@ Interpret the independent layer counts in this order:
 - many `observation_below_min` cells mean they were seen in fewer than the
   configured number of scans inside the integration window;
 - `elevation_known` substantially above `features_known` points to missing X
-  or Y elevation neighbors, which can happen with sparse 5 cm cells;
+  or Y elevation neighbors, which can happen with sparse 0.20 m cells;
 - `slope_over` identifies the planner slope gate, while
   `mapper_slope_at_or_above` and `roughness_over` identify mapper scoring
   limits, and `traversability_low` identifies the planner traversability gate;
@@ -284,7 +321,8 @@ python .\tools\analyze_diagnostics.py `
 
 It creates `analysis/report.md`, `analysis/topic_rates_summary.csv`,
 `analysis/process_health_summary.csv`, `analysis/sdk2_command_summary.csv`,
-`analysis/body_odometry_audit.csv`, and `analysis/planner_input_summary.csv`.
+`analysis/body_odometry_audit.csv`, `analysis/planner_input_summary.csv`, and
+`analysis/planner_input_series_summary.csv`.
 The planner CSV expands every recorded inspection into map, start, and optional
 goal rows while preserving the original `planner_input_inspections.jsonl`.
 The odometry audit compares only pairs with exactly identical ROS timestamps,

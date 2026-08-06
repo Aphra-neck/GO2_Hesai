@@ -24,6 +24,7 @@ from inspect_planner_inputs import (
     _write_session_record_atomic,
     _grid_snapshot,
     _mark_goal_capture_failure,
+    _read_live_planner_thresholds,
     _terrain_layer_stats,
     analyze_planner_inputs,
 )
@@ -128,6 +129,308 @@ class FakeNode:
         for subscription in list(self.active):
             if subscription.topic == topic:
                 subscription.callback(message)
+
+
+class FakeParameterType:
+    PARAMETER_INTEGER = 2
+    PARAMETER_DOUBLE = 3
+
+
+class FakeGetParameters:
+    class Request:
+        def __init__(self) -> None:
+            self.names: list[str] = []
+
+
+class FakeParameterValue:
+    def __init__(
+        self,
+        parameter_type: int,
+        *,
+        integer_value: int = 0,
+        double_value: float = 0.0,
+    ) -> None:
+        self.type = parameter_type
+        self.integer_value = integer_value
+        self.double_value = double_value
+
+
+class FakeParameterResponse:
+    def __init__(self, values: list[FakeParameterValue]) -> None:
+        self.values = values
+
+
+class FakeParameterFuture:
+    def __init__(
+        self,
+        *,
+        response: FakeParameterResponse | None = None,
+        error: Exception | None = None,
+        done: bool = True,
+    ) -> None:
+        self.response = response
+        self.error = error
+        self.completed = done
+        self.cancelled = False
+
+    def done(self) -> bool:
+        return self.completed
+
+    def exception(self) -> Exception | None:
+        return self.error
+
+    def result(self) -> FakeParameterResponse | None:
+        return self.response
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class FakeParameterClient:
+    def __init__(
+        self,
+        futures: list[FakeParameterFuture],
+        availability: list[bool] | None = None,
+    ) -> None:
+        self.futures = list(futures)
+        self.availability = list(availability or [])
+        self.requests: list[list[str]] = []
+        self.discovery_timeouts: list[float] = []
+
+    def wait_for_service(self, timeout_sec: float) -> bool:
+        self.discovery_timeouts.append(timeout_sec)
+        return self.availability.pop(0) if self.availability else True
+
+    def call_async(self, request: FakeGetParameters.Request) -> FakeParameterFuture:
+        self.requests.append(list(request.names))
+        return self.futures.pop(0)
+
+
+class FakeParameterNode:
+    def __init__(self, clients: dict[str, FakeParameterClient]) -> None:
+        self.clients = clients
+        self.created_services: list[str] = []
+        self.destroyed_clients: list[FakeParameterClient] = []
+
+    def create_client(
+        self, service_type: object, service_name: str
+    ) -> FakeParameterClient:
+        self.asserted_service_type = service_type
+        self.created_services.append(service_name)
+        return self.clients[service_name]
+
+    def destroy_client(self, client: FakeParameterClient) -> None:
+        self.destroyed_clients.append(client)
+
+
+def parameter_response(
+    min_observed_frames: int | None = None,
+    *values: float,
+) -> FakeParameterResponse:
+    encoded: list[FakeParameterValue] = []
+    if min_observed_frames is not None:
+        encoded.append(
+            FakeParameterValue(
+                FakeParameterType.PARAMETER_INTEGER,
+                integer_value=min_observed_frames,
+            )
+        )
+    encoded.extend(
+        FakeParameterValue(
+            FakeParameterType.PARAMETER_DOUBLE,
+            double_value=value,
+        )
+        for value in values
+    )
+    return FakeParameterResponse(encoded)
+
+
+class LiveParameterServiceTests(unittest.TestCase):
+    def test_transient_response_failure_is_retried_with_batched_requests(
+        self,
+    ) -> None:
+        mapper_client = FakeParameterClient(
+            [
+                FakeParameterFuture(error=RuntimeError("transient DDS failure")),
+                FakeParameterFuture(
+                    response=parameter_response(6, 0.58, 0.07)
+                ),
+            ]
+        )
+        planner_client = FakeParameterClient(
+            [
+                FakeParameterFuture(
+                    response=parameter_response(None, 0.21, 0.61, 0.19, 0.45)
+                )
+            ]
+        )
+        node = FakeParameterNode(
+            {
+                "/terrain_mapper/get_parameters": mapper_client,
+                "/body_lattice_planner/get_parameters": planner_client,
+            }
+        )
+        response_timeouts: list[float] = []
+
+        def spin_until_complete(
+            unused_node: object,
+            unused_future: object,
+            timeout_sec: float,
+        ) -> None:
+            del unused_node, unused_future
+            response_timeouts.append(timeout_sec)
+
+        thresholds = _read_live_planner_thresholds(
+            node,
+            FakeGetParameters,
+            FakeParameterType,
+            spin_until_complete,
+            service_timeout=0.25,
+            response_timeout=0.5,
+            max_attempts=3,
+        )
+
+        self.assertEqual(
+            thresholds,
+            PlannerThresholds(
+                min_traversability=0.21,
+                max_slope=0.61,
+                mapper_max_slope=0.58,
+                max_roughness=0.07,
+                max_step_height=0.19,
+                snap_radius=0.45,
+                min_observed_frames=6,
+            ),
+        )
+        self.assertEqual(
+            mapper_client.requests,
+            [
+                ["min_observed_frames", "max_slope", "max_roughness"],
+                ["min_observed_frames", "max_slope", "max_roughness"],
+            ],
+        )
+        self.assertEqual(
+            planner_client.requests,
+            [["min_traversability", "max_slope", "max_step_height", "snap_radius"]],
+        )
+        self.assertEqual(response_timeouts, [0.5, 0.5, 0.5])
+        self.assertEqual(
+            node.created_services,
+            [
+                "/terrain_mapper/get_parameters",
+                "/body_lattice_planner/get_parameters",
+            ],
+        )
+
+    def test_permanently_unavailable_service_fails_closed_after_limit(
+        self,
+    ) -> None:
+        mapper_client = FakeParameterClient(
+            [],
+            availability=[False, False, False],
+        )
+        planner_client = FakeParameterClient([])
+        node = FakeParameterNode(
+            {
+                "/terrain_mapper/get_parameters": mapper_client,
+                "/body_lattice_planner/get_parameters": planner_client,
+            }
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"could not read \[min_observed_frames, max_slope, max_roughness\] "
+            r"from /terrain_mapper/get_parameters after 3 attempts: "
+            r"service discovery timed out after 0\.250 s",
+        ):
+            _read_live_planner_thresholds(
+                node,
+                FakeGetParameters,
+                FakeParameterType,
+                lambda unused_node, unused_future, timeout_sec: None,
+                service_timeout=0.25,
+                response_timeout=0.5,
+                max_attempts=3,
+            )
+
+        self.assertEqual(mapper_client.discovery_timeouts, [0.25, 0.25, 0.25])
+        self.assertEqual(mapper_client.requests, [])
+        self.assertEqual(node.created_services, ["/terrain_mapper/get_parameters"])
+        self.assertEqual(node.destroyed_clients, [mapper_client])
+
+    def test_wrong_parameter_type_is_rejected_with_parameter_name(self) -> None:
+        mapper_response = parameter_response(6, 0.58, 0.07)
+        mapper_response.values[1] = FakeParameterValue(
+            FakeParameterType.PARAMETER_INTEGER,
+            integer_value=1,
+        )
+        node = FakeParameterNode(
+            {
+                "/terrain_mapper/get_parameters": FakeParameterClient(
+                    [FakeParameterFuture(response=mapper_response)]
+                ),
+                "/body_lattice_planner/get_parameters": FakeParameterClient(
+                    [
+                        FakeParameterFuture(
+                            response=parameter_response(
+                                None, 0.21, 0.61, 0.19, 0.45
+                            )
+                        )
+                    ]
+                ),
+            }
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"/terrain_mapper/get_parameters parameter max_slope must be "
+            r"a double; received ROS parameter type 2",
+        ):
+            _read_live_planner_thresholds(
+                node,
+                FakeGetParameters,
+                FakeParameterType,
+                lambda unused_node, unused_future, timeout_sec: None,
+                service_timeout=0.25,
+                response_timeout=0.5,
+                max_attempts=3,
+            )
+
+    def test_nonfinite_parameter_value_is_rejected(self) -> None:
+        node = FakeParameterNode(
+            {
+                "/terrain_mapper/get_parameters": FakeParameterClient(
+                    [
+                        FakeParameterFuture(
+                            response=parameter_response(6, 0.58, float("nan"))
+                        )
+                    ]
+                ),
+                "/body_lattice_planner/get_parameters": FakeParameterClient(
+                    [
+                        FakeParameterFuture(
+                            response=parameter_response(
+                                None, 0.21, 0.61, 0.19, 0.45
+                            )
+                        )
+                    ]
+                ),
+            }
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"/terrain_mapper/get_parameters parameter max_roughness must be finite",
+        ):
+            _read_live_planner_thresholds(
+                node,
+                FakeGetParameters,
+                FakeParameterType,
+                lambda unused_node, unused_future, timeout_sec: None,
+                service_timeout=0.25,
+                response_timeout=0.5,
+                max_attempts=3,
+            )
 
 
 def make_specs() -> dict[str, SubscriptionSpec]:
@@ -247,6 +550,56 @@ class PlannerInputInspectionTests(unittest.TestCase):
         self.assertEqual(stats["observation_below_min"], 2)
         self.assertEqual(stats["observation_ready"], 2)
 
+    def test_slope_quantiles_use_known_finite_values_and_linear_interpolation(self) -> None:
+        grid = replace(
+            make_grid(width=7, height=1),
+            slope=[0.0, 0.1, 0.2, 0.3, 0.4, UNKNOWN, float("nan")],
+        )
+
+        stats = _terrain_layer_stats(grid, PlannerThresholds())
+
+        self.assertEqual(
+            {
+                key: stats[key]
+                for key in (
+                    "slope_min_rad",
+                    "slope_p50_rad",
+                    "slope_p90_rad",
+                    "slope_p95_rad",
+                    "slope_max_rad",
+                )
+            },
+            {
+                "slope_min_rad": 0.0,
+                "slope_p50_rad": 0.2,
+                "slope_p90_rad": 0.36,
+                "slope_p95_rad": 0.38,
+                "slope_max_rad": 0.4,
+            },
+        )
+
+    def test_slope_quantiles_are_null_when_no_slope_is_known(self) -> None:
+        grid = replace(
+            make_grid(width=2, height=1),
+            slope=[UNKNOWN, float("inf")],
+        )
+
+        stats = _terrain_layer_stats(grid, PlannerThresholds())
+
+        self.assertEqual(
+            [
+                stats[key]
+                for key in (
+                    "slope_min_rad",
+                    "slope_p50_rad",
+                    "slope_p90_rad",
+                    "slope_p95_rad",
+                    "slope_max_rad",
+                )
+            ],
+            [None, None, None, None, None],
+        )
+
     def test_known_elevation_is_distinct_from_known_features(self) -> None:
         grid = replace(
             make_grid(width=1, height=1),
@@ -326,6 +679,8 @@ class PlannerInputInspectionTests(unittest.TestCase):
         global_stats = result["map"]["terrain_layers"]
         start_stats = result["start"]["snap_square_terrain_layers"]
         goal_stats = result["goal"]["snap_square_terrain_layers"]
+        start_radius_stats = result["start"]["snap_radius_terrain_layers"]
+        goal_radius_stats = result["goal"]["snap_radius_terrain_layers"]
         self.assertEqual(global_stats["observation_zero"], 1)
         self.assertEqual(global_stats["observation_below_min"], 1)
         self.assertEqual(start_stats["cell_count"], 4)
@@ -334,6 +689,8 @@ class PlannerInputInspectionTests(unittest.TestCase):
         self.assertEqual(goal_stats["cell_count"], 4)
         self.assertEqual(goal_stats["observation_zero"], 0)
         self.assertEqual(goal_stats["observation_below_min"], 1)
+        self.assertEqual(start_radius_stats["cell_count"], 3)
+        self.assertEqual(goal_radius_stats["cell_count"], 3)
 
     def test_grid_snapshot_captures_diagnostic_layers(self) -> None:
         message = SimpleNamespace(
@@ -405,9 +762,10 @@ class PlannerInputInspectionTests(unittest.TestCase):
         )
         result = analyze_planner_inputs(grid, pose(0.25, 0.25), None)
         self.assertEqual(
-            result["diagnosis"], "start_has_no_valid_cell_in_snap_square"
+            result["diagnosis"], "start_has_no_valid_cell_in_snap_radius"
         )
         self.assertEqual(result["start"]["valid_cells_in_snap_square"], 0)
+        self.assertEqual(result["start"]["valid_cells_in_snap_radius"], 0)
 
     def test_goal_outside_map_is_explicit(self) -> None:
         result = analyze_planner_inputs(
@@ -494,7 +852,7 @@ class PlannerInputInspectionTests(unittest.TestCase):
             "start_elevation_invalid_for_ground_topology",
         )
 
-    def test_square_snap_can_exceed_nominal_euclidean_radius(self) -> None:
+    def test_snap_rejects_candidate_outside_euclidean_radius(self) -> None:
         grid = make_grid(width=5, height=5)
         traversability = [UNKNOWN] * 25
         slope = [UNKNOWN] * 25
@@ -507,15 +865,34 @@ class PlannerInputInspectionTests(unittest.TestCase):
             None,
             PlannerThresholds(snap_radius=1.0),
         )
-        self.assertAlmostEqual(
-            result["start"]["snap_grid_distance_m"], 2.0**0.5
+        self.assertFalse(result["start"]["snapped"])
+        self.assertEqual(result["start"]["valid_cells_in_snap_square"], 1)
+        self.assertEqual(result["start"]["valid_cells_in_snap_radius"], 0)
+        self.assertEqual(
+            result["diagnosis"],
+            "start_has_no_valid_cell_in_snap_radius",
         )
-        self.assertAlmostEqual(
-            result["start"]["snap_world_to_center_distance_m"], 2.0**0.5
+
+    def test_snap_accepts_candidate_on_euclidean_radius_boundary(self) -> None:
+        grid = make_grid(width=8, height=8, resolution=0.1)
+        traversability = [UNKNOWN] * 64
+        slope = [UNKNOWN] * 64
+        traversability[6 * 8 + 1] = 1.0
+        slope[6 * 8 + 1] = 0.0
+        grid = replace(grid, slope=slope, traversability=traversability)
+        result = analyze_planner_inputs(
+            grid,
+            pose(0.15, 0.15),
+            None,
+            PlannerThresholds(snap_radius=0.5),
         )
-        self.assertTrue(
+        self.assertTrue(result["start"]["snapped"])
+        self.assertEqual(result["start"]["valid_cells_in_snap_radius"], 1)
+        self.assertAlmostEqual(result["start"]["snap_grid_distance_m"], 0.5)
+        self.assertFalse(
             result["start"]["snap_grid_distance_outside_nominal_radius"]
         )
+        self.assertEqual(result["diagnosis"], "start_ready_waiting_for_goal")
 
     def test_parent_frame_mismatch_is_rejected_before_topology_claim(self) -> None:
         result = analyze_planner_inputs(

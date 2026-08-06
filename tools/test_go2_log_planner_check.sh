@@ -34,6 +34,9 @@ mkdir -p -- \
 cat > "${workspace}/shell/ros2_environment.sh" <<'SH'
 #!/usr/bin/env bash
 export PATH="${GO2_WORKSPACE}/bin:${PATH}"
+if [[ "${FAKE_ENV_SOURCE_FAILURE:-0}" == 1 ]]; then
+  return 86
+fi
 SH
 
 cat > "${workspace}/bin/ros2" <<'SH'
@@ -57,36 +60,9 @@ if [[ "$*" == "topic info --no-daemon --spin-time 3 -v /lowcmd" ]]; then
 fi
 
 if [[ "$1 $2" == "param get" ]]; then
-  if [[ "${FAKE_PARAM_FAILURE:-}" == "$3 $4" ]]; then
-    exit 1
-  fi
-  case "$3 $4" in
-    '/terrain_mapper min_observed_frames')
-      echo 'Integer value is: 6'
-      ;;
-    '/terrain_mapper max_slope')
-      echo 'Double value is: 0.58'
-      ;;
-    '/terrain_mapper max_roughness')
-      echo 'Double value is: 0.07'
-      ;;
-    '/body_lattice_planner min_traversability')
-      echo 'Double value is: 0.21'
-      ;;
-    '/body_lattice_planner max_slope')
-      echo 'Double value is: 0.61'
-      ;;
-    '/body_lattice_planner max_step_height')
-      echo 'Double value is: 0.19'
-      ;;
-    '/body_lattice_planner snap_radius')
-      echo 'Double value is: 0.45'
-      ;;
-    *)
-      exit 1
-      ;;
-  esac
-  exit 0
+  : > "${FAKE_PARAM_GET_MARKER}"
+  echo "forbidden ros2 param get invocation: $*" >&2
+  exit 97
 fi
 
 echo "unexpected fake ros2 invocation: $*" >&2
@@ -109,6 +85,15 @@ exit 1
 SH
 chmod +x "${workspace}/bin/pgrep"
 
+cat > "${workspace}/bin/sleep" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ -n "${FAKE_SLEEP_LOG:-}" ]]; then
+  printf '%s\n' "$*" >> "${FAKE_SLEEP_LOG}"
+fi
+SH
+chmod +x "${workspace}/bin/sleep"
+
 cat > "${workspace}/tools/inspect_planner_inputs.py" <<'PY'
 #!/usr/bin/env python3
 import importlib.util
@@ -118,6 +103,20 @@ import sys
 from pathlib import Path
 
 if __name__ == "__main__":
+    sequence = os.environ.get("FAKE_INSPECTOR_STATUS_SEQUENCE", "")
+    sequence_status = None
+    if sequence:
+        state_path = Path(os.environ["FAKE_INSPECTOR_STATUS_STATE"])
+        invocation = int(state_path.read_text() or "0") if state_path.exists() else 0
+        statuses = [int(item) for item in sequence.split(",")]
+        if invocation >= len(statuses):
+            print("fake inspector status sequence exhausted", file=sys.stderr)
+            raise SystemExit(1)
+        sequence_status = statuses[invocation]
+        state_path.write_text(str(invocation + 1), encoding="utf-8")
+        if sequence_status == 1:
+            print("fake series capture failed", file=sys.stderr)
+            raise SystemExit(1)
     if "--malformed-success" in sys.argv:
         print("not planner inspection JSON")
         raise SystemExit(0)
@@ -135,7 +134,9 @@ if __name__ == "__main__":
         if not gate.exists():
             print("stream probe gate timed out", file=sys.stderr)
             raise SystemExit(1)
-    diagnostic_failure = "--diagnostic-failure" in sys.argv
+    diagnostic_failure = (
+        "--diagnostic-failure" in sys.argv or sequence_status == 2
+    )
     print(json.dumps({
         "diagnosis": (
             "start_has_no_valid_cell_in_snap_square"
@@ -166,6 +167,8 @@ _write_session_record_atomic = module._write_session_record_atomic
 PY
 
 : > "${session_dir}/planner_input_inspections.jsonl"
+printf 'GO2_LIO_DENSE_OUTPUT=false\n' \
+  > "${session_dir}/ros_dds_environment.txt"
 printf '%s\n' "${session_dir}" > "${runtime}/active_session"
 bash -c "exec -a 'go2-log _collect ${session_dir}' sleep 60" &
 COLLECTOR_PID="$!"
@@ -175,7 +178,30 @@ common_environment=(
   GO2_LOG_ROOT="${runtime}"
   GO2_WORKSPACE="${workspace}"
   GO2_REAL_INSPECTOR="${REPO_ROOT}/tools/inspect_planner_inputs.py"
+  FAKE_PARAM_GET_MARKER="${runtime}/param-get-called"
+  FAKE_SLEEP_LOG="${runtime}/sleep.log"
+  PATH="${workspace}/bin:${PATH}"
 )
+
+env "${common_environment[@]}" GO2_LIO_DENSE_OUTPUT=false \
+  "${GO2_LOG}" start >/dev/null
+test "$(grep -Fc 'GO2_LIO_DENSE_OUTPUT=false' \
+  "${session_dir}/ros_dds_environment.txt")" -eq 1
+
+set +e
+dense_change_output="$(
+  env "${common_environment[@]}" GO2_LIO_DENSE_OUTPUT=true \
+    "${GO2_LOG}" start 2>&1
+)"
+dense_change_status=$?
+set -e
+test "${dense_change_status}" -ne 0
+[[ "${dense_change_output}" == \
+  *"stop it before changing to true"* ]]
+test "$(grep -Fc 'GO2_LIO_DENSE_OUTPUT=false' \
+  "${session_dir}/ros_dds_environment.txt")" -eq 1
+test "$(grep -Fc 'GO2_LIO_DENSE_OUTPUT=true' \
+  "${session_dir}/ros_dds_environment.txt" || true)" -eq 0
 
 stream_output="${runtime}/planner-check-stream.txt"
 stream_gate="${runtime}/planner-check-stream.release"
@@ -276,23 +302,18 @@ import sys
 
 records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
 assert len(records) == 2
+assert "series" not in records[0]["inspection"]
 assert records[0]["exit_code"] == 2
 assert records[0]["status"] == "diagnostic_failure"
 assert records[0]["inspection"]["diagnosis"] == (
     "start_has_no_valid_cell_in_snap_square"
 )
 arguments = records[0]["inspection"]["arguments"]
-assert arguments[:3] == [
-    "--json", "--record-start-on-goal-timeout", "--diagnostic-failure"
-]
-assert arguments[3:] == [
-    "--min-observed-frames", "6",
-    "--mapper-max-slope", "0.58",
-    "--max-roughness", "0.07",
-    "--min-traversability", "0.21",
-    "--max-slope", "0.61",
-    "--max-step-height", "0.19",
-    "--snap-radius", "0.45",
+assert arguments == [
+    "--json",
+    "--record-start-on-goal-timeout",
+    "--read-live-parameters",
+    "--diagnostic-failure",
 ]
 assert records[1]["exit_code"] == 1
 assert records[1]["status"] == "capture_error"
@@ -322,33 +343,6 @@ test "${postflight_status}" -eq 1
 [[ "${postflight_output}" == *"post-capture motion safety preflight failed"* ]]
 rm -f -- "${motion_marker}"
 
-set +e
-parameter_output="$(
-  env "${common_environment[@]}" \
-    FAKE_PARAM_FAILURE='/terrain_mapper max_roughness' \
-    "${GO2_LOG}" planner-check --no-goal 2>&1
-)"
-parameter_status=$?
-set -e
-test "${parameter_status}" -eq 1
-[[ "${parameter_output}" == \
-  *"could not read /terrain_mapper max_roughness"* ]]
-
-python3 - "${session_dir}/planner_input_inspections.jsonl" <<'PY'
-import json
-from pathlib import Path
-import sys
-
-records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
-assert len(records) == 5
-assert records[-1]["status"] == "capture_error"
-assert records[-1]["exit_code"] == 1
-assert records[-1]["error"]["type"] == "inspector_capture_error"
-assert "could not read /terrain_mapper max_roughness" in (
-    records[-1]["error"]["message"]
-)
-PY
-
 before_motion_check="$(sha256sum "${session_dir}/planner_input_inspections.jsonl")"
 set +e
 motion_output="$(
@@ -361,6 +355,188 @@ test "${motion_status}" -ne 0
 [[ "${motion_output}" == *"/lowcmd has 1 publisher(s)"* ]]
 test "${before_motion_check}" = \
   "$(sha256sum "${session_dir}/planner_input_inspections.jsonl")"
+
+: > "${session_dir}/planner_input_inspections.jsonl"
+set +e
+implicit_goal_output="$(
+  env "${common_environment[@]}" \
+    "${GO2_LOG}" planner-series \
+      --samples 2 --interval 0.5 2>&1
+)"
+implicit_goal_status=$?
+set -e
+test "${implicit_goal_status}" -ne 0
+[[ "${implicit_goal_output}" == \
+  *"requires --no-goal or both --goal-x and --goal-y"* ]]
+test ! -s "${session_dir}/planner_input_inspections.jsonl"
+
+assert_series_schedule_rejected() {
+  local output status
+  set +e
+  output="$(
+    env "${common_environment[@]}" \
+      "${GO2_LOG}" planner-series "$@" --no-goal 2>&1
+  )"
+  status=$?
+  set -e
+  test "${status}" -ne 0
+  [[ "${output}" == *"invalid planner-series schedule"* ]]
+  test ! -s "${session_dir}/planner_input_inspections.jsonl"
+}
+
+assert_series_schedule_rejected --samples 1
+assert_series_schedule_rejected --samples 31
+assert_series_schedule_rejected --samples 2.0
+assert_series_schedule_rejected --samples NaN
+assert_series_schedule_rejected --interval 0.49
+assert_series_schedule_rejected --interval 5.01
+assert_series_schedule_rejected --interval NaN
+assert_series_schedule_rejected --interval Inf
+assert_series_schedule_rejected --interval nonsense
+assert_series_schedule_rejected --samples 30 --interval 1.1
+
+: > "${session_dir}/planner_input_inspections.jsonl"
+set +e
+source_failure_output="$(
+  env "${common_environment[@]}" FAKE_ENV_SOURCE_FAILURE=1 \
+    "${GO2_LOG}" planner-series \
+      --samples 2 --interval 0.5 --no-goal 2>&1
+)"
+source_failure_status=$?
+set -e
+test "${source_failure_status}" -eq 86
+test ! -s "${session_dir}/planner_input_inspections.jsonl"
+[[ "${source_failure_output}" != *"Planner inspection recorded"* ]]
+
+set +e
+series_output="$(
+  env "${common_environment[@]}" \
+    "${GO2_LOG}" planner-series \
+      --samples 2 --interval 0.5 --no-goal 2>&1
+)"
+series_status=$?
+set -e
+test "${series_status}" -eq 0
+[[ "${series_output}" == *"Planner series complete: 2/2 samples"* ]]
+
+python3 - "${session_dir}/planner_input_inspections.jsonl" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert len(records) == 2
+series = [record["inspection"]["series"] for record in records]
+assert series[0]["id"]
+assert series[0]["id"] == series[1]["id"]
+assert [item["index"] for item in series] == [1, 2]
+assert [item["count"] for item in series] == [2, 2]
+assert [item["interval_sec"] for item in series] == [0.5, 0.5]
+for record in records:
+    assert record["inspection"]["arguments"][-1] == "--no-goal"
+PY
+
+: > "${session_dir}/planner_input_inspections.jsonl"
+: > "${runtime}/sleep.log"
+env "${common_environment[@]}" \
+  "${GO2_LOG}" planner-series --no-goal >/dev/null
+test "$(wc -l < "${runtime}/sleep.log")" -eq 9
+test "$(sort -u "${runtime}/sleep.log")" = '1.0'
+
+python3 - "${session_dir}/planner_input_inspections.jsonl" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert len(records) == 10
+assert [record["inspection"]["series"]["index"] for record in records] == list(
+    range(1, 11)
+)
+assert {record["inspection"]["series"]["count"] for record in records} == {10}
+assert {
+    record["inspection"]["series"]["interval_sec"] for record in records
+} == {1.0}
+PY
+
+: > "${session_dir}/planner_input_inspections.jsonl"
+env "${common_environment[@]}" \
+  "${GO2_LOG}" planner-series \
+    --samples=2 --interval=.5 \
+    --goal-x 1.25 --goal-y=-0.5 --goal-yaw 0.1 >/dev/null
+
+python3 - "${session_dir}/planner_input_inspections.jsonl" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert len(records) == 2
+for record in records:
+    assert record["inspection"]["arguments"][-5:] == [
+        "--goal-x", "1.25", "--goal-y=-0.5", "--goal-yaw", "0.1"
+    ]
+PY
+
+: > "${session_dir}/planner_input_inspections.jsonl"
+: > "${runtime}/sleep.log"
+rm -f -- "${runtime}/series-status.state"
+set +e
+mixed_status_output="$(
+  env "${common_environment[@]}" \
+    FAKE_INSPECTOR_STATUS_SEQUENCE='2,0,2' \
+    FAKE_INSPECTOR_STATUS_STATE="${runtime}/series-status.state" \
+    "${GO2_LOG}" planner-series \
+      --samples 3 --interval 0.5 --no-goal 2>&1
+)"
+mixed_status=$?
+set -e
+test "${mixed_status}" -eq 2
+[[ "${mixed_status_output}" == *"Planner series complete: 3/3 samples"* ]]
+test "$(cat "${runtime}/series-status.state")" -eq 3
+test "$(wc -l < "${runtime}/sleep.log")" -eq 2
+
+python3 - "${session_dir}/planner_input_inspections.jsonl" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert [record["exit_code"] for record in records] == [2, 0, 2]
+assert [record["inspection"]["series"]["index"] for record in records] == [1, 2, 3]
+PY
+
+: > "${session_dir}/planner_input_inspections.jsonl"
+: > "${runtime}/sleep.log"
+rm -f -- "${runtime}/series-status.state"
+set +e
+capture_stop_output="$(
+  env "${common_environment[@]}" \
+    FAKE_INSPECTOR_STATUS_SEQUENCE='0,1,0' \
+    FAKE_INSPECTOR_STATUS_STATE="${runtime}/series-status.state" \
+    "${GO2_LOG}" planner-series \
+      --samples 3 --interval 0.5 --no-goal 2>&1
+)"
+capture_stop_status=$?
+set -e
+test "${capture_stop_status}" -eq 1
+[[ "${capture_stop_output}" != *"Planner series complete"* ]]
+test "$(cat "${runtime}/series-status.state")" -eq 2
+test "$(wc -l < "${runtime}/sleep.log")" -eq 1
+
+python3 - "${session_dir}/planner_input_inspections.jsonl" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+records = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+assert len(records) == 2
+assert records[0]["exit_code"] == 0
+assert records[0]["inspection"]["series"]["index"] == 1
+assert records[1]["exit_code"] == 1
+assert records[1]["status"] == "capture_error"
+assert "fake series capture failed" in records[1]["error"]["message"]
+PY
 
 before_stale="$(sha256sum "${session_dir}/planner_input_inspections.jsonl")"
 kill -TERM "${COLLECTOR_PID}"
@@ -376,5 +552,6 @@ test "${stale_status}" -ne 0
 [[ "${stale_output}" == *"collector is not healthy"* ]]
 test "${before_stale}" = "$(sha256sum "${session_dir}/planner_input_inspections.jsonl")"
 test -f "${runtime}/active_session"
+test ! -e "${runtime}/param-get-called"
 
 echo "PASS: planner checks are recorded only in a healthy active session"

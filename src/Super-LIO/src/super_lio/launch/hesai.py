@@ -6,6 +6,7 @@ from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, TextSubstitution
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 def generate_launch_description():
     pkg_super_lio = get_package_share_directory('super_lio')
@@ -17,6 +18,11 @@ def generate_launch_description():
         default_value='false',
         description='Whether to start RVIZ2 (the integrated workflow uses planning RViz)'
     )
+    declare_dense_output_arg = DeclareLaunchArgument(
+        'dense_output',
+        default_value='false',
+        description='Publish the full undistorted scan on /lio/cloud_world'
+    )
     rviz_flag = LaunchConfiguration('rviz')
 
     super_lio_node = Node(
@@ -24,7 +30,13 @@ def generate_launch_description():
         executable='super_lio_node',
         name='super_lio_node',
         output='screen',
-        parameters=[config_yaml],
+        parameters=[
+            config_yaml,
+            {
+                'lio.output.dense': ParameterValue(
+                    LaunchConfiguration('dense_output'), value_type=bool),
+            },
+        ],
         arguments=['--ros-args', '--log-level', 'info']
     )
 
@@ -38,6 +50,7 @@ def generate_launch_description():
 
     ld = LaunchDescription()
     ld.add_action(declare_rviz_arg)
+    ld.add_action(declare_dense_output_arg)
     ld.add_action(super_lio_node)
     ld.add_action(rviz2_node)
 

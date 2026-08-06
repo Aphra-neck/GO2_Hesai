@@ -20,6 +20,9 @@ from typing import Callable, Mapping, Sequence
 
 SESSION_LOG_MAX_BYTES = 8 * 1024 * 1024
 SESSION_RECORD_MAX_BYTES = 1024 * 1024
+PARAMETER_SERVICE_TIMEOUT_SEC = 2.0
+PARAMETER_RESPONSE_TIMEOUT_SEC = 2.0
+PARAMETER_READ_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,202 @@ class SubscriptionSpec:
     message_type: object
     topic: str
     qos: object
+
+
+def _request_parameter_batch(
+    node: object,
+    get_parameters_type: object,
+    spin_until_future_complete: Callable[..., object],
+    service_name: str,
+    parameter_names: Sequence[str],
+    service_timeout: float,
+    response_timeout: float,
+    max_attempts: int,
+) -> Sequence[object]:
+    client = node.create_client(get_parameters_type, service_name)
+    last_failure = "request was not attempted"
+    try:
+        for _ in range(max_attempts):
+            if not client.wait_for_service(timeout_sec=service_timeout):
+                last_failure = (
+                    f"service discovery timed out after {service_timeout:.3f} s"
+                )
+                continue
+
+            request = get_parameters_type.Request()
+            request.names = list(parameter_names)
+            future = client.call_async(request)
+            spin_until_future_complete(
+                node,
+                future,
+                timeout_sec=response_timeout,
+            )
+            if not future.done():
+                future.cancel()
+                last_failure = (
+                    f"response timed out after {response_timeout:.3f} s"
+                )
+                continue
+            error = future.exception()
+            if error is not None:
+                last_failure = f"request failed: {error}"
+                continue
+            response = future.result()
+            if response is None:
+                last_failure = "request completed without a response"
+                continue
+            values = response.values
+            if len(values) != len(parameter_names):
+                raise RuntimeError(
+                    f"{service_name} returned {len(values)} values for "
+                    f"{len(parameter_names)} requested parameters"
+                )
+            return values
+    finally:
+        node.destroy_client(client)
+
+    requested = ", ".join(parameter_names)
+    raise RuntimeError(
+        f"could not read [{requested}] from {service_name} after "
+        f"{max_attempts} attempts: {last_failure}"
+    )
+
+
+def _decode_live_parameter(
+    service_name: str,
+    parameter_name: str,
+    value: object,
+    expected_type: int,
+    value_field: str,
+    expected_type_name: str,
+) -> int | float:
+    if value.type != expected_type:
+        raise RuntimeError(
+            f"{service_name} parameter {parameter_name} must be "
+            f"{expected_type_name}; received ROS parameter type {value.type}"
+        )
+    decoded = getattr(value, value_field)
+    if isinstance(decoded, float) and not math.isfinite(decoded):
+        raise RuntimeError(
+            f"{service_name} parameter {parameter_name} must be finite"
+        )
+    return decoded
+
+
+def _read_live_planner_thresholds(
+    node: object,
+    get_parameters_type: object,
+    parameter_type: object,
+    spin_until_future_complete: Callable[..., object],
+    *,
+    service_timeout: float,
+    response_timeout: float,
+    max_attempts: int,
+) -> PlannerThresholds:
+    """Read mapper and planner thresholds using two bounded service calls."""
+    mapper_service = "/terrain_mapper/get_parameters"
+    mapper_names = ("min_observed_frames", "max_slope", "max_roughness")
+    mapper_values = _request_parameter_batch(
+        node,
+        get_parameters_type,
+        spin_until_future_complete,
+        mapper_service,
+        mapper_names,
+        service_timeout,
+        response_timeout,
+        max_attempts,
+    )
+    planner_service = "/body_lattice_planner/get_parameters"
+    planner_names = (
+        "min_traversability",
+        "max_slope",
+        "max_step_height",
+        "snap_radius",
+    )
+    planner_values = _request_parameter_batch(
+        node,
+        get_parameters_type,
+        spin_until_future_complete,
+        planner_service,
+        planner_names,
+        service_timeout,
+        response_timeout,
+        max_attempts,
+    )
+    thresholds = PlannerThresholds(
+        min_observed_frames=int(
+            _decode_live_parameter(
+                mapper_service,
+                mapper_names[0],
+                mapper_values[0],
+                parameter_type.PARAMETER_INTEGER,
+                "integer_value",
+                "an integer",
+            )
+        ),
+        mapper_max_slope=float(
+            _decode_live_parameter(
+                mapper_service,
+                mapper_names[1],
+                mapper_values[1],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        max_roughness=float(
+            _decode_live_parameter(
+                mapper_service,
+                mapper_names[2],
+                mapper_values[2],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        min_traversability=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[0],
+                planner_values[0],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        max_slope=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[1],
+                planner_values[1],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        max_step_height=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[2],
+                planner_values[2],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        snap_radius=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[3],
+                planner_values[3],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+    )
+    _validate_thresholds(thresholds)
+    return thresholds
 
 
 def _validate_grid(grid: GridSnapshot) -> None:
@@ -148,10 +347,10 @@ def _terrain_layer_stats(
     grid: GridSnapshot,
     thresholds: PlannerThresholds,
     indices: Sequence[int] | None = None,
-) -> dict[str, int]:
+) -> dict[str, int | float | None]:
     """Count independent terrain-layer facts over the requested cells."""
     selected = range(grid.width * grid.height) if indices is None else indices
-    stats = {
+    stats: dict[str, int | float | None] = {
         "cell_count": len(selected),
         "observation_zero": 0,
         "observation_below_min": 0,
@@ -174,7 +373,13 @@ def _terrain_layer_stats(
         "traversability_at_or_above_min": 0,
         "zero_traversability_with_slope_and_roughness_below_limits": 0,
         "planner_valid": 0,
+        "slope_min_rad": None,
+        "slope_p50_rad": None,
+        "slope_p90_rad": None,
+        "slope_p95_rad": None,
+        "slope_max_rad": None,
     }
+    known_slopes: list[float] = []
     for index in selected:
         observations = int(grid.observation_count[index])
         if observations == 0:
@@ -201,6 +406,7 @@ def _terrain_layer_stats(
             stats["elevation_unknown_or_nonfinite"] += 1
         if slope_known:
             stats["slope_known"] += 1
+            known_slopes.append(float(slope))
         else:
             stats["slope_unknown_or_nonfinite"] += 1
         if roughness_known:
@@ -247,6 +453,29 @@ def _terrain_layer_stats(
             and slope <= thresholds.max_slope
         ):
             stats["planner_valid"] += 1
+
+    if known_slopes:
+        known_slopes.sort()
+
+        def percentile(fraction: float) -> float:
+            position = fraction * (len(known_slopes) - 1)
+            lower = math.floor(position)
+            upper = math.ceil(position)
+            weight = position - lower
+            return (
+                known_slopes[lower] * (1.0 - weight)
+                + known_slopes[upper] * weight
+            )
+
+        stats.update(
+            {
+                "slope_min_rad": known_slopes[0],
+                "slope_p50_rad": percentile(0.50),
+                "slope_p90_rad": percentile(0.90),
+                "slope_p95_rad": percentile(0.95),
+                "slope_max_rad": known_slopes[-1],
+            }
+        )
     return stats
 
 
@@ -310,6 +539,7 @@ def _snap_endpoint(
         "inside_map": _inside(grid, grid_x, grid_y),
         "exact_cell_valid": False,
         "valid_cells_in_snap_square": 0,
+        "valid_cells_in_snap_radius": 0,
         "snapped": False,
         "snapped_grid_x": None,
         "snapped_grid_y": None,
@@ -319,6 +549,7 @@ def _snap_endpoint(
         "snap_world_to_center_distance_m": None,
         "snap_grid_distance_outside_nominal_radius": False,
         "snap_square_terrain_layers": None,
+        "snap_radius_terrain_layers": None,
     }
     if not result["inside_map"]:
         return result
@@ -328,6 +559,7 @@ def _snap_endpoint(
     radius = max(1, math.ceil(thresholds.snap_radius / grid.resolution))
     candidates: list[tuple[int, int, int]] = []
     snap_square_indices: list[int] = []
+    snap_radius_indices: list[int] = []
     for delta_y in range(-radius, radius + 1):
         for delta_x in range(-radius, radius + 1):
             x = grid_x + delta_x
@@ -336,6 +568,12 @@ def _snap_endpoint(
                 continue
             address = _address(grid, x, y)
             snap_square_indices.append(address)
+            distance_m = (
+                math.hypot(delta_x, delta_y) * grid.resolution
+            )
+            if distance_m > thresholds.snap_radius + 1.0e-6:
+                continue
+            snap_radius_indices.append(address)
             if mask[address]:
                 distance = delta_x * delta_x + delta_y * delta_y
                 candidates.append((distance, x, y))
@@ -344,7 +582,15 @@ def _snap_endpoint(
         thresholds,
         snap_square_indices,
     )
-    result["valid_cells_in_snap_square"] = len(candidates)
+    result["snap_radius_terrain_layers"] = _terrain_layer_stats(
+        grid,
+        thresholds,
+        snap_radius_indices,
+    )
+    result["valid_cells_in_snap_square"] = sum(
+        bool(mask[index]) for index in snap_square_indices
+    )
+    result["valid_cells_in_snap_radius"] = len(candidates)
     if not candidates:
         return result
 
@@ -371,7 +617,7 @@ def _snap_endpoint(
             "snap_grid_distance_m": grid_distance,
             "snap_world_to_center_distance_m": world_to_center_distance,
             "snap_grid_distance_outside_nominal_radius": (
-                grid_distance > thresholds.snap_radius + 1.0e-9
+                grid_distance > thresholds.snap_radius + 1.0e-6
             ),
         }
     )
@@ -535,7 +781,7 @@ def analyze_planner_inputs(
         result["diagnosis"] = "start_outside_map"
         return result
     if not start_result["snapped"]:
-        result["diagnosis"] = "start_has_no_valid_cell_in_snap_square"
+        result["diagnosis"] = "start_has_no_valid_cell_in_snap_radius"
         return result
 
     start_x = int(start_result["snapped_grid_x"])
@@ -570,7 +816,7 @@ def analyze_planner_inputs(
         result["diagnosis"] = "goal_outside_map"
         return result
     if not goal_result["snapped"]:
-        result["diagnosis"] = "goal_has_no_valid_cell_in_snap_square"
+        result["diagnosis"] = "goal_has_no_valid_cell_in_snap_radius"
         return result
 
     goal_address = _address(
@@ -852,11 +1098,20 @@ def _goal_pose(message: object) -> Pose2D:
 
 def collect_ros_inputs(
     args: argparse.Namespace,
-) -> tuple[GridSnapshot, Pose2D, Pose2D | None, int, str | None]:
+) -> tuple[
+    GridSnapshot,
+    Pose2D,
+    Pose2D | None,
+    int,
+    str | None,
+    PlannerThresholds | None,
+]:
     try:
         import rclpy
         from geometry_msgs.msg import PoseStamped
         from nav_msgs.msg import Odometry
+        from rcl_interfaces.msg import ParameterType
+        from rcl_interfaces.srv import GetParameters
         from rclpy.node import Node
         from rclpy.qos import (
             DurabilityPolicy,
@@ -890,6 +1145,22 @@ def collect_ros_inputs(
     )
     try:
         node = Node("inspect_planner_inputs")
+        live_thresholds = None
+        if args.read_live_parameters:
+            print(
+                "Reading live terrain mapper and planner parameters...",
+                file=sys.stderr,
+                flush=True,
+            )
+            live_thresholds = _read_live_planner_thresholds(
+                node,
+                GetParameters,
+                ParameterType,
+                rclpy.spin_until_future_complete,
+                service_timeout=PARAMETER_SERVICE_TIMEOUT_SEC,
+                response_timeout=PARAMETER_RESPONSE_TIMEOUT_SEC,
+                max_attempts=PARAMETER_READ_ATTEMPTS,
+            )
         specs = {
             "latched_map": SubscriptionSpec(
                 "map", TerrainGrid, args.map_topic, latched_map_qos
@@ -934,6 +1205,7 @@ def collect_ros_inputs(
             goal,
             now_ns,
             received.get("goal_capture_failure"),
+            live_thresholds,
         )
     finally:
         if node is not None:
@@ -989,14 +1261,15 @@ def _format_endpoint(
         f"inside={endpoint['inside_map']}",
         f"  exact_valid={endpoint['exact_cell_valid']} "
         f"valid_in_snap_square={endpoint['valid_cells_in_snap_square']} "
+        f"valid_in_snap_radius={endpoint['valid_cells_in_snap_radius']} "
         f"snapped={endpoint['snapped']} "
         f"grid_distance_m={endpoint['snap_grid_distance_m']} "
         f"world_to_center_m={endpoint['snap_world_to_center_distance_m']}",
     ]
-    local_stats = endpoint["snap_square_terrain_layers"]
+    local_stats = endpoint["snap_radius_terrain_layers"]
     if isinstance(local_stats, dict):
         lines.extend(
-            _format_terrain_layers("snap_square_layers", local_stats, "  ")
+            _format_terrain_layers("snap_radius_layers", local_stats, "  ")
         )
     return lines
 
@@ -1071,6 +1344,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--goal-discovery-timeout", type=float, default=10.0)
     parser.add_argument(
         "--record-start-on-goal-timeout",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--read-live-parameters",
         action="store_true",
         help=argparse.SUPPRESS,
     )
@@ -1292,20 +1570,28 @@ def _write_session_record_atomic(
 def main() -> int:
     args = parse_args()
     try:
-        grid, start, goal, now_ns, goal_capture_failure = collect_ros_inputs(args)
+        (
+            grid,
+            start,
+            goal,
+            now_ns,
+            goal_capture_failure,
+            live_thresholds,
+        ) = collect_ros_inputs(args)
+        thresholds = live_thresholds or PlannerThresholds(
+            min_traversability=args.min_traversability,
+            max_slope=args.max_slope,
+            mapper_max_slope=args.mapper_max_slope,
+            max_roughness=args.max_roughness,
+            max_step_height=args.max_step_height,
+            snap_radius=args.snap_radius,
+            min_observed_frames=args.min_observed_frames,
+        )
         result = analyze_planner_inputs(
             grid,
             start,
             goal,
-            PlannerThresholds(
-                min_traversability=args.min_traversability,
-                max_slope=args.max_slope,
-                mapper_max_slope=args.mapper_max_slope,
-                max_roughness=args.max_roughness,
-                max_step_height=args.max_step_height,
-                snap_radius=args.snap_radius,
-                min_observed_frames=args.min_observed_frames,
-            ),
+            thresholds,
             InputContract(
                 map_frame=args.expected_map_frame,
                 body_frame=args.expected_body_frame,

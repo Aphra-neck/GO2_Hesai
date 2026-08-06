@@ -56,6 +56,13 @@ PLANNER_LAYER_SOURCE_FIELDS = (
     "zero_traversability_with_slope_and_roughness_below_limits",
     "planner_valid",
 )
+PLANNER_SLOPE_QUANTILE_FIELDS = (
+    "slope_min_rad",
+    "slope_p50_rad",
+    "slope_p90_rad",
+    "slope_p95_rad",
+    "slope_max_rad",
+)
 PLANNER_LAYER_FIELDS = (
     "cell_count",
     "observation_zero",
@@ -79,6 +86,7 @@ PLANNER_LAYER_FIELDS = (
     "traversability_at_or_above_min",
     "hard_reject_candidate",
     "planner_valid",
+    *PLANNER_SLOPE_QUANTILE_FIELDS,
 )
 PLANNER_CSV_FIELDS = (
     "recorded_at",
@@ -86,6 +94,10 @@ PLANNER_CSV_FIELDS = (
     "exit_code",
     "diagnosis",
     "scope",
+    "series_id",
+    "series_index",
+    "series_count",
+    "series_interval_sec",
     "map_frame",
     "map_width",
     "map_height",
@@ -120,10 +132,32 @@ PLANNER_CSV_FIELDS = (
     "inside_map",
     "exact_cell_valid",
     "valid_cells_in_snap_square",
+    "valid_cells_in_snap_radius",
     "snapped",
     "snap_grid_distance_m",
     "snap_world_to_center_distance_m",
     "start_map_diagnosis",
+)
+PLANNER_SERIES_METRICS = (
+    "planner_valid",
+    "slope_over_limit",
+    *PLANNER_SLOPE_QUANTILE_FIELDS,
+    "start_component_cells",
+)
+PLANNER_SERIES_CSV_FIELDS = (
+    "series_id",
+    "scope",
+    "captured",
+    "expected",
+    "interval_sec",
+    "first_recorded_at",
+    "last_recorded_at",
+    "duration_sec",
+    *(f"{field}_{suffix}" for field in PLANNER_SERIES_METRICS for suffix in ("min", "max", "mean")),
+    "goal_connectivity_true",
+    "goal_connectivity_false",
+    "goal_connectivity_unknown",
+    "goal_connectivity_bool_flips",
 )
 
 
@@ -236,6 +270,25 @@ def _valid_planner_layers(value: object) -> bool:
     ):
         return False
 
+    quantiles_present = [
+        field in value for field in PLANNER_SLOPE_QUANTILE_FIELDS
+    ]
+    if any(quantiles_present) and not all(quantiles_present):
+        return False
+    if all(quantiles_present):
+        quantiles = [value[field] for field in PLANNER_SLOPE_QUANTILE_FIELDS]
+        if value["slope_known"] == 0:
+            if any(item is not None for item in quantiles):
+                return False
+        elif (
+            not all(_is_finite_number(item, minimum=0.0) for item in quantiles)
+            or any(
+                float(left) > float(right)
+                for left, right in zip(quantiles, quantiles[1:])
+            )
+        ):
+            return False
+
     cell_count = value["cell_count"]
     if (
         value["observation_zero"]
@@ -335,8 +388,18 @@ def _valid_planner_endpoint(value: object) -> bool:
     ):
         return False
 
+    has_radius_count = "valid_cells_in_snap_radius" in value
+    has_radius_layers = "snap_radius_terrain_layers" in value
+    if has_radius_count != has_radius_layers:
+        return False
+    if has_radius_count and not _is_strict_int(
+        value.get("valid_cells_in_snap_radius")
+    ):
+        return False
+
     inside = value["inside_map"]
     layers = value.get("snap_square_terrain_layers")
+    radius_layers = value.get("snap_radius_terrain_layers")
     if inside:
         if not _valid_planner_layers(layers):
             return False
@@ -344,10 +407,31 @@ def _valid_planner_endpoint(value: object) -> bool:
             return False
         if layers["planner_valid"] != value["valid_cells_in_snap_square"]:
             return False
+        if has_radius_count:
+            if not _valid_planner_layers(radius_layers):
+                return False
+            if radius_layers["cell_count"] > layers["cell_count"]:
+                return False
+            if (
+                radius_layers["planner_valid"]
+                != value["valid_cells_in_snap_radius"]
+                or value["valid_cells_in_snap_radius"]
+                > value["valid_cells_in_snap_square"]
+            ):
+                return False
     elif layers is not None:
+        return False
+    elif has_radius_count and (
+        radius_layers is not None or value["valid_cells_in_snap_radius"] != 0
+    ):
         return False
 
     snapped = value["snapped"]
+    valid_snap_cells = (
+        value["valid_cells_in_snap_radius"]
+        if has_radius_count
+        else value["valid_cells_in_snap_square"]
+    )
     snapped_fields = (
         "snapped_grid_x",
         "snapped_grid_y",
@@ -357,7 +441,7 @@ def _valid_planner_endpoint(value: object) -> bool:
         "snap_world_to_center_distance_m",
     )
     if snapped:
-        if value["valid_cells_in_snap_square"] < 1:
+        if valid_snap_cells < 1:
             return False
         if not all(
             _is_strict_int(value.get(field), minimum=-2**63)
@@ -382,7 +466,9 @@ def _valid_planner_endpoint(value: object) -> bool:
         or snapped
     ):
         return False
-    return (value["valid_cells_in_snap_square"] > 0) == snapped
+    if has_radius_count and value["snap_grid_distance_outside_nominal_radius"]:
+        return False
+    return (valid_snap_cells > 0) == snapped
 
 
 def _valid_planner_inspection(value: object) -> bool:
@@ -410,6 +496,7 @@ def _valid_planner_inspection(value: object) -> bool:
     freshness = value.get("freshness")
     start = value.get("start")
     goal = value.get("goal")
+    series = value.get("series")
     if (
         not isinstance(diagnosis, str)
         or not diagnosis
@@ -421,6 +508,20 @@ def _valid_planner_inspection(value: object) -> bool:
         or (goal is not None and not _valid_planner_endpoint(goal))
     ):
         return False
+
+    if series is not None:
+        series_required = {"id", "index", "count", "interval_sec"}
+        if (
+            not isinstance(series, dict)
+            or not series_required.issubset(series)
+            or not isinstance(series.get("id"), str)
+            or not series["id"].strip()
+            or not _is_strict_int(series.get("index"), minimum=1)
+            or not _is_strict_int(series.get("count"), minimum=1)
+            or series["index"] > series["count"]
+            or not _is_finite_number(series.get("interval_sec"), minimum=0.0)
+        ):
+            return False
 
     width = map_data.get("width")
     height = map_data.get("height")
@@ -603,12 +704,15 @@ def _planner_layer_row(
     map_data = inspection.get("map", {})
     thresholds = inspection.get("thresholds", {})
     freshness = inspection.get("freshness", {})
+    series = inspection.get("series", {})
     if not isinstance(map_data, dict):
         map_data = {}
     if not isinstance(thresholds, dict):
         thresholds = {}
     if not isinstance(freshness, dict):
         freshness = {}
+    if not isinstance(series, dict):
+        series = {}
     row.update(
         {
             "recorded_at": record.get("recorded_at", ""),
@@ -617,6 +721,10 @@ def _planner_layer_row(
             "diagnosis": inspection.get("diagnosis", ""),
             "start_map_diagnosis": inspection.get("start_map_diagnosis", ""),
             "scope": scope,
+            "series_id": series.get("id", ""),
+            "series_index": series.get("index", ""),
+            "series_count": series.get("count", ""),
+            "series_interval_sec": series.get("interval_sec", ""),
             "map_frame": map_data.get("frame_id", ""),
             "map_width": map_data.get("width", ""),
             "map_height": map_data.get("height", ""),
@@ -677,6 +785,7 @@ def _planner_layer_row(
             "inside_map",
             "exact_cell_valid",
             "valid_cells_in_snap_square",
+            "valid_cells_in_snap_radius",
             "snapped",
             "snap_grid_distance_m",
             "snap_world_to_center_distance_m",
@@ -749,7 +858,10 @@ def summarize_planner_inspections(
         assert isinstance(diagnosis, str)
         assert isinstance(map_data, dict)
         assert isinstance(start, dict)
-        start_layers = start.get("snap_square_terrain_layers")
+        start_layers = start.get(
+            "snap_radius_terrain_layers",
+            start.get("snap_square_terrain_layers"),
+        )
 
         accepted_records.append(record)
         completed.append(record)
@@ -778,8 +890,17 @@ def summarize_planner_inspections(
                     record,
                     inspection,
                     "goal",
-                    goal.get("snap_square_terrain_layers")
-                    if isinstance(goal.get("snap_square_terrain_layers"), dict)
+                    goal.get(
+                        "snap_radius_terrain_layers",
+                        goal.get("snap_square_terrain_layers"),
+                    )
+                    if isinstance(
+                        goal.get(
+                            "snap_radius_terrain_layers",
+                            goal.get("snap_square_terrain_layers"),
+                        ),
+                        dict,
+                    )
                     else {},
                     goal,
                 )
@@ -799,7 +920,88 @@ def summarize_planner_inspections(
         "schema_invalid": schema_invalid,
         "capture_errors": capture_errors,
         "diagnoses": diagnoses,
+        "series_rows": summarize_planner_series(rows),
     }
+
+
+def summarize_planner_series(
+    planner_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
+    for row in planner_rows:
+        series_id = row.get("series_id")
+        scope = row.get("scope")
+        if isinstance(series_id, str) and series_id and isinstance(scope, str):
+            grouped[(series_id, scope)].append(row)
+
+    summaries: list[dict[str, object]] = []
+    scope_order = {"map": 0, "start": 1, "goal": 2}
+    for (series_id, scope), rows in sorted(
+        grouped.items(),
+        key=lambda item: (item[0][0], scope_order.get(item[0][1], 99)),
+    ):
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                int(row["series_index"]),
+                str(row["recorded_at"]),
+            ),
+        )
+        timestamped = [
+            (
+                dt.datetime.fromisoformat(
+                    str(row["recorded_at"]).replace("Z", "+00:00")
+                ),
+                str(row["recorded_at"]),
+            )
+            for row in ordered
+        ]
+        first_time, first_text = min(timestamped)
+        last_time, last_text = max(timestamped)
+        summary: dict[str, object] = {
+            field: "" for field in PLANNER_SERIES_CSV_FIELDS
+        }
+        summary.update(
+            {
+                "series_id": series_id,
+                "scope": scope,
+                "captured": len(ordered),
+                "expected": max(int(row["series_count"]) for row in ordered),
+                "interval_sec": ordered[0]["series_interval_sec"],
+                "first_recorded_at": first_text,
+                "last_recorded_at": last_text,
+                "duration_sec": (last_time - first_time).total_seconds(),
+            }
+        )
+        for metric in PLANNER_SERIES_METRICS:
+            values = [
+                row[metric]
+                for row in ordered
+                if _is_finite_number(row.get(metric))
+            ]
+            if values:
+                summary[f"{metric}_min"] = min(values)
+                summary[f"{metric}_max"] = max(values)
+                summary[f"{metric}_mean"] = statistics.fmean(
+                    float(value) for value in values
+                )
+
+        connectivity = [row.get("goal_in_start_component") for row in ordered]
+        summary["goal_connectivity_true"] = sum(value is True for value in connectivity)
+        summary["goal_connectivity_false"] = sum(
+            value is False for value in connectivity
+        )
+        summary["goal_connectivity_unknown"] = sum(
+            type(value) is not bool for value in connectivity
+        )
+        summary["goal_connectivity_bool_flips"] = sum(
+            type(previous) is bool
+            and type(current) is bool
+            and previous != current
+            for previous, current in zip(connectivity, connectivity[1:])
+        )
+        summaries.append(summary)
+    return summaries
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -829,6 +1031,18 @@ def read_environment(path: Path) -> dict[str, str]:
         if separator and key:
             values[key.strip()] = value.strip()
     return values
+
+
+def load_dense_output_mode(session: Path) -> tuple[str, str]:
+    source = "ros_dds_environment.txt:GO2_LIO_DENSE_OUTPUT"
+    value = read_environment(
+        session / "ros_dds_environment.txt"
+    ).get("GO2_LIO_DENSE_OUTPUT")
+    if value in {"true", "false"}:
+        return value, source
+    if value is None:
+        return "not captured", "not captured"
+    return f"invalid ({value})", source
 
 
 def read_parameter_scalars(path: Path) -> dict[str, str]:
@@ -1345,9 +1559,10 @@ def planner_error_message(value: object, limit: int = 500) -> str:
 def generate_report(
     session: Path,
     output_dir: Path,
-) -> tuple[Path, Path, Path, Path, Path, Path]:
+) -> tuple[Path, Path, Path, Path, Path, Path, Path]:
     metadata = read_json(session / "metadata.json")
     runtime_settings = load_runtime_settings(session)
+    dense_output_mode, dense_output_source = load_dense_output_mode(session)
     rate_rows = read_csv(session / "topic_rates.csv")
     process_rows = read_csv(session / "process_health.csv")
     sdk2_rows = read_csv(session / "sdk2_commands.csv")
@@ -1386,6 +1601,7 @@ def generate_report(
     sdk2_csv = output_dir / "sdk2_command_summary.csv"
     odometry_csv = output_dir / "body_odometry_audit.csv"
     planner_csv = output_dir / "planner_input_summary.csv"
+    planner_series_csv = output_dir / "planner_input_series_summary.csv"
     report_path = output_dir / "report.md"
 
     write_csv_atomic(
@@ -1469,6 +1685,11 @@ def generate_report(
         PLANNER_CSV_FIELDS,
         planner_summary["rows"],
     )
+    write_csv_atomic(
+        planner_series_csv,
+        PLANNER_SERIES_CSV_FIELDS,
+        planner_summary["series_rows"],
+    )
 
     event_levels = Counter(str(event.get("level", "unknown")) for event in events)
     event_categories = Counter(str(event.get("category", "unknown")) for event in events)
@@ -1547,6 +1768,10 @@ def generate_report(
         lines.append(
             f"| {label} | {setting.display_value} | {markdown_cell(setting.source)} |"
         )
+    lines.append(
+        f"| LIO dense cloud output | {markdown_cell(dense_output_mode)} | "
+        f"{markdown_cell(dense_output_source)} |"
+    )
 
     lines.extend(
         [
@@ -1592,6 +1817,34 @@ def generate_report(
             lines.append(f"| {markdown_cell(diagnosis)} | {count} |")
     else:
         lines.append("| - | 0 |")
+
+    lines.extend(
+        [
+            "",
+            "### Planner Input Series",
+            "",
+            "| Series | Scope | Captured / expected | Duration (s) | Planner valid mean | Slope over mean | Slope p50 mean (rad) | Slope p95 mean (rad) | Start component mean | Goal T/F/? | Bool flips |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    if planner_summary["series_rows"]:
+        for row in planner_summary["series_rows"]:
+            lines.append(
+                f"| {markdown_cell(row['series_id'])} | {row['scope']} | "
+                f"{row['captured']} / {row['expected']} | "
+                f"{planner_markdown_value(row['duration_sec'])} | "
+                f"{planner_markdown_value(row['planner_valid_mean'])} | "
+                f"{planner_markdown_value(row['slope_over_limit_mean'])} | "
+                f"{planner_markdown_value(row['slope_p50_rad_mean'])} | "
+                f"{planner_markdown_value(row['slope_p95_rad_mean'])} | "
+                f"{planner_markdown_value(row['start_component_cells_mean'])} | "
+                f"{row['goal_connectivity_true']}/"
+                f"{row['goal_connectivity_false']}/"
+                f"{row['goal_connectivity_unknown']} | "
+                f"{row['goal_connectivity_bool_flips']} |"
+            )
+    else:
+        lines.append("| - | - | 0 / 0 | - | - | - | - | - | - | 0/0/0 | 0 |")
 
     latest_attempt = planner_summary["latest_attempt"]
     if latest_attempt is not None:
@@ -1682,8 +1935,8 @@ def generate_report(
                 "Layer counts overlap. Hole-filled cells can have known elevation "
                 "below the observation threshold.",
                 "",
-                "| Endpoint | Inside | Exact valid | Valid in snap square | Snapped | Grid | World position |",
-                "| --- | --- | --- | ---: | --- | --- | --- |",
+                "| Endpoint | Inside | Exact valid | Valid in snap square | Valid in snap radius | Snapped | Grid | World position |",
+                "| --- | --- | --- | ---: | ---: | --- | --- | --- |",
             ]
         )
         endpoint_rows = [
@@ -1696,6 +1949,7 @@ def generate_report(
                 f"| {row['scope']} | {row['inside_map']} | "
                 f"{row['exact_cell_valid']} | "
                 f"{planner_markdown_value(row['valid_cells_in_snap_square'])} | "
+                f"{planner_markdown_value(row['valid_cells_in_snap_radius'])} | "
                 f"{row['snapped']} | ({row['grid_x']}, {row['grid_y']}) | "
                 f"({row['world_x']}, {row['world_y']}) |"
             )
@@ -1810,7 +2064,15 @@ def generate_report(
         ]
     )
     write_text_atomic(report_path, "\n".join(lines))
-    return report_path, rate_csv, process_csv, sdk2_csv, odometry_csv, planner_csv
+    return (
+        report_path,
+        rate_csv,
+        process_csv,
+        sdk2_csv,
+        odometry_csv,
+        planner_csv,
+        planner_series_csv,
+    )
 
 
 def main() -> int:
@@ -1821,15 +2083,22 @@ def main() -> int:
     if not (session / "metadata.json").is_file():
         raise SystemExit(f"not a go2-log session (metadata.json is missing): {session}")
     output_dir = (args.output_dir or (session / "analysis")).expanduser().resolve()
-    report, rate_csv, process_csv, sdk2_csv, odometry_csv, planner_csv = (
-        generate_report(session, output_dir)
-    )
+    (
+        report,
+        rate_csv,
+        process_csv,
+        sdk2_csv,
+        odometry_csv,
+        planner_csv,
+        planner_series_csv,
+    ) = generate_report(session, output_dir)
     print(f"Report: {report}")
     print(f"Topic summary: {rate_csv}")
     print(f"Process summary: {process_csv}")
     print(f"SDK2 summary: {sdk2_csv}")
     print(f"Body odometry audit: {odometry_csv}")
     print(f"Planner input summary: {planner_csv}")
+    print(f"Planner input series summary: {planner_series_csv}")
     return 0
 
 

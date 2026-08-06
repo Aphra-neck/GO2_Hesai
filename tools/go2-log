@@ -44,6 +44,10 @@ readonly MAX_LOCAL_SESSIONS=20
 
 PLANNER_RESULT_FILE=''
 PLANNER_ERROR_FILE=''
+PLANNER_SERIES_ID=''
+PLANNER_SERIES_INDEX=''
+PLANNER_SERIES_COUNT=''
+PLANNER_SERIES_INTERVAL_SEC=''
 
 readonly ROBOT_PROCESS_PATTERN='hesai_ros_driver_node|go2_imu_bridge_node|super_lio_node|body_odom_adapter_node|terrain_mapper_node|body_lattice_planner_node|go2_sdk2_bridge_node|rl_controller_node|utree_go2_rl_controller'
 
@@ -560,18 +564,6 @@ validate_planner_session() {
     die "active diagnostic session already has an end marker"
 }
 
-read_ros_parameter_value() {
-  local node="$1"
-  local parameter="$2"
-  local output value
-  output="$(timeout 5 ros2 param get "${node}" "${parameter}" 2>/dev/null)" ||
-    return 1
-  value="${output##*: }"
-  [[ "${value}" =~ ^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$ ]] ||
-    return 1
-  printf '%s\n' "${value}"
-}
-
 assert_planner_check_motion_idle() {
   local processes topic_list lowcmd_info publisher_count pgrep_status
   set +e
@@ -637,14 +629,27 @@ record_planner_inspection() {
     "${LOG_ROOT}" \
     "${exit_code}" \
     "${result_file}" \
-    "${error_file}" <<'PY'
+    "${error_file}" \
+    "${PLANNER_SERIES_ID}" \
+    "${PLANNER_SERIES_INDEX}" \
+    "${PLANNER_SERIES_COUNT}" \
+    "${PLANNER_SERIES_INTERVAL_SEC}" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-tools_dir, log_name, temporary_directory, raw_exit, result_name, error_name = (
-    sys.argv[1:]
-)
+(
+    tools_dir,
+    log_name,
+    temporary_directory,
+    raw_exit,
+    result_name,
+    error_name,
+    series_id,
+    raw_series_index,
+    raw_series_count,
+    raw_series_interval,
+) = sys.argv[1:]
 sys.path.insert(0, tools_dir)
 from inspect_planner_inputs import _write_session_record_atomic  # noqa: E402
 
@@ -667,6 +672,13 @@ except (json.JSONDecodeError, ValueError):
     pass
 
 if exit_code in {0, 2} and inspection is not None:
+    if series_id:
+        inspection["series"] = {
+            "id": series_id,
+            "index": int(raw_series_index),
+            "count": int(raw_series_count),
+            "interval_sec": float(raw_series_interval),
+        }
     _write_session_record_atomic(
         Path(log_name),
         Path(temporary_directory),
@@ -695,8 +707,8 @@ PY
 
 planner_check() {
   local session_dir collector_pid current
-  local inspector_status tee_status value parameter_error='' postflight_error=''
-  local -a runtime_arguments=() pipeline_status=()
+  local inspector_status tee_status postflight_error=''
+  local -a pipeline_status=()
 
   session_dir="$(active_session_dir 2>/dev/null)" ||
     die "no active diagnostic session; run ./tools/go2-log start first"
@@ -721,75 +733,29 @@ planner_check() {
   PLANNER_RESULT_FILE="$(mktemp --tmpdir go2-planner-result.XXXXXX)"
   PLANNER_ERROR_FILE="$(mktemp --tmpdir go2-planner-error.XXXXXX)"
 
-  if value="$(read_ros_parameter_value /terrain_mapper min_observed_frames)"; then
-    runtime_arguments+=(--min-observed-frames "${value}")
-  else
-    parameter_error='could not read /terrain_mapper min_observed_frames'
-  fi
-  if [[ -z "${parameter_error}" ]] &&
-    value="$(read_ros_parameter_value /terrain_mapper max_slope)"; then
-    runtime_arguments+=(--mapper-max-slope "${value}")
-  elif [[ -z "${parameter_error}" ]]; then
-    parameter_error='could not read /terrain_mapper max_slope'
-  fi
-  if [[ -z "${parameter_error}" ]] &&
-    value="$(read_ros_parameter_value /terrain_mapper max_roughness)"; then
-    runtime_arguments+=(--max-roughness "${value}")
-  elif [[ -z "${parameter_error}" ]]; then
-    parameter_error='could not read /terrain_mapper max_roughness'
-  fi
-  if [[ -z "${parameter_error}" ]] &&
-    value="$(read_ros_parameter_value /body_lattice_planner min_traversability)"; then
-    runtime_arguments+=(--min-traversability "${value}")
-  elif [[ -z "${parameter_error}" ]]; then
-    parameter_error='could not read /body_lattice_planner min_traversability'
-  fi
-  if [[ -z "${parameter_error}" ]] &&
-    value="$(read_ros_parameter_value /body_lattice_planner max_slope)"; then
-    runtime_arguments+=(--max-slope "${value}")
-  elif [[ -z "${parameter_error}" ]]; then
-    parameter_error='could not read /body_lattice_planner max_slope'
-  fi
-  if [[ -z "${parameter_error}" ]] &&
-    value="$(read_ros_parameter_value /body_lattice_planner max_step_height)"; then
-    runtime_arguments+=(--max-step-height "${value}")
-  elif [[ -z "${parameter_error}" ]]; then
-    parameter_error='could not read /body_lattice_planner max_step_height'
-  fi
-  if [[ -z "${parameter_error}" ]] &&
-    value="$(read_ros_parameter_value /body_lattice_planner snap_radius)"; then
-    runtime_arguments+=(--snap-radius "${value}")
-  elif [[ -z "${parameter_error}" ]]; then
-    parameter_error='could not read /body_lattice_planner snap_radius'
-  fi
-
-  if [[ -n "${parameter_error}" ]]; then
-    printf '%s\n' "${parameter_error}" | tee "${PLANNER_ERROR_FILE}" >&2
-    inspector_status=1
-  else
-    set +e
-    {
-      (
-        ulimit -f $((COMMAND_CAPTURE_BYTES / 1024))
-        exec python3 "${REPO_ROOT}/tools/inspect_planner_inputs.py" --json \
-          --record-start-on-goal-timeout \
-          "$@" "${runtime_arguments[@]}"
-      ) > "${PLANNER_RESULT_FILE}"
-    } 2>&1 | (
+  set +e
+  {
+    (
       ulimit -f $((COMMAND_CAPTURE_BYTES / 1024))
-      exec tee -- "${PLANNER_ERROR_FILE}" >&2
-    )
-    pipeline_status=("${PIPESTATUS[@]}")
-    set -e
-    inspector_status="${pipeline_status[0]:-1}"
-    tee_status="${pipeline_status[1]:-1}"
-    if (( ${#pipeline_status[@]} != 2 || tee_status != 0 )); then
-      printf '%s\n' 'planner-check stderr streaming failed' >&2
-      printf '%s\n' 'planner-check stderr streaming failed' \
-        > "${PLANNER_ERROR_FILE}"
-      : > "${PLANNER_RESULT_FILE}"
-      inspector_status=1
-    fi
+      exec python3 "${REPO_ROOT}/tools/inspect_planner_inputs.py" --json \
+        --record-start-on-goal-timeout \
+        --read-live-parameters \
+        "$@"
+    ) > "${PLANNER_RESULT_FILE}"
+  } 2>&1 | (
+    ulimit -f $((COMMAND_CAPTURE_BYTES / 1024))
+    exec tee -- "${PLANNER_ERROR_FILE}" >&2
+  )
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -e
+  inspector_status="${pipeline_status[0]:-1}"
+  tee_status="${pipeline_status[1]:-1}"
+  if (( ${#pipeline_status[@]} != 2 || tee_status != 0 )); then
+    printf '%s\n' 'planner-check stderr streaming failed' >&2
+    printf '%s\n' 'planner-check stderr streaming failed' \
+      > "${PLANNER_ERROR_FILE}"
+    : > "${PLANNER_RESULT_FILE}"
+    inspector_status=1
   fi
 
   if ! postflight_error="$(assert_planner_check_motion_idle 2>&1)"; then
@@ -817,17 +783,181 @@ planner_check() {
   return "${inspector_status}"
 }
 
+validate_planner_series_schedule() {
+  python3 - "$1" "$2" <<'PY'
+import math
+import re
+import sys
+
+raw_samples, raw_interval = sys.argv[1:]
+if re.fullmatch(r"[0-9]+", raw_samples) is None:
+    raise SystemExit("samples must be an integer from 2 through 30")
+samples = int(raw_samples)
+if not 2 <= samples <= 30:
+    raise SystemExit("samples must be an integer from 2 through 30")
+
+if re.fullmatch(
+    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
+    raw_interval,
+) is None:
+    raise SystemExit("interval must be a finite number from 0.5 through 5 seconds")
+interval = float(raw_interval)
+if not math.isfinite(interval) or not 0.5 <= interval <= 5.0:
+    raise SystemExit("interval must be a finite number from 0.5 through 5 seconds")
+if (samples - 1) * interval > 30.0:
+    raise SystemExit("planned series span must not exceed 30 seconds")
+
+print(f"{samples}\t{interval!r}")
+PY
+}
+
+planner_series() {
+  local samples=10 interval_sec=1.0 index inspector_status aggregate_status=0
+  local no_goal=false has_goal_x=false has_goal_y=false argument
+  local schedule_values
+  local -a inspector_arguments=()
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --samples)
+        (( $# >= 2 )) || die "planner-series --samples requires a value"
+        samples="$2"
+        shift 2
+        ;;
+      --samples=*)
+        samples="${1#*=}"
+        shift
+        ;;
+      --interval)
+        (( $# >= 2 )) || die "planner-series --interval requires a value"
+        interval_sec="$2"
+        shift 2
+        ;;
+      --interval=*)
+        interval_sec="${1#*=}"
+        shift
+        ;;
+      *)
+        inspector_arguments+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+  if ! schedule_values="$(
+    validate_planner_series_schedule "${samples}" "${interval_sec}"
+  )"; then
+    die "invalid planner-series schedule"
+  fi
+  IFS=$'\t' read -r samples interval_sec <<< "${schedule_values}"
+
+  for argument in "${inspector_arguments[@]}"; do
+    case "${argument}" in
+      --no-goal)
+        no_goal=true
+        ;;
+      --goal-x|--goal-x=*)
+        has_goal_x=true
+        ;;
+      --goal-y|--goal-y=*)
+        has_goal_y=true
+        ;;
+    esac
+  done
+  if [[ "${no_goal}" == true ]]; then
+    [[ "${has_goal_x}" == false && "${has_goal_y}" == false ]] ||
+      die "planner-series --no-goal cannot be combined with manual goal coordinates"
+  elif [[ "${has_goal_x}" != true || "${has_goal_y}" != true ]]; then
+    die "planner-series requires --no-goal or both --goal-x and --goal-y"
+  fi
+
+  PLANNER_SERIES_ID="$(date -u +'%Y%m%dT%H%M%SZ')-$$"
+  PLANNER_SERIES_COUNT="${samples}"
+  PLANNER_SERIES_INTERVAL_SEC="${interval_sec}"
+
+  for (( index = 1; index <= samples; index++ )); do
+    PLANNER_SERIES_INDEX="${index}"
+    set +e
+    (set -e; planner_check "${inspector_arguments[@]}")
+    inspector_status=$?
+    set -e
+    case "${inspector_status}" in
+      0)
+        ;;
+      2)
+        aggregate_status=2
+        ;;
+      *)
+        return "${inspector_status}"
+        ;;
+    esac
+    if (( index < samples )); then
+      sleep "${interval_sec}"
+    fi
+  done
+
+  echo "Planner series complete: ${samples}/${samples} samples"
+  return "${aggregate_status}"
+}
+
+read_recorded_environment_value() {
+  local session_dir="$1"
+  local key="$2"
+  local line value=''
+  [[ -r "${session_dir}/ros_dds_environment.txt" ]] || return 1
+  while IFS= read -r line; do
+    if [[ "${line}" == "${key}="* ]]; then
+      value="${line#*=}"
+    fi
+  done < "${session_dir}/ros_dds_environment.txt"
+  [[ -n "${value}" ]] || return 1
+  printf '%s\n' "${value}"
+}
+
 record_active_runtime_overrides() {
   local session_dir="$1"
   local body_yaw_offset="${GO2_BODY_YAW_OFFSET_RAD:-}"
-  [[ -n "${body_yaw_offset}" ]] || return 0
-  if [[ ! "${body_yaw_offset}" =~ ^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$ ]]; then
-    append_event "${session_dir}" warning configuration \
-      "ignored invalid GO2_BODY_YAW_OFFSET_RAD from a repeated start command"
-    return 0
+  local lio_dense_output="${GO2_LIO_DENSE_OUTPUT:-}"
+  local recorded_dense_output=''
+
+  if [[ -n "${body_yaw_offset}" ]]; then
+    if [[ "${body_yaw_offset}" =~ ^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$ ]]; then
+      printf 'GO2_BODY_YAW_OFFSET_RAD=%s\n' "${body_yaw_offset}" \
+        >> "${session_dir}/ros_dds_environment.txt"
+    else
+      append_event "${session_dir}" warning configuration \
+        "ignored invalid GO2_BODY_YAW_OFFSET_RAD from a repeated start command"
+    fi
   fi
-  printf 'GO2_BODY_YAW_OFFSET_RAD=%s\n' "${body_yaw_offset}" \
-    >> "${session_dir}/ros_dds_environment.txt"
+
+  if [[ -n "${lio_dense_output}" ]]; then
+    case "${lio_dense_output}" in
+      true|false)
+        if recorded_dense_output="$(
+          read_recorded_environment_value \
+            "${session_dir}" GO2_LIO_DENSE_OUTPUT
+        )"; then
+          case "${recorded_dense_output}" in
+            true|false) ;;
+            *)
+              die "active diagnostic session has an invalid recorded GO2_LIO_DENSE_OUTPUT"
+              ;;
+          esac
+          if [[ "${recorded_dense_output}" != "${lio_dense_output}" ]]; then
+            die "active diagnostic session uses GO2_LIO_DENSE_OUTPUT=${recorded_dense_output}; stop it before changing to ${lio_dense_output}"
+          fi
+        else
+          printf 'GO2_LIO_DENSE_OUTPUT=%s\n' "${lio_dense_output}" \
+            >> "${session_dir}/ros_dds_environment.txt"
+        fi
+        ;;
+      *)
+        append_event "${session_dir}" warning configuration \
+          "ignored invalid GO2_LIO_DENSE_OUTPUT from a repeated start command"
+        ;;
+    esac
+  fi
 }
 
 capture_static_context() {
@@ -866,7 +996,7 @@ PY
   } > "${session_dir}/git.txt"
 
   env | LC_ALL=C sort | grep -E \
-    '^(ROS_|RMW_|CYCLONEDDS_URI=|FASTRTPS_DEFAULT_PROFILES_FILE=|FASTDDS_DEFAULT_PROFILES_FILE=|LD_LIBRARY_PATH=|GO2_NETWORK_INTERFACE=|GO2_IMU_RATE=|GO2_BODY_YAW_OFFSET_RAD=)' \
+    '^(ROS_|RMW_|CYCLONEDDS_URI=|FASTRTPS_DEFAULT_PROFILES_FILE=|FASTDDS_DEFAULT_PROFILES_FILE=|LD_LIBRARY_PATH=|GO2_NETWORK_INTERFACE=|GO2_IMU_RATE=|GO2_BODY_YAW_OFFSET_RAD=|GO2_LIO_DENSE_OUTPUT=)' \
     > "${session_dir}/ros_dds_environment.txt" || true
 
   {
@@ -2745,6 +2875,9 @@ Commands:
   start                 Start a bounded diagnostic session.
   status                Show collector state and session size.
   planner-check [ARGS]  Inspect planner inputs and record them in the session.
+  planner-series [--samples N] [--interval SEC] [INSPECTOR ARGS]
+                        Repeat planner checks (defaults: N=10, SEC=1.0).
+                        Pass --no-goal (recommended) or --goal-x/--goal-y.
   stop                  Stop the active diagnostic session cleanly.
   repair [SESSION_ID]   Quarantine and trim a verified trailing-NUL text suffix.
   upload [SESSION_ID]   Push a stopped session to Aphra-neck/G02_log.
@@ -2773,6 +2906,10 @@ main() {
     planner-check)
       shift
       planner_check "$@"
+      ;;
+    planner-series)
+      shift
+      planner_series "$@"
       ;;
     stop)
       [[ $# -eq 1 ]] || die "stop takes no arguments"

@@ -6,9 +6,18 @@ WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 LOG_DIR="${SLAM_LOG_DIR:-${HOME}/slam_logs}"
 NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 IMU_RATE="${GO2_IMU_RATE:-200.0}"
+LIO_DENSE_OUTPUT="${GO2_LIO_DENSE_OUTPUT:-false}"
 UNITREE_SDK_LIBRARY_DIR="${UNITREE_SDK_LIBRARY_DIR:-/usr/local/lib}"
 source "${SCRIPT_DIR}/ros2_environment.sh"
 
+case "${LIO_DENSE_OUTPUT}" in
+  true|false) ;;
+  *)
+    echo "GO2_LIO_DENSE_OUTPUT must be true or false: ${LIO_DENSE_OUTPUT}" >&2
+    exit 1
+    ;;
+esac
+export GO2_LIO_DENSE_OUTPUT="${LIO_DENSE_OUTPUT}"
 if ! command -v setsid >/dev/null 2>&1; then
   echo "The setsid command is required to manage ROS 2 child processes." >&2
   exit 1
@@ -176,6 +185,7 @@ echo " ROS RMW: ${RMW_IMPLEMENTATION}"
 echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Unitree DDS libraries: ${UNITREE_SDK_LIBRARY_DIR}"
+echo " LIO dense cloud output: ${LIO_DENSE_OUTPUT}"
 echo "======================================"
 
 echo "[1/3] Starting Hesai LiDAR driver..."
@@ -199,4 +209,6 @@ echo "Logs: ${LOG_DIR}"
 echo "Diagnostics: ${HOME}/go2_logs/sessions"
 echo "Check pose: ros2 topic echo /lio/odom"
 
-ros2 launch super_lio hesai.py rviz:=false
+ros2 launch super_lio hesai.py \
+  rviz:=false \
+  dense_output:="${LIO_DENSE_OUTPUT}"

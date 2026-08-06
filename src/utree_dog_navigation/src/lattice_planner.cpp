@@ -14,6 +14,7 @@ namespace utree_dog_navigation
 namespace
 {
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kDistanceTolerance = 1.0e-6;
 
 double normalizeAngle(double angle)
 {
@@ -209,6 +210,10 @@ bool LatticePlanner::nearestValid(int & x, int & y) const
   int best_distance = std::numeric_limits<int>::max();
   for (int dy = -radius; dy <= radius; ++dy) {
     for (int dx = -radius; dx <= radius; ++dx) {
+      const double distance_m = std::hypot(
+        static_cast<double>(dx) * map_->resolution,
+        static_cast<double>(dy) * map_->resolution);
+      if (distance_m > config_.snap_radius + kDistanceTolerance) {continue;}
       const int distance = dx * dx + dy * dy;
       if (distance < best_distance && validCell(x + dx, y + dy)) {
         best_x = x + dx;
