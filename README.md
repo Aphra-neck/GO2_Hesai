@@ -534,8 +534,52 @@ timeout 15 ros2 topic echo --no-daemon --once \
 
 ### 5. 只验证规划，不执行运动
 
-在 WSL2 RViz 中使用 Set Goal 设置近距离、平地、完全可见的目标。此操作只应生成
-`/body_path`，不会自动控制机器人，因为 SDK2 bridge 尚未启动。
+设置目标前，确保机器人静止并准备好遥控器急停。以下命令必须没有任何输出；如果发现
+SDK2 bridge 或 RL controller 进程，先停止它，不能继续设置目标：
+
+```bash
+pgrep -af '[g]o2_sdk2_bridge|[r]l_controller' || true
+```
+
+加载 ROS 环境后还应执行 `ros2 topic info -v /lowcmd || true`；话题不存在或
+`Publisher count` 为 `0` 才能继续。
+
+Jetson 和 WSL2 必须使用同步的系统时钟且 `use_sim_time` 设置一致，否则跨主机发布的
+目标可能被判为 `goal_stale` 或 `goal_stamp_from_future`。当前检查器默认值与
+`terrain_navigation.yaml` 一致；如果实机参数被覆盖，先用 `ros2 param get` 核对
+`/body_lattice_planner` 的 `min_traversability`、`max_slope`、`max_step_height` 和
+`snap_radius`，再把相同值作为检查器参数传入。
+
+然后在第三个 Jetson 终端启动只读规划输入检查器：
+
+```bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+ros2 topic info -v /lowcmd || true
+ros2 param get /terrain_mapper map_frame
+ros2 param get /body_lattice_planner min_traversability
+ros2 param get /body_lattice_planner max_slope
+ros2 param get /body_lattice_planner max_step_height
+ros2 param get /body_lattice_planner snap_radius
+python3 ./tools/inspect_planner_inputs.py --goal-timeout 60
+```
+
+等待出现 `Initial samples captured but not yet validated` 后，在 WSL2 RViz 中使用
+Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。该提示只表示发现了初始消息，
+不是输入有效性结论。检查器先释放大地图和里程计订阅；等待目标期间只订阅
+`/goal_pose`，收到目标后再分别抓取一条比各自初始样本更新的 `/terrain_map` 和
+`/lio/body_odom`。两条消息并非时间同步的数据对。检查器不会发布目标、路径或运动命令。
+
+`start_has_no_valid_cell_in_snap_square`、
+`goal_has_no_valid_cell_in_snap_square` 和
+`start_and_goal_continuous_ground_disconnected` 分别用于区分起点无有效格、目标无有效格和
+连续地面不连通；`*_frame_mismatch`、`*_stale` 或 `*_stamp_from_future` 表示坐标契约或
+时间新鲜度不满足，`*_elevation_invalid_for_ground_topology` 表示吸附格缺少有效高程。
+此操作只应让规划节点生成 `/body_path`，不会自动控制机器人，因为 SDK2 bridge 尚未启动。
+
+退出码 `0` 只表示起点检查通过，或起终点属于同一连续地面区域；其他诊断结论返回 `2`，
+采集/消息错误返回 `1`。使用 `--json` 时仍应读取 `diagnosis`；即使退出码为 `0`，也不代表
+可以执行运动。
 
 检查路径：
 
@@ -546,8 +590,12 @@ timeout 10 ros2 topic echo --no-daemon --once \
   /body_path nav_msgs/msg/Path --field header
 ```
 
-路径必须使用 `world`。在完成障碍穿越、footprint、地图边界和 stale path 验收前，
-不要进入自动运动。
+路径必须使用 `world`。检查器报告
+`same_continuous_ground_component_not_planner_approval` 只说明起点和目标位于同一个
+四邻域有效地形区域，且相邻格高程有限、台阶高度未超限。这个拓扑结果不复现
+规划器的航向格和 `0.20 m` motion primitive，也不检查 footprint 或整段碰撞，因此既不
+保证规划成功，也不是运动安全批准。在完成障碍穿越、footprint、地图边界和 stale path
+验收前，不要进入自动运动。
 
 ### 6. 停止顺序
 

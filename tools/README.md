@@ -162,6 +162,80 @@ upload. Each `topic_rates.csv` row is also followed by a low-frequency
 `fdatasync`; this reduces the delayed-write window after an unexpected reboot
 without adding synchronous disk I/O to high-rate sensor topics.
 
+## Inspect planner inputs on the Jetson
+
+Before changing terrain thresholds in response to `Planning failed`, run the
+read-only inspector while SLAM and navigation are active and the robot is
+stationary. Keep the remote-control emergency stop ready. The following
+preflight must print no processes; stop before setting a goal if it prints an
+SDK2 bridge or RL controller:
+
+```bash
+pgrep -af '[g]o2_sdk2_bridge|[r]l_controller' || true
+```
+
+After sourcing ROS, `/lowcmd` must either be absent or report zero publishers.
+
+The Jetson and WSL2 clocks must be synchronized and both hosts must use the same
+`use_sim_time` setting. Otherwise a valid cross-host RViz goal can be reported
+as stale or from the future. Then run:
+
+```bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+ros2 topic info -v /lowcmd || true
+ros2 param get /terrain_mapper map_frame
+ros2 param get /body_lattice_planner min_traversability
+ros2 param get /body_lattice_planner max_slope
+ros2 param get /body_lattice_planner max_step_height
+ros2 param get /body_lattice_planner snap_radius
+python3 ./tools/inspect_planner_inputs.py --goal-timeout 60
+```
+
+Start this command before clicking Set Goal in the WSL2 planning RViz. The
+`Initial samples captured but not yet validated` prompt means only that initial
+messages were found; it is not a validity result. The inspector releases both
+subscriptions before waiting with only `/goal_pose` subscribed. After the goal
+arrives, it independently captures a `/terrain_map` and `/lio/body_odom` message
+newer than each topic's initial sample, releases all subscriptions, and then
+reports. These messages are not a synchronized pair.
+
+- known and planner-valid terrain cell counts;
+- whether start and goal are inside the map;
+- the exact cell and the nearest cell selected by the planner's square snap
+  search;
+- the number of valid cells in each endpoint's snap area; and
+- whether map, odometry, and goal frames and timestamps satisfy the configured
+  input contract; and
+- whether the snapped endpoints share one edge-adjacent, finite-elevation,
+  step-height-limited continuous-ground component.
+
+The command never publishes a goal, path, SDK2 command, or motion request. The
+diagnoses `start_has_no_valid_cell_in_snap_square`,
+`goal_has_no_valid_cell_in_snap_square`, and
+`start_and_goal_continuous_ground_disconnected` distinguish the main causes of
+a zero-expansion or exhausted-search failure. Frame mismatches and stale,
+missing, or future timestamps are reported before a topology claim. An
+`*_elevation_invalid_for_ground_topology` result means the planner-valid snapped
+cell has no finite elevation for this topology check. Use `--no-goal` to inspect
+only the current map and robot start, or `--json` for machine-readable output.
+The defaults match `terrain_navigation.yaml`; pass
+the corresponding CLI overrides if the live planner parameters were changed.
+Before relying on a comparison, query `/body_lattice_planner` with
+`ros2 param get` for `min_traversability`, `max_slope`, `max_step_height`, and
+`snap_radius`.
+
+Exit `0` means the start check passed or both endpoints are in the same
+continuous-ground component. Other diagnostic outcomes exit `2`; collection or
+message errors exit `1`. With `--json`, always inspect `diagnosis`. Exit `0` is
+not permission to move the robot.
+
+`same_continuous_ground_component_not_planner_approval` is deliberately named
+to prevent treating this result as a motion-safety approval. The topology check
+does not reproduce the planner's yaw states or 0.20 m motion primitives, so it
+can disagree with planner reachability in either direction. It also does not
+validate footprint or swept collision.
+
 ## Analyze after pulling on the local computer
 
 Pull `Aphra-neck/G02_log` into `D:\G02_log`, then run the analyzer from a local
