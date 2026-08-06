@@ -534,34 +534,34 @@ timeout 15 ros2 topic echo --no-daemon --once \
 
 ### 5. 只验证规划，不执行运动
 
-设置目标前，确保机器人静止并准备好遥控器急停。以下命令必须没有任何输出；如果发现
-SDK2 bridge 或 RL controller 进程，先停止它，不能继续设置目标：
-
-```bash
-pgrep -af '[g]o2_sdk2_bridge|[r]l_controller' || true
-```
-
-加载 ROS 环境后还应执行 `ros2 topic info -v /lowcmd || true`；话题不存在或
-`Publisher count` 为 `0` 才能继续。
+设置目标前，确保机器人静止并准备好遥控器急停。不要启动 SDK2 bridge 或 RL controller；
+下面的 `planner-check` 会自动检查相关进程、ROS 图和 `/lowcmd` 发布者，无法明确确认安全
+状态时直接拒绝采集。
 
 Jetson 和 WSL2 必须使用同步的系统时钟且 `use_sim_time` 设置一致，否则跨主机发布的
-目标可能被判为 `goal_stale` 或 `goal_stamp_from_future`。当前检查器默认值与
-`terrain_navigation.yaml` 一致；如果实机参数被覆盖，先用 `ros2 param get` 核对
-`/body_lattice_planner` 的 `min_traversability`、`max_slope`、`max_step_height` 和
-`snap_radius`，再把相同值作为检查器参数传入。
+目标可能被检查器标记为 `goal_stale` 或 `goal_stamp_from_future`。这些新鲜度、odom frame
+和 child frame 判定属于项目检查契约；当前 `body_lattice_planner` 运行节点自身只检查输入
+是否存在以及 goal frame 是否与 map frame 一致。
 
-然后在第三个 Jetson 终端启动只读规划输入检查器：
+`start_slam.sh` 已启动诊断会话。在第三个 Jetson 终端使用统一日志入口，不要直接运行
+底层 Python 检查器：
 
 ```bash
 cd ~/catkin_ws
-source ./shell/ros2_environment.sh
-ros2 topic info -v /lowcmd || true
-ros2 param get /terrain_mapper map_frame
-ros2 param get /body_lattice_planner min_traversability
-ros2 param get /body_lattice_planner max_slope
-ros2 param get /body_lattice_planner max_step_height
-ros2 param get /body_lattice_planner snap_radius
-python3 ./tools/inspect_planner_inputs.py --goal-timeout 60
+./tools/go2-log status
+./tools/go2-log planner-check --goal-timeout 60
+```
+
+`planner-check` 自动加载项目 ROS/Fast DDS 环境，确认 SDK2/RL 控制进程未运行且
+`/lowcmd` 无发布者，并从运行中的 mapper/planner 读取 mapper 与 planner 各自的坡度阈值、
+观测帧数、粗糙度、通行度、台阶高度和吸附半径。任一安全检查、ROS 图查询或参数读取失败
+都会 fail closed，不会用默认值伪造结果。检查结果原子追加到当前会话的
+`planner_input_inspections.jsonl`；诊断结论返回 `2` 也会正常写入，不代表程序崩溃。
+
+只检查当前起点、不等待 RViz 目标时运行：
+
+```bash
+./tools/go2-log planner-check --no-goal
 ```
 
 等待出现 `Initial samples captured but not yet validated` 后，在 WSL2 RViz 中使用
@@ -569,6 +569,16 @@ Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。该提示只�
 不是输入有效性结论。检查器先释放大地图和里程计订阅；等待目标期间只订阅
 `/goal_pose`，收到目标后再分别抓取一条比各自初始样本更新的 `/terrain_map` 和
 `/lio/body_odom`。两条消息并非时间同步的数据对。检查器不会发布目标、路径或运动命令。
+
+检查器会分别统计整张地图、起点吸附方框和目标吸附方框。`observation_below_min`
+较多表示单元格在积分窗口内被观测的帧数不足；`elevation_known` 明显多于
+`features_known` 表示已有高程，但 5 cm 网格在 X 或 Y 方向缺少可计算坡度的邻格；
+`slope_over` 是 planner 坡度门槛，`mapper_slope_at_or_above` 和 `roughness_over`
+是 mapper 生成通行度时的门槛，`traversability_low` 是 planner 通行度门槛。
+`hard_reject_candidate` 只表示坡度和粗糙度均严格低于 mapper 阈值、但通行度仍为零，通常指向
+高度差或单格垂直跨度硬拒绝；现有 `TerrainGrid` 无法继续区分这两种原因。
+这些计数是可重叠的层统计，不是互斥分类。补洞逻辑也可能让观测帧数不足的格子拥有高程，
+因此不要把观测、高程和地形特征计数当成严格单调漏斗，更不要仅凭一个计数修改安全阈值。
 
 `start_has_no_valid_cell_in_snap_square`、
 `goal_has_no_valid_cell_in_snap_square` 和
@@ -781,9 +791,10 @@ python .\tools\analyze_diagnostics.py `
   D:\G02_log\sessions\<session-id>
 ```
 
-分析器生成 Markdown 报告、话题/进程/SDK2 汇总和
-`body_odometry_audit.csv`，自动核对实机原始与校正里程计的时间戳、frame、四元数及
-yaw 偏置，并保留原始 JSONL。PCD、rosbag 和 core dump
+分析器生成 Markdown 报告、话题/进程/SDK2 汇总、`body_odometry_audit.csv` 和
+`planner_input_summary.csv`。后者展开每次实机规划检查的全图、起点与目标局部层统计；
+原始 `planner_input_inspections.jsonl` 保持不变。分析器同时核对实机原始与校正里程计的
+时间戳、frame、四元数及 yaw 偏置。PCD、rosbag 和 core dump
 不得进入 Git；用 SCP 分别传到 `D:\GO2_Data\maps`、`D:\GO2_Data\bags` 和
 `D:\GO2_Data\cores`。详细约束见 `tools/README.md`。
 

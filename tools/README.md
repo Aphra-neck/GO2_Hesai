@@ -166,31 +166,31 @@ without adding synchronous disk I/O to high-rate sensor topics.
 
 Before changing terrain thresholds in response to `Planning failed`, run the
 read-only inspector while SLAM and navigation are active and the robot is
-stationary. Keep the remote-control emergency stop ready. The following
-preflight must print no processes; stop before setting a goal if it prints an
-SDK2 bridge or RL controller:
-
-```bash
-pgrep -af '[g]o2_sdk2_bridge|[r]l_controller' || true
-```
-
-After sourcing ROS, `/lowcmd` must either be absent or report zero publishers.
+stationary. Keep the remote-control emergency stop ready and do not start an
+SDK2 bridge or RL controller. `planner-check` verifies those processes, the ROS
+graph, and `/lowcmd`; it fails closed when the safe state cannot be confirmed.
 
 The Jetson and WSL2 clocks must be synchronized and both hosts must use the same
-`use_sim_time` setting. Otherwise a valid cross-host RViz goal can be reported
-as stale or from the future. Then run:
+`use_sim_time` setting. Otherwise the inspector can report a valid cross-host
+RViz goal as stale or from the future. Freshness, odometry frame, and child
+frame checks are project inspector-contract gates; the current planner node
+itself checks input presence and goal/map frame equality only.
+
+`start_slam.sh` starts the bounded diagnostic session. Use its logging wrapper
+instead of invoking the Python inspector directly:
 
 ```bash
 cd ~/catkin_ws
-source ./shell/ros2_environment.sh
-ros2 topic info -v /lowcmd || true
-ros2 param get /terrain_mapper map_frame
-ros2 param get /body_lattice_planner min_traversability
-ros2 param get /body_lattice_planner max_slope
-ros2 param get /body_lattice_planner max_step_height
-ros2 param get /body_lattice_planner snap_radius
-python3 ./tools/inspect_planner_inputs.py --goal-timeout 60
+./tools/go2-log status
+./tools/go2-log planner-check --goal-timeout 60
 ```
+
+The wrapper sources the project ROS/Fast DDS environment, fails closed if the
+ROS graph or motion-safety preflight cannot be verified, and reads the live
+mapper and planner thresholds. It records one bounded atomic JSONL entry in
+`planner_input_inspections.jsonl`. A diagnostic exit `2` is still recorded and
+does not mean the program crashed. Use `planner-check --no-goal` for a start-only
+sample.
 
 Start this command before clicking Set Goal in the WSL2 planning RViz. The
 `Initial samples captured but not yet validated` prompt means only that initial
@@ -200,7 +200,8 @@ arrives, it independently captures a `/terrain_map` and `/lio/body_odom` message
 newer than each topic's initial sample, releases all subscriptions, and then
 reports. These messages are not a synchronized pair.
 
-- known and planner-valid terrain cell counts;
+- observation, elevation, feature, threshold, and planner-valid counts for the
+  full map and each endpoint's square snap area;
 - whether start and goal are inside the map;
 - the exact cell and the nearest cell selected by the planner's square snap
   search;
@@ -219,11 +220,31 @@ missing, or future timestamps are reported before a topology claim. An
 `*_elevation_invalid_for_ground_topology` result means the planner-valid snapped
 cell has no finite elevation for this topology check. Use `--no-goal` to inspect
 only the current map and robot start, or `--json` for machine-readable output.
-The defaults match `terrain_navigation.yaml`; pass
-the corresponding CLI overrides if the live planner parameters were changed.
-Before relying on a comparison, query `/body_lattice_planner` with
-`ros2 param get` for `min_traversability`, `max_slope`, `max_step_height`, and
-`snap_radius`.
+The wrapper requires live values for `/terrain_mapper` `min_observed_frames`,
+`max_slope`, and `max_roughness`, and for `/body_lattice_planner`
+`min_traversability`, `max_slope`, `max_step_height`, and `snap_radius`. The two
+`max_slope` values are captured separately because mapper scoring and planner
+acceptance are independent gates. User-supplied threshold flags cannot override
+the values read from the running nodes.
+
+Interpret the independent layer counts in this order:
+
+- many `observation_below_min` cells mean they were seen in fewer than the
+  configured number of scans inside the integration window;
+- `elevation_known` substantially above `features_known` points to missing X
+  or Y elevation neighbors, which can happen with sparse 5 cm cells;
+- `slope_over` identifies the planner slope gate, while
+  `mapper_slope_at_or_above` and `roughness_over` identify mapper scoring
+  limits, and `traversability_low` identifies the planner traversability gate;
+  and
+- `hard_reject_candidate` means traversability is zero while slope and
+  roughness are strictly below the mapper limits. This suggests either the local
+  step-height or vertical-span hard gate, but `TerrainGrid` does not expose
+  enough intermediate data to distinguish them.
+
+These counts deliberately overlap. Hole filling can also produce known
+elevation with fewer than `min_observed_frames`, so they are not a monotonic
+funnel and must not be used alone to justify relaxing a safety threshold.
 
 Exit `0` means the start check passed or both endpoints are in the same
 continuous-ground component. Other diagnostic outcomes exit `2`; collection or
@@ -252,8 +273,10 @@ python .\tools\analyze_diagnostics.py `
 ```
 
 It creates `analysis/report.md`, `analysis/topic_rates_summary.csv`,
-`analysis/process_health_summary.csv`, and
-`analysis/sdk2_command_summary.csv`, plus `analysis/body_odometry_audit.csv`.
+`analysis/process_health_summary.csv`, `analysis/sdk2_command_summary.csv`,
+`analysis/body_odometry_audit.csv`, and `analysis/planner_input_summary.csv`.
+The planner CSV expands every recorded inspection into map, start, and optional
+goal rows while preserving the original `planner_input_inspections.jsonl`.
 The odometry audit compares only pairs with exactly identical ROS timestamps,
 then reports the configured and observed relative rotation, frame mismatches,
 invalid quaternion samples, and whether the maximum rotation error stayed

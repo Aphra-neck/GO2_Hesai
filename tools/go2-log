@@ -39,7 +39,11 @@ readonly SESSION_FINAL_BYTES=$((94 * 1024 * 1024))
 readonly SESSION_MAX_BYTES=$((100 * 1024 * 1024))
 readonly MAX_GIT_FILE_BYTES=$((40 * 1024 * 1024))
 readonly COMMAND_CAPTURE_BYTES=$((4 * 1024 * 1024))
+readonly PLANNER_RECORD_HEADROOM_BYTES=$((1 * 1024 * 1024))
 readonly MAX_LOCAL_SESSIONS=20
+
+PLANNER_RESULT_FILE=''
+PLANNER_ERROR_FILE=''
 
 readonly ROBOT_PROCESS_PATTERN='hesai_ros_driver_node|go2_imu_bridge_node|super_lio_node|body_odom_adapter_node|terrain_mapper_node|body_lattice_planner_node|go2_sdk2_bridge_node|rl_controller_node|utree_go2_rl_controller'
 
@@ -61,6 +65,7 @@ declare -ar REPAIRABLE_SESSION_TEXT_FILES=(
   'sdk2_commands.csv'
   'process_health.csv'
   'events.jsonl'
+  'planner_input_inspections.jsonl'
   'rosout_warn_error.txt'
   'collector.log'
 )
@@ -138,6 +143,22 @@ release_lock() {
   rmdir -- "${LOCK_DIR}" 2>/dev/null || true
 }
 
+cleanup_planner_temporaries() {
+  if [[ -n "${PLANNER_RESULT_FILE}" ]]; then
+    rm -f -- "${PLANNER_RESULT_FILE}"
+    PLANNER_RESULT_FILE=''
+  fi
+  if [[ -n "${PLANNER_ERROR_FILE}" ]]; then
+    rm -f -- "${PLANNER_ERROR_FILE}"
+    PLANNER_ERROR_FILE=''
+  fi
+}
+
+go2_log_exit_cleanup() {
+  cleanup_planner_temporaries
+  release_lock
+}
+
 acquire_lock() {
   ensure_directories
   local attempt stale_dir age_seconds modified_at owner_pid
@@ -151,7 +172,7 @@ acquire_lock() {
         echo "created_at=$(utc_now)"
       } > "${owner_temp}"
       mv -f -- "${owner_temp}" "${LOCK_OWNER_FILE}"
-      trap release_lock EXIT
+      trap go2_log_exit_cleanup EXIT
       return 0
     fi
 
@@ -519,6 +540,271 @@ source_ros_environment() {
   set -u
 }
 
+validate_planner_session() {
+  local session_dir="$1"
+  local session_parent sessions_parent session_id
+
+  [[ -f "${ACTIVE_FILE}" && ! -L "${ACTIVE_FILE}" ]] ||
+    die "active-session state is missing or symbolic"
+  [[ -d "${session_dir}" && ! -L "${session_dir}" ]] ||
+    die "active diagnostic session is invalid or symbolic"
+  session_parent="$(cd -- "$(dirname -- "${session_dir}")" && pwd -P)"
+  sessions_parent="$(cd -- "${SESSIONS_DIR}" && pwd -P)"
+  [[ "${session_parent}" == "${sessions_parent}" ]] ||
+    die "active diagnostic session is outside the sessions directory"
+  session_id="$(basename -- "${session_dir}")"
+  validate_session_id "${session_id}"
+  [[ ! -e "${session_dir}/.uploaded" && ! -L "${session_dir}/.uploaded" ]] ||
+    die "active diagnostic session is already marked uploaded"
+  [[ ! -e "${session_dir}/ended_at.txt" && ! -L "${session_dir}/ended_at.txt" ]] ||
+    die "active diagnostic session already has an end marker"
+}
+
+read_ros_parameter_value() {
+  local node="$1"
+  local parameter="$2"
+  local output value
+  output="$(timeout 5 ros2 param get "${node}" "${parameter}" 2>/dev/null)" ||
+    return 1
+  value="${output##*: }"
+  [[ "${value}" =~ ^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$ ]] ||
+    return 1
+  printf '%s\n' "${value}"
+}
+
+assert_planner_check_motion_idle() {
+  local processes topic_list lowcmd_info publisher_count pgrep_status
+  set +e
+  processes="$(
+    pgrep -af \
+      'go2_sdk2_bridge_node|rl_controller_node|utree_go2_rl_controller' \
+      2>/dev/null
+  )"
+  pgrep_status=$?
+  set -e
+  if (( pgrep_status > 1 )); then
+    echo "Refusing planner check: motion process query failed." >&2
+    return 1
+  fi
+  [[ ${pgrep_status} -eq 1 && -z "${processes}" ]] || {
+    echo "Refusing planner check while a motion command process is running:" >&2
+    echo "${processes}" >&2
+    return 1
+  }
+
+  topic_list="$(
+    timeout 8 ros2 topic list --no-daemon --spin-time 3 2>/dev/null
+  )" || {
+    echo "Refusing planner check: ROS graph query failed." >&2
+    return 1
+  }
+  grep -Fxq '/lowcmd' <<< "${topic_list}" || return 0
+  lowcmd_info="$(
+    timeout 8 ros2 topic info --no-daemon --spin-time 3 -v /lowcmd 2>/dev/null
+  )" || {
+    echo "Refusing planner check: /lowcmd publisher query failed." >&2
+    return 1
+  }
+  publisher_count="$(
+    awk -F': *' '$1 == "Publisher count" {print $2; exit}' <<< "${lowcmd_info}"
+  )"
+  [[ "${publisher_count}" =~ ^[0-9]+$ ]] || {
+    echo "Refusing planner check: /lowcmd publisher count is unavailable." >&2
+    return 1
+  }
+  [[ "${publisher_count}" == 0 ]] || {
+    echo "Refusing planner check: /lowcmd has ${publisher_count} publisher(s)." >&2
+    return 1
+  }
+}
+
+record_planner_inspection() {
+  local session_dir="$1"
+  local exit_code="$2"
+  local result_file="$3"
+  local error_file="$4"
+  local log_path="${session_dir}/planner_input_inspections.jsonl"
+  local size
+
+  [[ "${exit_code}" =~ ^[0-9]+$ ]] || die "invalid planner-check exit code"
+  size="$(session_bytes "${session_dir}")"
+  (( size + PLANNER_RECORD_HEADROOM_BYTES < SESSION_STOP_BYTES )) ||
+    die "session is too close to its size limit for another planner inspection"
+
+  python3 - \
+    "${REPO_ROOT}/tools" \
+    "${log_path}" \
+    "${LOG_ROOT}" \
+    "${exit_code}" \
+    "${result_file}" \
+    "${error_file}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+tools_dir, log_name, temporary_directory, raw_exit, result_name, error_name = (
+    sys.argv[1:]
+)
+sys.path.insert(0, tools_dir)
+from inspect_planner_inputs import _write_session_record_atomic  # noqa: E402
+
+exit_code = int(raw_exit)
+result_text = Path(result_name).read_text(encoding="utf-8", errors="replace")
+error_text = Path(error_name).read_text(encoding="utf-8", errors="replace")
+inspection = None
+
+def reject_constant(value):
+    raise ValueError(f"invalid JSON numeric constant: {value}")
+
+try:
+    candidate = json.loads(
+        result_text,
+        parse_constant=reject_constant,
+    )
+    if isinstance(candidate, dict) and isinstance(candidate.get("diagnosis"), str):
+        inspection = candidate
+except (json.JSONDecodeError, ValueError):
+    pass
+
+if exit_code in {0, 2} and inspection is not None:
+    _write_session_record_atomic(
+        Path(log_name),
+        Path(temporary_directory),
+        exit_code,
+        inspection=inspection,
+    )
+    print(f"Planner inspection recorded: {log_name}")
+    print(f"Diagnosis: {inspection['diagnosis']}")
+else:
+    message = error_text.strip() or result_text.strip()
+    if not message:
+        message = f"inspector exited {exit_code} without diagnostic output"
+    _write_session_record_atomic(
+        Path(log_name),
+        Path(temporary_directory),
+        1,
+        error={
+            "type": "inspector_capture_error",
+            "message": message[:65536],
+        },
+    )
+    print(f"Planner inspection capture error recorded: {log_name}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+planner_check() {
+  local session_dir collector_pid current
+  local inspector_status value parameter_error='' postflight_error=''
+  local -a runtime_arguments=()
+
+  session_dir="$(active_session_dir 2>/dev/null)" ||
+    die "no active diagnostic session; run ./tools/go2-log start first"
+  validate_planner_session "${session_dir}"
+  collector_pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+  collector_is_running "${collector_pid}" "${session_dir}" ||
+    die "active diagnostic collector is not healthy"
+  (( $(session_bytes "${session_dir}") + PLANNER_RECORD_HEADROOM_BYTES <
+      SESSION_STOP_BYTES )) ||
+    die "session is too close to its size limit for another planner inspection"
+  [[ -r "${REPO_ROOT}/tools/inspect_planner_inputs.py" ]] ||
+    die "planner input inspector is missing from ${REPO_ROOT}/tools"
+  [[ -r "${REPO_ROOT}/shell/ros2_environment.sh" ]] ||
+    die "ROS 2 environment helper is missing from ${REPO_ROOT}/shell"
+
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/shell/ros2_environment.sh"
+  command -v ros2 >/dev/null 2>&1 || die "ros2 is unavailable"
+  assert_planner_check_motion_idle || die "motion safety preflight failed"
+
+  trap go2_log_exit_cleanup EXIT
+  PLANNER_RESULT_FILE="$(mktemp --tmpdir go2-planner-result.XXXXXX)"
+  PLANNER_ERROR_FILE="$(mktemp --tmpdir go2-planner-error.XXXXXX)"
+
+  if value="$(read_ros_parameter_value /terrain_mapper min_observed_frames)"; then
+    runtime_arguments+=(--min-observed-frames "${value}")
+  else
+    parameter_error='could not read /terrain_mapper min_observed_frames'
+  fi
+  if [[ -z "${parameter_error}" ]] &&
+    value="$(read_ros_parameter_value /terrain_mapper max_slope)"; then
+    runtime_arguments+=(--mapper-max-slope "${value}")
+  elif [[ -z "${parameter_error}" ]]; then
+    parameter_error='could not read /terrain_mapper max_slope'
+  fi
+  if [[ -z "${parameter_error}" ]] &&
+    value="$(read_ros_parameter_value /terrain_mapper max_roughness)"; then
+    runtime_arguments+=(--max-roughness "${value}")
+  elif [[ -z "${parameter_error}" ]]; then
+    parameter_error='could not read /terrain_mapper max_roughness'
+  fi
+  if [[ -z "${parameter_error}" ]] &&
+    value="$(read_ros_parameter_value /body_lattice_planner min_traversability)"; then
+    runtime_arguments+=(--min-traversability "${value}")
+  elif [[ -z "${parameter_error}" ]]; then
+    parameter_error='could not read /body_lattice_planner min_traversability'
+  fi
+  if [[ -z "${parameter_error}" ]] &&
+    value="$(read_ros_parameter_value /body_lattice_planner max_slope)"; then
+    runtime_arguments+=(--max-slope "${value}")
+  elif [[ -z "${parameter_error}" ]]; then
+    parameter_error='could not read /body_lattice_planner max_slope'
+  fi
+  if [[ -z "${parameter_error}" ]] &&
+    value="$(read_ros_parameter_value /body_lattice_planner max_step_height)"; then
+    runtime_arguments+=(--max-step-height "${value}")
+  elif [[ -z "${parameter_error}" ]]; then
+    parameter_error='could not read /body_lattice_planner max_step_height'
+  fi
+  if [[ -z "${parameter_error}" ]] &&
+    value="$(read_ros_parameter_value /body_lattice_planner snap_radius)"; then
+    runtime_arguments+=(--snap-radius "${value}")
+  elif [[ -z "${parameter_error}" ]]; then
+    parameter_error='could not read /body_lattice_planner snap_radius'
+  fi
+
+  if [[ -n "${parameter_error}" ]]; then
+    printf '%s\n' "${parameter_error}" | tee "${PLANNER_ERROR_FILE}" >&2
+    inspector_status=1
+  else
+    set +e
+    (
+      ulimit -f $((COMMAND_CAPTURE_BYTES / 1024))
+      exec python3 "${REPO_ROOT}/tools/inspect_planner_inputs.py" --json \
+        "$@" "${runtime_arguments[@]}"
+    ) > "${PLANNER_RESULT_FILE}" 2> "${PLANNER_ERROR_FILE}"
+    inspector_status=$?
+    set -e
+    if [[ -s "${PLANNER_ERROR_FILE}" ]]; then
+      tail -c 65536 -- "${PLANNER_ERROR_FILE}" >&2
+    fi
+  fi
+
+  if ! postflight_error="$(assert_planner_check_motion_idle 2>&1)"; then
+    {
+      printf 'post-capture motion safety preflight failed\n'
+      printf '%s\n' "${postflight_error}"
+    } | tee "${PLANNER_ERROR_FILE}" >&2
+    : > "${PLANNER_RESULT_FILE}"
+    inspector_status=1
+  fi
+
+  acquire_lock
+  current="$(active_session_dir 2>/dev/null)" ||
+    die "diagnostic session stopped before planner inspection could be recorded"
+  [[ "${current}" == "${session_dir}" ]] ||
+    die "active diagnostic session changed during planner inspection"
+  validate_planner_session "${session_dir}"
+  collector_pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+  collector_is_running "${collector_pid}" "${session_dir}" ||
+    die "diagnostic collector stopped before planner inspection could be recorded"
+  record_planner_inspection \
+    "${session_dir}" "${inspector_status}" \
+    "${PLANNER_RESULT_FILE}" "${PLANNER_ERROR_FILE}"
+  cleanup_planner_temporaries
+  return "${inspector_status}"
+}
+
 record_active_runtime_overrides() {
   local session_dir="$1"
   local body_yaw_offset="${GO2_BODY_YAW_OFFSET_RAD:-}"
@@ -605,6 +891,7 @@ PY
   printf 'timestamp,vx,vy,yaw_rate,status\n' > "${session_dir}/sdk2_commands.csv"
   printf 'timestamp,component,running,pids\n' > "${session_dir}/process_health.csv"
   : > "${session_dir}/events.jsonl"
+  : > "${session_dir}/planner_input_inspections.jsonl"
   : > "${session_dir}/rosout_warn_error.txt"
 }
 
@@ -2445,6 +2732,7 @@ Usage: go2-log <command> [arguments]
 Commands:
   start                 Start a bounded diagnostic session.
   status                Show collector state and session size.
+  planner-check [ARGS]  Inspect planner inputs and record them in the session.
   stop                  Stop the active diagnostic session cleanly.
   repair [SESSION_ID]   Quarantine and trim a verified trailing-NUL text suffix.
   upload [SESSION_ID]   Push a stopped session to Aphra-neck/G02_log.
@@ -2469,6 +2757,10 @@ main() {
     status)
       [[ $# -eq 1 ]] || die "status takes no arguments"
       status_session
+      ;;
+    planner-check)
+      shift
+      planner_check "$@"
       ;;
     stop)
       [[ $# -eq 1 ]] || die "stop takes no arguments"

@@ -25,6 +25,105 @@ EXPECTED_TOPICS = (
 )
 PARAMETER_SCALAR = re.compile(r"^\s*([A-Za-z0-9_.-]+):\s*([^#]+?)\s*(?:#.*)?$")
 YAW_AUDIT_TOLERANCE_RAD = 0.15
+RFC3339_UTC = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00)$"
+)
+PLANNER_SUCCESS_DIAGNOSES = {
+    "start_ready_waiting_for_goal",
+    "same_continuous_ground_component_not_planner_approval",
+}
+PLANNER_LAYER_SOURCE_FIELDS = (
+    "cell_count",
+    "observation_zero",
+    "observation_below_min",
+    "observation_ready",
+    "elevation_known",
+    "elevation_unknown_or_nonfinite",
+    "elevation_known_below_min_observations",
+    "slope_known",
+    "slope_unknown_or_nonfinite",
+    "roughness_known",
+    "roughness_unknown_or_nonfinite",
+    "traversability_known",
+    "traversability_unknown_or_nonfinite",
+    "features_known",
+    "slope_over_limit",
+    "slope_at_or_above_mapper_limit",
+    "roughness_over_limit",
+    "traversability_zero",
+    "traversability_below_min_nonzero",
+    "traversability_at_or_above_min",
+    "zero_traversability_with_slope_and_roughness_below_limits",
+    "planner_valid",
+)
+PLANNER_LAYER_FIELDS = (
+    "cell_count",
+    "observation_zero",
+    "observation_below_min",
+    "observation_ready",
+    "elevation_known",
+    "elevation_unknown_or_nonfinite",
+    "elevation_known_below_min_observations",
+    "slope_known",
+    "slope_unknown_or_nonfinite",
+    "roughness_known",
+    "roughness_unknown_or_nonfinite",
+    "traversability_known",
+    "traversability_unknown_or_nonfinite",
+    "features_known",
+    "slope_over_limit",
+    "slope_at_or_above_mapper_limit",
+    "roughness_over_limit",
+    "traversability_zero",
+    "traversability_below_min_nonzero",
+    "traversability_at_or_above_min",
+    "hard_reject_candidate",
+    "planner_valid",
+)
+PLANNER_CSV_FIELDS = (
+    "recorded_at",
+    "status",
+    "exit_code",
+    "diagnosis",
+    "scope",
+    "map_frame",
+    "map_width",
+    "map_height",
+    "resolution",
+    "map_stamp_ns",
+    "map_total_cells",
+    "map_planner_gate_known_cells",
+    "map_valid_cells",
+    "map_continuous_ground_cells",
+    "map_known_percent",
+    "map_valid_percent",
+    "map_continuous_ground_percent",
+    "min_observed_frames",
+    "min_traversability",
+    "max_slope",
+    "mapper_max_slope",
+    "max_roughness",
+    "max_step_height",
+    "snap_radius",
+    "map_age_sec",
+    "odom_age_sec",
+    "goal_age_sec",
+    "map_odom_stamp_delta_sec",
+    "start_component_cells",
+    "start_component_percent_of_ground",
+    "goal_in_start_component",
+    *PLANNER_LAYER_FIELDS,
+    "world_x",
+    "world_y",
+    "grid_x",
+    "grid_y",
+    "inside_map",
+    "exact_cell_valid",
+    "valid_cells_in_snap_square",
+    "snapped",
+    "snap_grid_distance_m",
+    "snap_world_to_center_distance_m",
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +162,10 @@ def read_json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON numeric constant: {value}")
+
+
 def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
     records: list[dict[str, Any]] = []
     invalid = 0
@@ -72,10 +175,11 @@ def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
         return records, invalid
     for line in lines:
         if not line.strip():
+            invalid += 1
             continue
         try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
+            value = json.loads(line, parse_constant=_reject_json_constant)
+        except (json.JSONDecodeError, ValueError):
             invalid += 1
             continue
         if isinstance(value, dict):
@@ -83,6 +187,617 @@ def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
         else:
             invalid += 1
     return records, invalid
+
+
+def _is_strict_int(value: object, *, minimum: int = 0) -> bool:
+    return type(value) is int and value >= minimum
+
+
+def _is_finite_number(
+    value: object,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    number = float(value)
+    if not math.isfinite(number):
+        return False
+    if minimum is not None and number < minimum:
+        return False
+    if maximum is not None and number > maximum:
+        return False
+    return True
+
+
+def _is_optional_finite_number(value: object) -> bool:
+    return value is None or _is_finite_number(value)
+
+
+def _is_rfc3339_utc(value: object) -> bool:
+    if not isinstance(value, str) or RFC3339_UTC.fullmatch(value) is None:
+        return False
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = dt.datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.utcoffset() == dt.timedelta(0)
+
+
+def _valid_planner_layers(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if any(
+        not _is_strict_int(value.get(field))
+        for field in PLANNER_LAYER_SOURCE_FIELDS
+    ):
+        return False
+
+    cell_count = value["cell_count"]
+    if (
+        value["observation_zero"]
+        + value["observation_below_min"]
+        + value["observation_ready"]
+        != cell_count
+    ):
+        return False
+    for known, unknown in (
+        ("elevation_known", "elevation_unknown_or_nonfinite"),
+        ("slope_known", "slope_unknown_or_nonfinite"),
+        ("roughness_known", "roughness_unknown_or_nonfinite"),
+        ("traversability_known", "traversability_unknown_or_nonfinite"),
+    ):
+        if value[known] + value[unknown] != cell_count:
+            return False
+    if value["elevation_known_below_min_observations"] > value["elevation_known"]:
+        return False
+    if value["elevation_known_below_min_observations"] > (
+        value["observation_zero"] + value["observation_below_min"]
+    ):
+        return False
+    if value["features_known"] > min(
+        value["slope_known"],
+        value["roughness_known"],
+        value["traversability_known"],
+    ):
+        return False
+    if value["slope_over_limit"] > value["slope_known"]:
+        return False
+    if value["slope_at_or_above_mapper_limit"] > value["slope_known"]:
+        return False
+    if value["roughness_over_limit"] > value["roughness_known"]:
+        return False
+    if any(
+        value[field] > value["traversability_known"]
+        for field in (
+            "traversability_zero",
+            "traversability_below_min_nonzero",
+            "traversability_at_or_above_min",
+        )
+    ):
+        return False
+    if value[
+        "zero_traversability_with_slope_and_roughness_below_limits"
+    ] > min(value["traversability_zero"], value["features_known"]):
+        return False
+    return value["planner_valid"] <= min(
+        value["traversability_at_or_above_min"],
+        value["slope_known"],
+    )
+
+
+def _valid_planner_endpoint(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = {
+        "frame_id",
+        "child_frame_id",
+        "stamp_ns",
+        "world_x",
+        "world_y",
+        "yaw_rad",
+        "grid_x",
+        "grid_y",
+        "inside_map",
+        "exact_cell_valid",
+        "valid_cells_in_snap_square",
+        "snapped",
+        "snapped_grid_x",
+        "snapped_grid_y",
+        "snapped_world_x",
+        "snapped_world_y",
+        "snap_grid_distance_m",
+        "snap_world_to_center_distance_m",
+        "snap_grid_distance_outside_nominal_radius",
+        "snap_square_terrain_layers",
+    }
+    if (
+        not required.issubset(value)
+        or not isinstance(value.get("frame_id"), str)
+        or not isinstance(value.get("child_frame_id"), str)
+        or not _is_strict_int(value.get("stamp_ns"))
+        or not all(
+            _is_finite_number(value.get(field))
+            for field in ("world_x", "world_y", "yaw_rad")
+        )
+        or not all(
+            _is_strict_int(value.get(field), minimum=-2**63)
+            for field in ("grid_x", "grid_y")
+        )
+        or type(value.get("inside_map")) is not bool
+        or type(value.get("exact_cell_valid")) is not bool
+        or not _is_strict_int(value.get("valid_cells_in_snap_square"))
+        or type(value.get("snapped")) is not bool
+        or type(value.get("snap_grid_distance_outside_nominal_radius")) is not bool
+    ):
+        return False
+
+    inside = value["inside_map"]
+    layers = value.get("snap_square_terrain_layers")
+    if inside:
+        if not _valid_planner_layers(layers):
+            return False
+        if layers["cell_count"] < 1:
+            return False
+        if layers["planner_valid"] != value["valid_cells_in_snap_square"]:
+            return False
+    elif layers is not None:
+        return False
+
+    snapped = value["snapped"]
+    snapped_fields = (
+        "snapped_grid_x",
+        "snapped_grid_y",
+        "snapped_world_x",
+        "snapped_world_y",
+        "snap_grid_distance_m",
+        "snap_world_to_center_distance_m",
+    )
+    if snapped:
+        if value["valid_cells_in_snap_square"] < 1:
+            return False
+        if not all(
+            _is_strict_int(value.get(field), minimum=-2**63)
+            for field in ("snapped_grid_x", "snapped_grid_y")
+        ):
+            return False
+        if not all(
+            _is_finite_number(
+                value.get(field),
+                minimum=0.0 if field.endswith("distance_m") else None,
+            )
+            for field in snapped_fields[2:]
+        ):
+            return False
+    elif any(value.get(field) is not None for field in snapped_fields):
+        return False
+    if value["exact_cell_valid"] and not snapped:
+        return False
+    if not inside and (
+        value["exact_cell_valid"]
+        or value["valid_cells_in_snap_square"] != 0
+        or snapped
+    ):
+        return False
+    return (value["valid_cells_in_snap_square"] > 0) == snapped
+
+
+def _valid_planner_inspection(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    required = {
+        "map",
+        "thresholds",
+        "contract",
+        "freshness",
+        "start",
+        "goal",
+        "start_component_cells",
+        "start_component_percent_of_ground",
+        "goal_in_start_component",
+        "diagnosis",
+        "limitations",
+    }
+    if not required.issubset(value):
+        return False
+    diagnosis = value.get("diagnosis")
+    map_data = value.get("map")
+    thresholds = value.get("thresholds")
+    contract = value.get("contract")
+    freshness = value.get("freshness")
+    start = value.get("start")
+    goal = value.get("goal")
+    if (
+        not isinstance(diagnosis, str)
+        or not diagnosis
+        or not isinstance(map_data, dict)
+        or not isinstance(thresholds, dict)
+        or not isinstance(contract, dict)
+        or not isinstance(freshness, dict)
+        or not _valid_planner_endpoint(start)
+        or (goal is not None and not _valid_planner_endpoint(goal))
+    ):
+        return False
+
+    width = map_data.get("width")
+    height = map_data.get("height")
+    total_cells = map_data.get("total_cells")
+    map_required = {
+        "frame_id",
+        "stamp_ns",
+        "resolution",
+        "width",
+        "height",
+        "origin_x",
+        "origin_y",
+        "total_cells",
+        "known_cells",
+        "planner_gate_known_cells",
+        "valid_cells",
+        "continuous_ground_cells",
+        "known_percent",
+        "valid_percent",
+        "continuous_ground_percent",
+        "terrain_layers",
+    }
+    if (
+        not map_required.issubset(map_data)
+        or not isinstance(map_data.get("frame_id"), str)
+        or not _is_strict_int(map_data.get("stamp_ns"))
+        or not _is_finite_number(map_data.get("resolution"), minimum=0.0)
+        or float(map_data["resolution"]) == 0.0
+        or not _is_strict_int(width, minimum=1)
+        or not _is_strict_int(height, minimum=1)
+        or not _is_finite_number(map_data.get("origin_x"))
+        or not _is_finite_number(map_data.get("origin_y"))
+        or not _is_strict_int(total_cells, minimum=1)
+        or total_cells != width * height
+        or not _valid_planner_layers(map_data.get("terrain_layers"))
+        or map_data["terrain_layers"]["cell_count"] != total_cells
+    ):
+        return False
+
+    count_fields = (
+        "known_cells",
+        "planner_gate_known_cells",
+        "valid_cells",
+        "continuous_ground_cells",
+    )
+    if any(not _is_strict_int(map_data.get(field)) for field in count_fields):
+        return False
+    if (
+        map_data["known_cells"] != map_data["planner_gate_known_cells"]
+        or map_data["valid_cells"] != map_data["terrain_layers"]["planner_valid"]
+        or map_data["known_cells"] > total_cells
+        or map_data["valid_cells"] > map_data["known_cells"]
+        or map_data["continuous_ground_cells"] > map_data["valid_cells"]
+    ):
+        return False
+    for field in (
+        "known_percent",
+        "valid_percent",
+        "continuous_ground_percent",
+    ):
+        if not _is_finite_number(map_data.get(field), minimum=0.0, maximum=100.0):
+            return False
+    for field, count_field in (
+        ("known_percent", "known_cells"),
+        ("valid_percent", "valid_cells"),
+        ("continuous_ground_percent", "continuous_ground_cells"),
+    ):
+        if not math.isclose(
+            float(map_data[field]),
+            100.0 * map_data[count_field] / total_cells,
+            rel_tol=1.0e-9,
+            abs_tol=1.0e-9,
+        ):
+            return False
+
+    thresholds_required = {
+        "min_observed_frames",
+        "min_traversability",
+        "max_slope",
+        "mapper_max_slope",
+        "max_roughness",
+        "max_step_height",
+        "snap_radius",
+    }
+    contract_required = {
+        "map_frame",
+        "body_frame",
+        "max_map_age",
+        "max_odom_age",
+        "max_goal_age",
+        "future_tolerance",
+    }
+    freshness_required = {
+        "evaluated",
+        "map_age_sec",
+        "odom_age_sec",
+        "goal_age_sec",
+        "map_odom_stamp_delta_sec",
+    }
+    if (
+        not thresholds_required.issubset(thresholds)
+        or not contract_required.issubset(contract)
+        or not freshness_required.issubset(freshness)
+        or not _is_strict_int(thresholds.get("min_observed_frames"), minimum=1)
+        or any(
+            not _is_finite_number(thresholds.get(field), minimum=0.0)
+            for field in (
+                "min_traversability",
+                "max_slope",
+                "mapper_max_slope",
+                "max_roughness",
+                "max_step_height",
+                "snap_radius",
+            )
+        )
+        or not isinstance(contract.get("map_frame"), str)
+        or not contract["map_frame"]
+        or not isinstance(contract.get("body_frame"), str)
+        or not contract["body_frame"]
+        or any(
+            not _is_finite_number(contract.get(field), minimum=0.0)
+            for field in (
+                "max_map_age",
+                "max_odom_age",
+                "max_goal_age",
+                "future_tolerance",
+            )
+        )
+        or type(freshness.get("evaluated")) is not bool
+        or any(
+            not _is_optional_finite_number(freshness.get(field))
+            for field in (
+                "map_age_sec",
+                "odom_age_sec",
+                "goal_age_sec",
+                "map_odom_stamp_delta_sec",
+            )
+        )
+        or not _is_strict_int(value.get("start_component_cells"))
+        or not _is_finite_number(
+            value.get("start_component_percent_of_ground"),
+            minimum=0.0,
+            maximum=100.0,
+        )
+        or (
+            value.get("goal_in_start_component") is not None
+            and type(value.get("goal_in_start_component")) is not bool
+        )
+        or not isinstance(value.get("limitations"), str)
+        or not value["limitations"]
+    ):
+        return False
+    if value["start_component_cells"] > map_data["continuous_ground_cells"]:
+        return False
+    expected_component_percent = (
+        100.0
+        * value["start_component_cells"]
+        / map_data["continuous_ground_cells"]
+        if map_data["continuous_ground_cells"]
+        else 0.0
+    )
+    if not math.isclose(
+        float(value["start_component_percent_of_ground"]),
+        expected_component_percent,
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-9,
+    ):
+        return False
+    return True
+
+
+def _planner_layer_row(
+    record: dict[str, Any],
+    inspection: dict[str, Any],
+    scope: str,
+    layers: dict[str, Any],
+    endpoint: dict[str, Any] | None,
+) -> dict[str, object]:
+    row: dict[str, object] = {field: "" for field in PLANNER_CSV_FIELDS}
+    map_data = inspection.get("map", {})
+    thresholds = inspection.get("thresholds", {})
+    freshness = inspection.get("freshness", {})
+    if not isinstance(map_data, dict):
+        map_data = {}
+    if not isinstance(thresholds, dict):
+        thresholds = {}
+    if not isinstance(freshness, dict):
+        freshness = {}
+    row.update(
+        {
+            "recorded_at": record.get("recorded_at", ""),
+            "status": record.get("status", ""),
+            "exit_code": record.get("exit_code", ""),
+            "diagnosis": inspection.get("diagnosis", ""),
+            "scope": scope,
+            "map_frame": map_data.get("frame_id", ""),
+            "map_width": map_data.get("width", ""),
+            "map_height": map_data.get("height", ""),
+            "resolution": map_data.get("resolution", ""),
+            "map_stamp_ns": map_data.get("stamp_ns", ""),
+            "map_total_cells": map_data.get("total_cells", ""),
+            "map_planner_gate_known_cells": map_data.get(
+                "planner_gate_known_cells", ""
+            ),
+            "map_valid_cells": map_data.get("valid_cells", ""),
+            "map_continuous_ground_cells": map_data.get(
+                "continuous_ground_cells", ""
+            ),
+            "map_known_percent": map_data.get("known_percent", ""),
+            "map_valid_percent": map_data.get("valid_percent", ""),
+            "map_continuous_ground_percent": map_data.get(
+                "continuous_ground_percent", ""
+            ),
+            "min_observed_frames": thresholds.get(
+                "min_observed_frames", ""
+            ),
+            "min_traversability": thresholds.get("min_traversability", ""),
+            "max_slope": thresholds.get("max_slope", ""),
+            "mapper_max_slope": thresholds.get("mapper_max_slope", ""),
+            "max_roughness": thresholds.get("max_roughness", ""),
+            "max_step_height": thresholds.get("max_step_height", ""),
+            "snap_radius": thresholds.get("snap_radius", ""),
+            "map_age_sec": freshness.get("map_age_sec", ""),
+            "odom_age_sec": freshness.get("odom_age_sec", ""),
+            "goal_age_sec": freshness.get("goal_age_sec", ""),
+            "map_odom_stamp_delta_sec": freshness.get(
+                "map_odom_stamp_delta_sec", ""
+            ),
+            "start_component_cells": inspection.get(
+                "start_component_cells", ""
+            ),
+            "start_component_percent_of_ground": inspection.get(
+                "start_component_percent_of_ground", ""
+            ),
+            "goal_in_start_component": inspection.get(
+                "goal_in_start_component", ""
+            ),
+        }
+    )
+    for field in PLANNER_LAYER_FIELDS:
+        source_field = (
+            "zero_traversability_with_slope_and_roughness_below_limits"
+            if field == "hard_reject_candidate"
+            else field
+        )
+        row[field] = layers.get(source_field, "")
+    if endpoint is not None:
+        for field in (
+            "world_x",
+            "world_y",
+            "grid_x",
+            "grid_y",
+            "inside_map",
+            "exact_cell_valid",
+            "valid_cells_in_snap_square",
+            "snapped",
+            "snap_grid_distance_m",
+            "snap_world_to_center_distance_m",
+        ):
+            row[field] = endpoint.get(field, "")
+    return row
+
+
+def summarize_planner_inspections(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    accepted_records: list[dict[str, Any]] = []
+    completed: list[dict[str, Any]] = []
+    rows: list[dict[str, object]] = []
+    latest_rows: list[dict[str, object]] = []
+    schema_invalid = 0
+    capture_errors = 0
+    diagnoses: Counter[str] = Counter()
+
+    for record in records:
+        status = record.get("status")
+        exit_code = record.get("exit_code")
+        if (
+            type(record.get("schema_version")) is not int
+            or record["schema_version"] != 1
+            or not _is_rfc3339_utc(record.get("recorded_at"))
+            or type(exit_code) is not int
+            or status not in {
+                "ok",
+                "diagnostic_failure",
+                "capture_error",
+            }
+        ):
+            schema_invalid += 1
+            continue
+        if status == "capture_error":
+            error = record.get("error")
+            if (
+                exit_code != 1
+                or "inspection" in record
+                or not isinstance(error, dict)
+                or not isinstance(error.get("type"), str)
+                or not error["type"]
+                or not isinstance(error.get("message"), str)
+                or not error["message"]
+            ):
+                schema_invalid += 1
+                continue
+            accepted_records.append(record)
+            capture_errors += 1
+            continue
+
+        expected_exit = 0 if status == "ok" else 2
+        inspection = record.get("inspection")
+        if (
+            exit_code != expected_exit
+            or "error" in record
+            or not _valid_planner_inspection(inspection)
+        ):
+            schema_invalid += 1
+            continue
+        assert isinstance(inspection, dict)
+        diagnosis = inspection.get("diagnosis")
+        if (status == "ok") != (diagnosis in PLANNER_SUCCESS_DIAGNOSES):
+            schema_invalid += 1
+            continue
+        map_data = inspection["map"]
+        start = inspection["start"]
+        goal = inspection.get("goal")
+        assert isinstance(diagnosis, str)
+        assert isinstance(map_data, dict)
+        assert isinstance(start, dict)
+        start_layers = start.get("snap_square_terrain_layers")
+
+        accepted_records.append(record)
+        completed.append(record)
+        diagnoses[diagnosis] += 1
+        record_rows = [
+            _planner_layer_row(
+                record,
+                inspection,
+                "map",
+                map_data["terrain_layers"],
+                None,
+            )
+        ]
+        record_rows.append(
+            _planner_layer_row(
+                record,
+                inspection,
+                "start",
+                start_layers if isinstance(start_layers, dict) else {},
+                start,
+            )
+        )
+        if goal is not None:
+            record_rows.append(
+                _planner_layer_row(
+                    record,
+                    inspection,
+                    "goal",
+                    goal.get("snap_square_terrain_layers")
+                    if isinstance(goal.get("snap_square_terrain_layers"), dict)
+                    else {},
+                    goal,
+                )
+            )
+        rows.extend(record_rows)
+        latest_rows = record_rows
+
+    latest = completed[-1] if completed else None
+    latest_attempt = accepted_records[-1] if accepted_records else None
+    return {
+        "accepted_records": accepted_records,
+        "completed_records": completed,
+        "rows": rows,
+        "latest": latest,
+        "latest_attempt": latest_attempt,
+        "latest_rows": latest_rows,
+        "schema_invalid": schema_invalid,
+        "capture_errors": capture_errors,
+        "diagnoses": diagnoses,
+    }
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -560,7 +1275,65 @@ def build_observations(
     return observations
 
 
-def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, Path, Path]:
+def planner_inspection_observations(
+    summary: dict[str, Any],
+    malformed_records: int,
+) -> list[str]:
+    observations: list[str] = []
+    if malformed_records:
+        observations.append(
+            "Planner input log contains "
+            f"{malformed_records} malformed JSONL record(s)."
+        )
+    if summary["schema_invalid"]:
+        observations.append(
+            "Planner input log contains "
+            f"{summary['schema_invalid']} schema-invalid record(s)."
+        )
+    if summary["capture_errors"]:
+        observations.append(
+            f"Planner input inspection had {summary['capture_errors']} capture error(s)."
+        )
+    latest_attempt = summary["latest_attempt"]
+    if latest_attempt is not None and latest_attempt["status"] == "capture_error":
+        error = latest_attempt["error"]
+        observations.append(
+            "Latest planner input inspection attempt failed at "
+            f"{markdown_cell(latest_attempt['recorded_at'])}: "
+            f"{markdown_cell(error['type'])}: "
+            f"{planner_error_message(error['message'])}."
+        )
+    latest = summary["latest"]
+    if latest is None:
+        observations.append("No completed planner input inspection was captured.")
+        return observations
+    inspection = latest["inspection"]
+    diagnosis = inspection["diagnosis"]
+    if diagnosis not in {
+        "start_ready_waiting_for_goal",
+        "same_continuous_ground_component_not_planner_approval",
+    }:
+        observations.append(
+            f"Latest planner input inspection diagnosis: `{diagnosis}`."
+        )
+    return observations
+
+
+def planner_markdown_value(value: object) -> str:
+    if value is None or value == "":
+        return "-"
+    return markdown_cell(value)
+
+
+def planner_error_message(value: object, limit: int = 500) -> str:
+    message = markdown_cell(value)
+    return message if len(message) <= limit else message[:limit] + "..."
+
+
+def generate_report(
+    session: Path,
+    output_dir: Path,
+) -> tuple[Path, Path, Path, Path, Path, Path]:
     metadata = read_json(session / "metadata.json")
     runtime_settings = load_runtime_settings(session)
     rate_rows = read_csv(session / "topic_rates.csv")
@@ -569,6 +1342,10 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
     raw_odometry_rows = read_csv(session / "odom_position.csv")
     body_odometry_rows = read_csv(session / "body_odom_pose.csv")
     events, invalid_events = read_jsonl(session / "events.jsonl")
+    planner_records, malformed_planner_records = read_jsonl(
+        session / "planner_input_inspections.jsonl"
+    )
+    planner_summary = summarize_planner_inspections(planner_records)
     rate_summaries = summarize_rates(rate_rows)
     process_summaries = summarize_processes(process_rows)
     sdk2_summary = summarize_sdk2_commands(sdk2_rows)
@@ -596,6 +1373,7 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
     process_csv = output_dir / "process_health_summary.csv"
     sdk2_csv = output_dir / "sdk2_command_summary.csv"
     odometry_csv = output_dir / "body_odometry_audit.csv"
+    planner_csv = output_dir / "planner_input_summary.csv"
     report_path = output_dir / "report.md"
 
     write_csv_atomic(
@@ -674,6 +1452,11 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
         ),
         [odometry_output],
     )
+    write_csv_atomic(
+        planner_csv,
+        PLANNER_CSV_FIELDS,
+        planner_summary["rows"],
+    )
 
     event_levels = Counter(str(event.get("level", "unknown")) for event in events)
     event_categories = Counter(str(event.get("category", "unknown")) for event in events)
@@ -706,6 +1489,12 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
             raw_odometry_summary,
             body_odometry_summary,
             yaw_correction_summary,
+        )
+    )
+    observations.extend(
+        planner_inspection_observations(
+            planner_summary,
+            malformed_planner_records,
         )
     )
     if not observations:
@@ -769,6 +1558,137 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
                 latest=format_rate(rate_value(summary, "latest_hz")),
             )
         )
+
+    lines.extend(
+        [
+            "",
+            "## Planner Input Inspections",
+            "",
+            "Accepted records: "
+            f"{len(planner_summary['accepted_records'])}; completed inspections: "
+            f"{len(planner_summary['completed_records'])}; capture errors: "
+            f"{planner_summary['capture_errors']}; malformed JSONL: "
+            f"{malformed_planner_records}; schema-invalid: "
+            f"{planner_summary['schema_invalid']}.",
+            "",
+            "| Diagnosis | Count |",
+            "| --- | ---: |",
+        ]
+    )
+    if planner_summary["diagnoses"]:
+        for diagnosis, count in sorted(planner_summary["diagnoses"].items()):
+            lines.append(f"| {markdown_cell(diagnosis)} | {count} |")
+    else:
+        lines.append("| - | 0 |")
+
+    latest_attempt = planner_summary["latest_attempt"]
+    if latest_attempt is not None:
+        if latest_attempt["status"] == "capture_error":
+            error = latest_attempt["error"]
+            lines.extend(
+                [
+                    "",
+                    "Latest attempt: "
+                    f"{markdown_cell(latest_attempt['recorded_at'])}; "
+                    "status=`capture_error`; "
+                    f"error={markdown_cell(error['type'])}: "
+                    f"{planner_error_message(error['message'])}.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "Latest attempt: "
+                    f"{markdown_cell(latest_attempt['recorded_at'])}; "
+                    f"status=`{latest_attempt['status']}`; "
+                    "diagnosis=`"
+                    f"{markdown_cell(latest_attempt['inspection']['diagnosis'])}`.",
+                ]
+            )
+
+    latest_planner = planner_summary["latest"]
+    if latest_planner is not None:
+        latest_inspection = latest_planner["inspection"]
+        latest_map = latest_inspection["map"]
+        lines.extend(
+            [
+                "",
+                "Latest completed inspection: "
+                f"{markdown_cell(latest_planner.get('recorded_at', '-'))}; "
+                f"diagnosis=`{markdown_cell(latest_inspection['diagnosis'])}`; "
+                f"map={markdown_cell(latest_map.get('frame_id', '-'))} "
+                f"{latest_map.get('width', '-')}x{latest_map.get('height', '-')} "
+                f"at {latest_map.get('resolution', '-')} m.",
+                "Map gates: "
+                f"planner_gate_known={latest_map['planner_gate_known_cells']} "
+                f"({latest_map['known_percent']:.3f}%); "
+                f"planner_valid={latest_map['valid_cells']} "
+                f"({latest_map['valid_percent']:.3f}%); "
+                f"continuous_ground={latest_map['continuous_ground_cells']} "
+                f"({latest_map['continuous_ground_percent']:.3f}%).",
+                "Thresholds: "
+                f"min_observed_frames={latest_inspection['thresholds']['min_observed_frames']}; "
+                f"min_traversability={latest_inspection['thresholds']['min_traversability']}; "
+                f"max_slope={latest_inspection['thresholds']['max_slope']}; "
+                f"mapper_max_slope={latest_inspection['thresholds']['mapper_max_slope']}; "
+                f"max_roughness={latest_inspection['thresholds']['max_roughness']}; "
+                f"max_step_height={latest_inspection['thresholds']['max_step_height']}; "
+                f"snap_radius={latest_inspection['thresholds']['snap_radius']}.",
+                "Timing/topology: "
+                "map_minus_odom="
+                f"{planner_markdown_value(latest_inspection['freshness']['map_odom_stamp_delta_sec'])} s; "
+                f"start_component={latest_inspection['start_component_cells']} cells "
+                f"({latest_inspection['start_component_percent_of_ground']:.3f}% of ground); "
+                "goal_in_start_component="
+                f"{planner_markdown_value(latest_inspection['goal_in_start_component'])}.",
+                "",
+                "| Scope | Cells | Obs 0 | Obs below min | Obs ready | Elevation known | Features known | Slope over planner | Slope >= mapper | Roughness over | T=0 | T low | T accepted | Hard reject candidate | Planner valid |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for row in planner_summary["latest_rows"]:
+            lines.append(
+                f"| {row['scope']} | {planner_markdown_value(row['cell_count'])} | "
+                f"{planner_markdown_value(row['observation_zero'])} | "
+                f"{planner_markdown_value(row['observation_below_min'])} | "
+                f"{planner_markdown_value(row['observation_ready'])} | "
+                f"{planner_markdown_value(row['elevation_known'])} | "
+                f"{planner_markdown_value(row['features_known'])} | "
+                f"{planner_markdown_value(row['slope_over_limit'])} | "
+                f"{planner_markdown_value(row['slope_at_or_above_mapper_limit'])} | "
+                f"{planner_markdown_value(row['roughness_over_limit'])} | "
+                f"{planner_markdown_value(row['traversability_zero'])} | "
+                f"{planner_markdown_value(row['traversability_below_min_nonzero'])} | "
+                f"{planner_markdown_value(row['traversability_at_or_above_min'])} | "
+                f"{planner_markdown_value(row['hard_reject_candidate'])} | "
+                f"{planner_markdown_value(row['planner_valid'])} |"
+            )
+        lines.extend(
+            [
+                "",
+                "Layer counts overlap. Hole-filled cells can have known elevation "
+                "below the observation threshold.",
+                "",
+                "| Endpoint | Inside | Exact valid | Valid in snap square | Snapped | Grid | World position |",
+                "| --- | --- | --- | ---: | --- | --- | --- |",
+            ]
+        )
+        endpoint_rows = [
+            row
+            for row in planner_summary["latest_rows"]
+            if row["scope"] in {"start", "goal"}
+        ]
+        for row in endpoint_rows:
+            lines.append(
+                f"| {row['scope']} | {row['inside_map']} | "
+                f"{row['exact_cell_valid']} | "
+                f"{planner_markdown_value(row['valid_cells_in_snap_square'])} | "
+                f"{row['snapped']} | ({row['grid_x']}, {row['grid_y']}) | "
+                f"({row['world_x']}, {row['world_y']}) |"
+            )
+    else:
+        lines.extend(["", "No completed planner input inspection was captured."])
 
     lines.extend(
         [
@@ -872,13 +1792,13 @@ def generate_report(session: Path, output_dir: Path) -> tuple[Path, Path, Path, 
             "",
             "The analyzer does not modify raw files. Review `events.jsonl`, `topic_rates.csv`, "
             "`odom_position.csv`, `body_odom_pose.csv`, `sdk2_commands.csv`, `process_health.csv`, "
-            "`rosout_warn_error.txt`, parameter dumps, "
+            "`planner_input_inspections.jsonl`, `rosout_warn_error.txt`, parameter dumps, "
             "and the Git/network/environment snapshots alongside this report.",
             "",
         ]
     )
     write_text_atomic(report_path, "\n".join(lines))
-    return report_path, rate_csv, process_csv, sdk2_csv, odometry_csv
+    return report_path, rate_csv, process_csv, sdk2_csv, odometry_csv, planner_csv
 
 
 def main() -> int:
@@ -889,12 +1809,15 @@ def main() -> int:
     if not (session / "metadata.json").is_file():
         raise SystemExit(f"not a go2-log session (metadata.json is missing): {session}")
     output_dir = (args.output_dir or (session / "analysis")).expanduser().resolve()
-    report, rate_csv, process_csv, sdk2_csv, odometry_csv = generate_report(session, output_dir)
+    report, rate_csv, process_csv, sdk2_csv, odometry_csv, planner_csv = (
+        generate_report(session, output_dir)
+    )
     print(f"Report: {report}")
     print(f"Topic summary: {rate_csv}")
     print(f"Process summary: {process_csv}")
     print(f"SDK2 summary: {sdk2_csv}")
     print(f"Body odometry audit: {odometry_csv}")
+    print(f"Planner input summary: {planner_csv}")
     return 0
 
 

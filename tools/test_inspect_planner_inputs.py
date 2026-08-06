@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 from inspect_planner_inputs import (
@@ -15,6 +19,9 @@ from inspect_planner_inputs import (
     _diagnosis_exit_code,
     _capture_runtime_messages,
     _capture_stage,
+    _write_session_record_atomic,
+    _grid_snapshot,
+    _terrain_layer_stats,
     analyze_planner_inputs,
 )
 
@@ -41,7 +48,9 @@ def make_grid(
         unknown_value=UNKNOWN,
         elevation=[0.0] * cells,
         slope=[0.0] * cells,
+        roughness=[0.0] * cells,
         traversability=[1.0] * cells,
+        observation_count=[4] * cells,
     )
 
 
@@ -121,6 +130,221 @@ def make_specs() -> dict[str, SubscriptionSpec]:
 
 
 class PlannerInputInspectionTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "session append uses POSIX locking")
+    def test_session_record_is_appended_as_durable_jsonl(self) -> None:
+        result = analyze_planner_inputs(
+            make_grid(),
+            pose(1.5, 1.5),
+            None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "planner_input_inspections.jsonl"
+            _write_session_record_atomic(
+                path,
+                Path(directory),
+                0,
+                inspection=result,
+                recorded_at="2026-08-06T00:00:00+00:00",
+            )
+            _write_session_record_atomic(
+                path,
+                Path(directory),
+                2,
+                inspection=result,
+                recorded_at="2026-08-06T00:00:01+00:00",
+            )
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["schema_version"], 1)
+        self.assertEqual(records[0]["status"], "ok")
+        self.assertEqual(
+            records[0]["inspection"]["diagnosis"],
+            "start_ready_waiting_for_goal",
+        )
+        self.assertEqual(records[1]["status"], "diagnostic_failure")
+        self.assertEqual(
+            records[1]["recorded_at"],
+            "2026-08-06T00:00:01+00:00",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "session append uses POSIX files")
+    def test_session_record_rejects_unsafe_existing_payloads(self) -> None:
+        result = analyze_planner_inputs(
+            make_grid(),
+            pose(1.5, 1.5),
+            None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "planner_input_inspections.jsonl"
+            unsafe = b'{"schema_version":1}\n\0'
+            path.write_bytes(unsafe)
+            with self.assertRaisesRegex(ValueError, "NUL"):
+                _write_session_record_atomic(
+                    path,
+                    root,
+                    0,
+                    inspection=result,
+                )
+            self.assertEqual(path.read_bytes(), unsafe)
+
+            target = root / "other.jsonl"
+            target.write_text("", encoding="utf-8")
+            path.unlink()
+            path.symlink_to(target)
+            with self.assertRaises(OSError):
+                _write_session_record_atomic(
+                    path,
+                    root,
+                    0,
+                    inspection=result,
+                )
+            self.assertEqual(target.read_text(encoding="utf-8"), "")
+
+    @unittest.skipUnless(os.name == "posix", "session append uses POSIX files")
+    def test_session_record_rejects_nonfinite_json(self) -> None:
+        result = analyze_planner_inputs(
+            make_grid(),
+            pose(1.5, 1.5),
+            None,
+        )
+        result["thresholds"]["max_slope"] = float("nan")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "planner_input_inspections.jsonl"
+            with self.assertRaisesRegex(ValueError, "JSON"):
+                _write_session_record_atomic(
+                    path,
+                    root,
+                    0,
+                    inspection=result,
+                )
+            self.assertFalse(path.exists())
+
+    def test_observation_buckets_are_exhaustive(self) -> None:
+        grid = replace(
+            make_grid(width=5, height=1),
+            observation_count=[0, 1, 3, 4, 8],
+        )
+        stats = _terrain_layer_stats(
+            grid,
+            PlannerThresholds(min_observed_frames=4),
+        )
+        self.assertEqual(stats["cell_count"], 5)
+        self.assertEqual(stats["observation_zero"], 1)
+        self.assertEqual(stats["observation_below_min"], 2)
+        self.assertEqual(stats["observation_ready"], 2)
+
+    def test_known_elevation_is_distinct_from_known_features(self) -> None:
+        grid = replace(
+            make_grid(width=1, height=1),
+            observation_count=[0],
+            slope=[UNKNOWN],
+            traversability=[UNKNOWN],
+        )
+        stats = _terrain_layer_stats(grid, PlannerThresholds())
+        self.assertEqual(stats["elevation_known"], 1)
+        self.assertEqual(stats["features_known"], 0)
+        self.assertEqual(stats["observation_zero"], 1)
+
+    def test_threshold_rejection_counts_are_independent(self) -> None:
+        grid = replace(
+            make_grid(width=5, height=1),
+            slope=[0.66, 0.0, 0.0, 0.0, 0.0],
+            roughness=[0.0, 0.081, 0.0, 0.0, 0.0],
+            traversability=[1.0, 1.0, 0.10, 0.18, 1.0],
+        )
+        stats = _terrain_layer_stats(grid, PlannerThresholds())
+        self.assertEqual(stats["slope_over_limit"], 1)
+        self.assertEqual(stats["roughness_over_limit"], 1)
+        self.assertEqual(stats["traversability_below_min_nonzero"], 1)
+        self.assertEqual(stats["traversability_at_or_above_min"], 4)
+        self.assertEqual(stats["planner_valid"], 3)
+
+    def test_hard_rejection_candidate_uses_strict_feature_limits(self) -> None:
+        grid = replace(
+            make_grid(width=3, height=1),
+            slope=[0.10, 0.65, 0.10],
+            roughness=[0.01, 0.01, 0.08],
+            traversability=[0.0, 0.0, 0.0],
+        )
+        stats = _terrain_layer_stats(grid, PlannerThresholds())
+        self.assertEqual(stats["traversability_zero"], 3)
+        self.assertEqual(
+            stats[
+                "zero_traversability_with_slope_and_roughness_below_limits"
+            ],
+            1,
+        )
+
+    def test_hard_rejection_uses_mapper_not_planner_slope_limit(self) -> None:
+        grid = replace(
+            make_grid(width=1, height=1),
+            slope=[0.60],
+            roughness=[0.01],
+            traversability=[0.0],
+        )
+        stats = _terrain_layer_stats(
+            grid,
+            PlannerThresholds(max_slope=0.70, mapper_max_slope=0.50),
+        )
+        self.assertEqual(stats["slope_over_limit"], 0)
+        self.assertEqual(stats["slope_at_or_above_mapper_limit"], 1)
+        self.assertEqual(
+            stats[
+                "zero_traversability_with_slope_and_roughness_below_limits"
+            ],
+            0,
+        )
+
+    def test_snap_square_layer_stats_are_local_and_map_clipped(self) -> None:
+        observation_count = [4] * 25
+        observation_count[0] = 0
+        observation_count[24] = 1
+        grid = replace(
+            make_grid(width=5, height=5, resolution=0.1),
+            observation_count=observation_count,
+        )
+        result = analyze_planner_inputs(
+            grid,
+            pose(0.05, 0.05),
+            pose(0.45, 0.45),
+            PlannerThresholds(snap_radius=0.1),
+        )
+        global_stats = result["map"]["terrain_layers"]
+        start_stats = result["start"]["snap_square_terrain_layers"]
+        goal_stats = result["goal"]["snap_square_terrain_layers"]
+        self.assertEqual(global_stats["observation_zero"], 1)
+        self.assertEqual(global_stats["observation_below_min"], 1)
+        self.assertEqual(start_stats["cell_count"], 4)
+        self.assertEqual(start_stats["observation_zero"], 1)
+        self.assertEqual(start_stats["observation_below_min"], 0)
+        self.assertEqual(goal_stats["cell_count"], 4)
+        self.assertEqual(goal_stats["observation_zero"], 0)
+        self.assertEqual(goal_stats["observation_below_min"], 1)
+
+    def test_grid_snapshot_captures_diagnostic_layers(self) -> None:
+        message = SimpleNamespace(
+            header=SimpleNamespace(
+                frame_id="world",
+                stamp=SimpleNamespace(sec=2, nanosec=3),
+            ),
+            resolution=0.1,
+            width=1,
+            height=1,
+            origin_x=-1.0,
+            origin_y=-2.0,
+            unknown_value=UNKNOWN,
+            elevation=[0.2],
+            slope=[0.1],
+            roughness=[0.02],
+            traversability=[0.7],
+            observation_count=[6],
+        )
+        snapshot = _grid_snapshot(message)
+        self.assertEqual(snapshot.roughness, [0.02])
+        self.assertEqual(snapshot.observation_count, [6])
+
     def test_exit_codes_distinguish_ready_from_rejected_diagnoses(self) -> None:
         self.assertEqual(
             _diagnosis_exit_code(
@@ -338,6 +562,20 @@ class PlannerInputInspectionTests(unittest.TestCase):
         grid = replace(make_grid(), slope=[0.0])
         with self.assertRaisesRegex(ValueError, "slope length"):
             analyze_planner_inputs(grid, pose(1.5, 1.5), None)
+
+    def test_malformed_diagnostic_layers_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "roughness length"):
+            analyze_planner_inputs(
+                replace(make_grid(), roughness=[0.0]),
+                pose(1.5, 1.5),
+                None,
+            )
+        with self.assertRaisesRegex(ValueError, "observation_count length"):
+            analyze_planner_inputs(
+                replace(make_grid(), observation_count=[4]),
+                pose(1.5, 1.5),
+                None,
+            )
 
     def test_nonfinite_goal_position_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "goal x must be finite"):
