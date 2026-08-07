@@ -55,7 +55,8 @@ git -c http.proxy=http://192.168.151.143:7890 \
 ~/catkin_ws/GO2_Hesai/src/
 ```
 
-如果这个独立工作空间已经克隆过仓库，拉取 ROS2 分支：
+如果这个独立工作空间已经克隆过仓库，先确认机器人节点和诊断会话均已停止，再拉取并增量
+构建 ROS2 分支：
 
 ```bash
 cd ~/catkin_ws
@@ -63,7 +64,21 @@ test "$(git branch --show-current)" = ROS2 || exit 1
 git -c http.proxy=http://192.168.151.143:7890 \
   -c https.proxy=http://192.168.151.143:7890 \
   pull --ff-only origin ROS2
+
+source /opt/ros/humble/setup.bash
+MAKEFLAGS=-j2 colcon build \
+  --symlink-install \
+  --executor sequential \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
 ```
+
+`git pull` 只更新源码，不能替代编译。上面的完整工作空间增量构建会让 colcon 检查所有包，
+避免某次更新涉及 Hesai、IMU、Super-LIO、规划或 SDK2 bridge 时遗漏对应二进制；未改变的构建
+产物仍由 colcon 复用。它也确保本轮 freshness、watchdog 和空路径撤销逻辑进入 `install/`。
+构建失败时不要启动机器人节点，也不要通过只修改 YAML 绕过旧二进制。
+更新后若使用可选的全局 `go2-log` 副本，还必须按“诊断日志”一节重新安装；标准流程始终使用
+仓库内的 `./tools/go2-log`。
 
 这些代理设置只作用于单条 Git 命令，不写入全局配置。如果现场网络可直接访问
 GitHub，可以省略两个 `-c ...proxy=...` 参数。
@@ -434,13 +449,23 @@ pgrep -af \
 
 ### 1. Jetson 终端 1：启动无界面 SLAM
 
+当前 XT-16 平地集成的日常候选模式是 `dense=true`。它已经通过连续 10 帧起点门禁，但仍只用于
+静止和短距离无运动规划验证，不代表允许启动 SDK2 bridge。日常启动使用：
+
+```bash
+cd ~/catkin_ws
+GO2_LIO_DENSE_OUTPUT=true ./shell/start_slam.sh
+```
+
+#### 首次部署或相关配置变更后的 dense A/B
+
+只有首次部署，或修改 Super-LIO、点云发布、DDS/RViz 负载路径及相关硬件后，才重新执行完整
+A/B。第一轮必须保持 Hesai 配置中的 `lio.output.dense: false`，并用显式开关让日志标记基线：
+
 ```bash
 cd ~/catkin_ws
 GO2_LIO_DENSE_OUTPUT=false ./shell/start_slam.sh
 ```
-
-平地闭环第一轮必须保持 Hesai 配置中的 `lio.output.dense: false`；上面的显式开关会让
-日志明确标记该轮为基线。
 
 完成基线连续起点检查后，无论结果是否通过，都停止该轮全部节点和日志会话，再用下面的
 命令新开第二轮，让 `/lio/cloud_world` 发布完整去畸变帧：
@@ -466,8 +491,8 @@ PointCloud 显示，再核对 `/lio/odom` 和 `/lio/cloud_world` 频率。不要
 ... Map init done
 ```
 
-`Map init done` 后在另一个 Jetson 终端确认本轮实际参数；第一轮 dense 必须为 `False`，
-第二轮对照必须为 `True`，`pub_step` 两轮都必须为 `1`：
+`Map init done` 后在另一个 Jetson 终端确认本轮实际参数；A/B 第一轮 dense 必须为 `False`，
+第二轮对照必须为 `True`，当前日常单轮必须为 `True`，`pub_step` 始终必须为 `1`：
 
 ```bash
 cd ~/catkin_ws
@@ -505,6 +530,46 @@ body_lattice_planner_node
 启动瞬间出现一次 `Waiting for odometry` 是正常的；如果持续出现，检查
 `/lio/body_odom` 和 Fast DDS profile。
 
+规划层按传感器时间戳而不是消息到达时间判断输入是否可用。默认运行契约如下：
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `terrain_mapper.resolution` | `0.20 m` | 真实地形地图每个栅格单元的边长 |
+| `body_lattice_planner.motion_step` | `0.20 m` | lattice 单次运动 primitive 的步长 |
+| `map_frame` | `world` | 地图、目标和里程计必须使用的世界坐标系 |
+| `body_frame` | `base_link` | `/lio/body_odom.child_frame_id` 必须使用的机身坐标系 |
+| `max_map_age` | `1.0 s` | 允许规划使用的最大地形图年龄 |
+| `max_odom_age` | `0.5 s` | 允许规划使用的最大机身里程计年龄 |
+| `timestamp_future_tolerance` | `0.2 s` | 跨主机时钟误差的最大未来容差 |
+| `input_watchdog_rate` | `10 Hz` | 没有新回调时检查活动路径的频率 |
+| `cloud_stale_warning_age` | `1.0 s` | mapper 对点云 source stamp 或接收间隔发出诊断警告的阈值 |
+
+`resolution` 和 `motion_step` 是两个独立参数；当前值恰好同为 `0.20 m`，不能用修改其中一个
+代替另一个。watchdog 周期还必须满足
+`1 / input_watchdog_rate <= min(max_map_age, max_odom_age)`；默认周期 `0.1 s` 小于
+`0.5 s` 的最严格输入年龄。违反该关系时规划节点会拒绝启动，而不是降低安全性继续运行。
+
+这些值是安全边界，不应通过放宽它们掩盖 SLAM 或 DDS 停更。mapper 的点云警告只用于区分
+“没有收到新 cloud”和“仍收到带旧 source stamp 的积压 cloud”；它不会伪造新时间戳。
+规划器在开始搜索、搜索过程中和发布前检查输入。任何 stale、future、frame mismatch、畸形地图
+或规划失败都会撤销已经发布的活动路径。
+
+规划节点启动后，在另一个 Jetson 终端核对运行中的参数，而不是只查看源码 YAML：
+
+```bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+
+ros2 param get /terrain_mapper resolution
+ros2 param get /body_lattice_planner motion_step
+ros2 param get /body_lattice_planner max_map_age
+ros2 param get /body_lattice_planner max_odom_age
+ros2 param get /body_lattice_planner input_watchdog_rate
+```
+
+应依次得到 `0.2`、`0.2`、`1.0`、`0.5` 和 `10.0`。节点不存在、参数读取失败或数值不一致时，
+停止本轮并检查 pull、build 和启动输出，不要继续发目标。
+
 ### 3. WSL2 终端：启动唯一 RViz
 
 ```bash
@@ -533,6 +598,20 @@ RViz 配置固定使用：
 
 WSLg 可能输出一条 GLSL sampler 警告。只要 RViz 进程仍存活且点云可见，该警告
 与 DDS 无关；如果仅代价地图贴图异常，再单独排查 WSLg 渲染。
+
+#### RViz PointCloud 负载复测
+
+首次 dense A/B 必须关闭 `Super-LIO World Cloud` 显示。选定 dense 模式并通过平地起点门禁后，
+如果要判断 WSL2 RViz 点云显示是否加重 Jetson/DDS 负载，使用三个完全独立的静止会话：
+
+1. `PointCloud OFF`；
+2. `PointCloud ON`；
+3. `PointCloud OFF recovery`。
+
+三轮只切换 RViz 中 `Super-LIO World Cloud` 的 `Enabled` 复选框。不要修改 Best Effort、
+Volatile、Depth `5` 或 Decay Time `10`，不要发目标，也不要启动 SDK2 bridge 或 RL controller。
+每轮保持相同代码、dense 模式、机器人姿态和场景，至少覆盖三个日志采集周期。每轮结束后先停止
+规划与 SLAM，再停止并上传该轮独立日志；机器人节点运行期间不要执行 Git 或日志上传。
 
 ### 4. 从 WSL2 验证实时数据
 
@@ -566,9 +645,38 @@ timeout 15 ros2 topic echo --no-daemon --once \
 状态时直接拒绝采集。
 
 Jetson 和 WSL2 必须使用同步的系统时钟且 `use_sim_time` 设置一致，否则跨主机发布的
-目标可能被检查器标记为 `goal_stale` 或 `goal_stamp_from_future`。这些新鲜度、odom frame
-和 child frame 判定属于项目检查契约；当前 `body_lattice_planner` 运行节点自身只检查输入
-是否存在以及 goal frame 是否与 map frame 一致。
+目标可能被检查器标记为 `goal_stale` 或 `goal_stamp_from_future`。运行中的
+`body_lattice_planner` 自身也会检查 map/odom 时间新鲜度、未来时间戳、map/odom/goal frame
+和 odom child frame；检查器从运行节点读取同一组 freshness 参数，不能用本地默认值替代。
+
+发目标前，先在 Jetson 检查终端执行：
+
+```bash
+date --iso-8601=ns
+ros2 param get /terrain_mapper use_sim_time
+ros2 param get /body_lattice_planner use_sim_time
+
+timeout 10 ros2 topic delay --window 50 /lio/body_odom
+echo "jetson_delay_exit=$?"
+```
+
+再新开一个 WSL2 终端，按上面的 RViz 步骤加载 Humble 和同一 Fast DDS 环境后立即执行：
+
+```bash
+date --iso-8601=ns
+ros2 param get /rviz2 use_sim_time
+
+timeout 10 ros2 topic delay --window 50 /lio/body_odom
+echo "wsl_delay_exit=$?"
+```
+
+两端 `date` 只用于排除日期、时区或秒级明显偏移，不能单独证明满足 `0.2 s` 容差。三个
+`use_sim_time` 都应为 `False`。两端的 `ros2 topic delay` 都检查 `/lio/body_odom`；Jetson
+结果给出本机基线，WSL2 结果还包含跨主机 clock skew 和传输延迟。收到样本后被 `timeout`
+结束时退出 `124` 是正常的，但必须实际打印 delay 统计，不得出现低于 `-0.2 s` 的负延迟，
+正延迟应保持在 `0.5 s` odom 新鲜度预算内。没有样本或越界时停止在这里。即使预检通过，
+收到 RViz 目标后的 `planner-check` live timestamp 结论仍是最终 fail-closed 门禁；出现
+`goal_stale` 或 `goal_stamp_from_future` 时路径不获批准，也绝不启动运动。
 
 `start_slam.sh` 已启动诊断会话。在第三个 Jetson 终端使用统一日志入口，不要直接运行
 底层 Python 检查器：
@@ -590,7 +698,8 @@ cd ~/catkin_ws
 ./tools/go2-log planner-check --no-goal
 ```
 
-平地 A/B 先采集连续的起点和地图摘要，不需要在 RViz 发点：
+首次部署或相关配置变更后的平地 A/B，先采集连续的起点和地图摘要，不需要在 RViz 发点。
+日常候选 `dense=true` 每次启动后也必须先运行同一门禁，确认本轮数据仍可用：
 
 ```bash
 ./tools/go2-log planner-series --no-goal --samples 10 --interval 1.0
@@ -609,7 +718,7 @@ cd ~/catkin_ws
   `start_component_cells>0`；
 - 没有 capture error、frame mismatch、stale 或 timestamp future 诊断。
 
-`dense=false` 和 `dense=true` 两轮都必须采集。第一轮结束后，先在规划终端和 SLAM
+首次/变更后 A/B 的 `dense=false` 和 `dense=true` 两轮都必须采集。第一轮结束后，先在规划终端和 SLAM
 终端分别按 `Ctrl+C`，确认相关机器人节点全部退出，再执行 `./tools/go2-log stop`。第二轮
 必须创建新的诊断会话；`go2-log` 会拒绝在同一活动会话内切换 dense 模式，避免两组证据
 混在一起。所有机器人进程停止前不要上传日志。
@@ -619,6 +728,10 @@ cd ~/catkin_ws
 两轮都未通过时停止在这里，关闭节点并上传两场日志，不要发目标。若选定模式不是当前
 正在运行的第二轮模式，先正常停止第二轮和日志会话，再用选定模式新开一轮，并重新通过
 一次 `planner-series` 门禁。
+
+当前实机证据中只有 `dense=true` 连续 10 帧通过，所以它是现阶段日常候选。该选择只限定
+平地、静止、短距离无运动验证；如果后续 A/B 结果改变，必须保留独立日志并更新本节，不能在
+运行中的会话里临时切换模式。
 
 选定模式通过门禁且仍在运行后，才执行目标检查：
 
@@ -671,10 +784,17 @@ Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。检查器会�
 ros2 topic info -v /body_path
 timeout 10 ros2 topic echo --no-daemon --once \
   --qos-reliability reliable --qos-durability transient_local \
-  /body_path nav_msgs/msg/Path --field header
+  /body_path nav_msgs/msg/Path --field poses
+echo "path_echo_exit=$?"
 ```
 
-路径必须使用 `world`。检查器报告
+不要只检查 `header`：非空 `poses` 才表示当前存在活动路径；空 `poses` 表示规划器因输入过期、
+坐标系不匹配或规划失败而撤销了 transient-local 旧路径。如果该进程启动后从未成功规划，
+`/body_path` 可以完全没有消息，此时 `timeout` 返回 `124` 是正常结果。有效路径的
+`header.stamp` 使用 map/odom 中较旧的因果时间戳，而不是规划完成时的 `now()`；路径 frame
+必须为 `world`。
+
+检查器报告
 `same_continuous_ground_component_not_planner_approval` 只说明起点和目标位于同一个
 四邻域有效地形区域，且相邻格高程有限、台阶高度未超限。这个拓扑结果不复现
 规划器的航向格和 `0.20 m` motion primitive，也不检查 footprint 或整段碰撞，因此既不
@@ -710,7 +830,7 @@ pgrep -af \
 | `ROS_LOCALHOST_ONLY` | `0` | 允许跨主机 ROS 2 通信 |
 | `GO2_NETWORK_INTERFACE` | `enP8p1s0` | Unitree SDK2 LowState 网卡 |
 | `GO2_IMU_RATE` | `200.0` | IMU 最大发布频率，单位 Hz |
-| `GO2_LIO_DENSE_OUTPUT` | `false` | 平地 A/B 时设为 `true`，让 `/lio/cloud_world` 发布完整去畸变帧 |
+| `GO2_LIO_DENSE_OUTPUT` | 脚本默认 `false` | 当前日常候选须显式设为 `true`；首次/变更后 A/B 分别测试 `false` 与 `true` |
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
 | `UNITREE_SDK_LIBRARY_DIR` | `/usr/local/lib` | Unitree SDK 配套 DDS 动态库目录 |
 | `GO2_BODY_YAW_OFFSET_RAD` | `-1.5707963267948966` | IMU 到 `base_link` 的 yaw 校正 |
@@ -789,38 +909,49 @@ ros2 service call /go2_sdk2_bridge/enable_motion \
 
 ### 诊断日志
 
-三个启动脚本都会调用 `tools/go2-log start`。该命令是幂等的：同一会话已在采集时
+三个启动脚本都会调用仓库内的 `./tools/go2-log start`。该命令是幂等的：同一会话已在采集时
 不会重复创建进程。采集内容包括 Git 版本、ROS/DDS 环境、网络、参数、进程状态、
 关键小消息和频率摘要以及 `/rosout` 警告/错误；不会复制完整雷达点云、世界点云或
 `TerrainGrid`。
 
-如需使用简短的全局命令，可在 Jetson 安装一次：
+每轮还会写入以下有界健康摘要：
+
+- `process_health.csv`：各组件 PID、进程状态、区间 CPU、RSS 和线程数；
+- `topic_timing.csv`：`/lio/odom` 与 `/lio/body_odom` 的 5 秒 header/接收时序摘要；
+- `system_health.csv`：系统负载、可用内存、swap 和最高可读温度；
+- `network_health.csv`：非回环网卡状态、流量、错误和丢包计数；
+- `hesai_summary.csv`：Hesai 日志尾部的有界 raw-frame、点数、包数和警告/错误摘要。
+
+标准流程始终从仓库根目录调用当前版本：
 
 ```bash
-sudo install -m 0755 tools/go2-log /usr/local/bin/go2-log
+cd ~/catkin_ws
+./tools/go2-log status
 ```
 
-以下示例假定已安装该命令；未安装时把 `go2-log` 替换为 `./tools/go2-log`。
-
-运行期间只查看状态：
+如确实需要简短的全局命令，可以安装副本，但每次 `git pull` 后都必须再次执行安装命令，
+不能让新版采集器与旧版 stop/upload 混用：
 
 ```bash
-go2-log status
+cd ~/catkin_ws
+sudo install -m 0755 tools/go2-log /usr/local/bin/go2-log
 ```
 
 先停止 SLAM、规划和 SDK2 bridge，再停止并上传诊断会话：
 
 ```bash
-go2-log stop
-go2-log upload
+cd ~/catkin_ws
+./tools/go2-log stop
+./tools/go2-log upload
 ```
 
 如果旧会话因采集器文本文件末尾出现 NUL 字节而被 `upload` 拒绝，保持所有机器人
 进程停止，显式修复该会话后再上传：
 
 ```bash
-go2-log repair <session-id>
-go2-log upload <session-id>
+cd ~/catkin_ws
+./tools/go2-log repair <session-id>
+./tools/go2-log upload <session-id>
 ```
 
 `repair` 只接受“完整 UTF-8 行之后连续到文件末尾”的 NUL 后缀；中间 NUL、未完整
@@ -866,8 +997,13 @@ python .\tools\analyze_diagnostics.py `
   D:\G02_log\sessions\<session-id>
 ```
 
-分析器生成 Markdown 报告、话题/进程/SDK2 汇总、`body_odometry_audit.csv` 和
-`planner_input_summary.csv`。后者展开每次实机规划检查的全图、起点与目标局部层统计；
+分析器生成 `analysis/report.md`、`analysis/topic_rates_summary.csv`、
+`analysis/process_health_summary.csv`、`analysis/sdk2_command_summary.csv`、
+`analysis/body_odometry_audit.csv`、`analysis/planner_input_summary.csv` 和
+`analysis/planner_input_series_summary.csv`。存在相应原始输入时，还会生成
+`analysis/topic_timing_summary.csv`、`analysis/system_health_summary.csv`、
+`analysis/network_health_summary.csv` 和 `analysis/hesai_driver_summary.csv`。planner 汇总展开
+每次实机规划检查的全图、起点与目标局部层统计；
 原始 `planner_input_inspections.jsonl` 保持不变。分析器同时核对实机原始与校正里程计的
 时间戳、frame、四元数及 yaw 偏置。PCD、rosbag 和 core dump
 不得进入 Git；用 SCP 分别传到 `D:\GO2_Data\maps`、`D:\GO2_Data\bags` 和

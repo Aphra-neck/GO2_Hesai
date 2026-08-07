@@ -16,6 +16,7 @@ from analyze_diagnostics import (
     read_jsonl,
     summarize_planner_inspections,
     summarize_planner_series,
+    summarize_topic_timing,
 )
 from inspect_planner_inputs import (
     GridSnapshot,
@@ -834,6 +835,178 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertIn("Accepted records: 0", report)
         self.assertIn("No completed planner input inspection was captured.", report)
+
+
+class ResourceDiagnosticsAnalysisTests(unittest.TestCase):
+    def test_topic_timing_preserves_future_header_age(self) -> None:
+        summaries = summarize_topic_timing(
+            [
+                {
+                    "topic": "/lio/odom",
+                    "status": "ok",
+                    "window_duration_sec": "5",
+                    "message_count": "5",
+                    "latest_header_age_ms": "-25.5",
+                },
+                {
+                    "topic": "/lio/odom",
+                    "status": "ok",
+                    "window_duration_sec": "5",
+                    "message_count": "5",
+                    "latest_header_age_ms": "40.0",
+                },
+            ]
+        )
+
+        self.assertEqual(summaries[0]["min_latest_header_age_ms"], "-25.500000")
+        self.assertEqual(summaries[0]["max_latest_header_age_ms"], "40.000000")
+
+    def test_report_summarizes_new_runtime_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "sessions" / "resource-session"
+            output = session / "analysis"
+            session.mkdir(parents=True)
+            (session / "metadata.json").write_text(
+                json.dumps({"session_id": "resource-session"}),
+                encoding="utf-8",
+            )
+            (session / "process_health.csv").write_text(
+                "timestamp,component,running,pids,states,cpu_percent_interval,"
+                "rss_kib,threads,metrics_status\n"
+                "2026-08-07T00:00:00Z,super_lio,1,101,101:S,,1000,4,baseline\n"
+                "2026-08-07T00:00:05Z,super_lio,1,101,101:S,25.5,1200,5,ok\n"
+                "2026-08-07T00:00:10Z,super_lio,1,101,101:R,50.5,1400,6,partial\n",
+                encoding="utf-8",
+            )
+            (session / "topic_timing.csv").write_text(
+                "window_end,window_duration_sec,topic,status,message_count,"
+                "first_receive_ns,last_receive_ns,first_header_ns,last_header_ns,"
+                "latest_header_age_ms,header_span_ms,first_local_sequence,"
+                "last_local_sequence,unique_header_count,duplicate_header_count,"
+                "nonmonotonic_header_count,invalid_header_count,min_header_gap_ms,"
+                "max_header_gap_ms,max_receive_gap_ms\n"
+                "2026-08-07T00:00:05Z,5,/lio/odom,ok,6,1,6,1,6,12,5000,1,6,"
+                "5,1,1,0,90,110,150\n"
+                "2026-08-07T00:00:10Z,5,/lio/odom,ok,11,7,17,7,17,18,5000,1,11,"
+                "11,0,0,1,80,120,220\n"
+                "2026-08-07T00:00:10Z,5,/lio/body_odom,no_data,0,,,,,,,,,0,0,0,0,,,\n",
+                encoding="utf-8",
+            )
+            (session / "system_health.csv").write_text(
+                "timestamp,monotonic_ns,load1,load5,load15,mem_available_kib,"
+                "swap_free_kib,thermal_max_millic,thermal_zone,status\n"
+                "2026-08-07T00:00:00Z,1,1.0,0.8,0.5,4000000,2000000,55000,cpu,ok\n"
+                "2026-08-07T00:00:05Z,2,2.5,1.2,0.7,3500000,1500000,62000,gpu,partial\n",
+                encoding="utf-8",
+            )
+            (session / "network_health.csv").write_text(
+                "timestamp,monotonic_ns,interface,operstate,carrier,rx_bytes,"
+                "rx_packets,rx_errors,rx_dropped,tx_bytes,tx_packets,tx_errors,"
+                "tx_dropped,status\n"
+                "2026-08-07T00:00:00Z,1,enP8p1s0,up,1,1000,10,1,2,2000,20,0,1,ok\n"
+                "2026-08-07T00:00:05Z,2,enP8p1s0,up,1,1600,16,3,5,2900,29,1,3,ok\n",
+                encoding="utf-8",
+            )
+            (session / "hesai_summary.csv").write_text(
+                "timestamp,status,file_size_bytes,mtime_epoch,last_frame,frame_delta,"
+                "last_points,last_packets,last_start_time,last_end_time,"
+                "tail_warning_lines,tail_error_lines\n"
+                "2026-08-07T00:00:00Z,ok,10000,1,100,,64000,500,10.0,10.1,1,0\n"
+                "2026-08-07T00:00:05Z,ok,12000,2,110,10,64000,500,10.5,10.6,2,1\n",
+                encoding="utf-8",
+            )
+
+            products = generate_report(session, output)
+            report = products[0].read_text(encoding="utf-8")
+            with (output / "process_health_summary.csv").open(
+                encoding="utf-8", newline=""
+            ) as stream:
+                process_rows = list(csv.DictReader(stream))
+            with (output / "topic_timing_summary.csv").open(
+                encoding="utf-8", newline=""
+            ) as stream:
+                timing_rows = list(csv.DictReader(stream))
+            with (output / "system_health_summary.csv").open(
+                encoding="utf-8", newline=""
+            ) as stream:
+                system_rows = list(csv.DictReader(stream))
+            with (output / "network_health_summary.csv").open(
+                encoding="utf-8", newline=""
+            ) as stream:
+                network_rows = list(csv.DictReader(stream))
+            with (output / "hesai_driver_summary.csv").open(
+                encoding="utf-8", newline=""
+            ) as stream:
+                hesai_rows = list(csv.DictReader(stream))
+
+        self.assertEqual(len(products), 7)
+        self.assertEqual(process_rows[0]["cpu_samples"], "2")
+        self.assertEqual(process_rows[0]["mean_cpu_percent"], "38.000000")
+        self.assertEqual(process_rows[0]["max_rss_kib"], "1400.000000")
+        self.assertEqual(process_rows[0]["max_threads"], "6")
+        self.assertEqual(process_rows[0]["last_states"], "101:R")
+        self.assertEqual(timing_rows[0]["topic"], "/lio/odom")
+        self.assertEqual(timing_rows[0]["total_messages"], "17")
+        self.assertEqual(timing_rows[0]["duplicate_headers"], "1")
+        self.assertEqual(timing_rows[0]["nonmonotonic_headers"], "1")
+        self.assertEqual(timing_rows[0]["invalid_headers"], "1")
+        self.assertEqual(timing_rows[0]["max_receive_gap_ms"], "220.000000")
+        self.assertEqual(system_rows[0]["max_load1"], "2.500000")
+        self.assertEqual(system_rows[0]["min_mem_available_kib"], "3500000.000000")
+        self.assertEqual(system_rows[0]["max_thermal_millic"], "62000.000000")
+        self.assertEqual(network_rows[0]["rx_bytes_delta"], "600")
+        self.assertEqual(network_rows[0]["rx_errors_delta"], "2")
+        self.assertEqual(network_rows[0]["tx_dropped_delta"], "2")
+        self.assertEqual(hesai_rows[0]["frame_advance_total"], "10")
+        self.assertEqual(hesai_rows[0]["last_frame"], "110")
+        self.assertEqual(hesai_rows[0]["max_tail_error_lines"], "1")
+        self.assertIn("## Topic Timing", report)
+        self.assertIn("## System Health", report)
+        self.assertIn("## Network Health", report)
+        self.assertIn("## Hesai Driver Summary", report)
+        self.assertIn("Mean CPU %", report)
+
+    def test_legacy_process_rows_and_missing_new_files_remain_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory) / "sessions" / "legacy-session"
+            output = session / "analysis"
+            session.mkdir(parents=True)
+            (session / "metadata.json").write_text(
+                json.dumps({"session_id": "legacy-session"}),
+                encoding="utf-8",
+            )
+            (session / "process_health.csv").write_text(
+                "timestamp,component,running,pids\n"
+                "2026-08-06T00:00:00Z,super_lio,1,42\n",
+                encoding="utf-8",
+            )
+
+            products = generate_report(session, output)
+            report = products[0].read_text(encoding="utf-8")
+            with products[2].open(encoding="utf-8", newline="") as stream:
+                process_rows = list(csv.DictReader(stream))
+            with (output / "topic_timing_summary.csv").open(
+                encoding="utf-8", newline=""
+            ) as stream:
+                timing_rows = list(csv.DictReader(stream))
+            with (output / "network_health_summary.csv").open(
+                encoding="utf-8", newline=""
+            ) as stream:
+                network_rows = list(csv.DictReader(stream))
+
+        self.assertEqual(len(products), 7)
+        self.assertEqual(process_rows[0]["last_state"], "running")
+        self.assertEqual(process_rows[0]["last_pids"], "42")
+        self.assertEqual(process_rows[0]["cpu_samples"], "0")
+        self.assertEqual(process_rows[0]["mean_cpu_percent"], "")
+        self.assertEqual(process_rows[0]["max_rss_kib"], "")
+        self.assertEqual(timing_rows, [])
+        self.assertEqual(network_rows, [])
+        self.assertIn("## Topic Timing", report)
+        self.assertIn("No topic timing windows were captured.", report)
+        self.assertIn("No system health samples were captured.", report)
+        self.assertIn("No network health samples were captured.", report)
+        self.assertIn("No Hesai driver samples were captured.", report)
 
 
 if __name__ == "__main__":

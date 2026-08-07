@@ -38,6 +38,11 @@ struct QueueItem
   std::uint64_t key{0};
   bool operator<(const QueueItem & other) const {return f > other.f;}
 };
+
+bool finiteWorldState(const WorldState & state)
+{
+  return std::isfinite(state.x) && std::isfinite(state.y) && std::isfinite(state.yaw);
+}
 }  // namespace
 
 LatticePlanner::LatticePlanner(LatticePlannerConfig config) : config_(std::move(config))
@@ -57,18 +62,45 @@ bool LatticePlanner::hasMap() const noexcept {return static_cast<bool>(map_);}
 
 bool LatticePlanner::mapValid() const
 {
-  if (!map_ || map_->resolution <= 0.0F || map_->width == 0 || map_->height == 0) {
+  if (!map_ || !std::isfinite(map_->resolution) || map_->resolution <= 0.0F ||
+    !std::isfinite(map_->origin_x) || !std::isfinite(map_->origin_y) ||
+    !std::isfinite(map_->unknown_value) || map_->width == 0 || map_->height == 0)
+  {
     return false;
   }
   const std::size_t expected = static_cast<std::size_t>(map_->width) * map_->height;
-  return map_->elevation.size() == expected && map_->slope.size() == expected &&
-         map_->traversability.size() == expected;
+  if (map_->elevation.size() != expected || map_->slope.size() != expected ||
+    map_->traversability.size() != expected)
+  {
+    return false;
+  }
+  for (std::size_t index = 0; index < expected; ++index) {
+    const float elevation = map_->elevation[index];
+    const float slope = map_->slope[index];
+    const float traversability = map_->traversability[index];
+    if (!std::isfinite(elevation) || !std::isfinite(slope) ||
+      !std::isfinite(traversability))
+    {
+      return false;
+    }
+    if (slope != map_->unknown_value && slope < 0.0F) {return false;}
+    if (traversability != map_->unknown_value &&
+      (traversability < 0.0F || traversability > 1.0F))
+    {
+      return false;
+    }
+  }
+  return true;
 }
 
-PlanningResult LatticePlanner::plan(const WorldState & start_world, const WorldState & goal_world) const
+PlanningResult LatticePlanner::plan(
+  const WorldState & start_world, const WorldState & goal_world,
+  const std::function<bool()> & cancellation_requested) const
 {
   PlanningResult result;
-  if (!mapValid()) {return result;}
+  if (!mapValid() || !finiteWorldState(start_world) || !finiteWorldState(goal_world)) {
+    return result;
+  }
 
   GridState start;
   GridState goal;
@@ -100,6 +132,7 @@ PlanningResult LatticePlanner::plan(const WorldState & start_world, const WorldS
   std::uint64_t reached_key = 0;
 
   while (!open.empty() && result.expansions < config_.max_expansions) {
+    if (cancellation_requested && cancellation_requested()) {return result;}
     const QueueItem item = open.top();
     open.pop();
     auto current_record = records.find(item.key);
@@ -203,7 +236,8 @@ bool LatticePlanner::validCell(int x, int y) const
 {
   if (!inside(x, y)) {return false;}
   const std::size_t i = cellAddress(x, y);
-  return map_->traversability[i] != map_->unknown_value &&
+  return map_->elevation[i] != map_->unknown_value &&
+         map_->traversability[i] != map_->unknown_value &&
          map_->traversability[i] >= config_.min_traversability &&
          map_->slope[i] != map_->unknown_value && map_->slope[i] <= config_.max_slope;
 }

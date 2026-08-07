@@ -40,6 +40,8 @@ readonly SESSION_MAX_BYTES=$((100 * 1024 * 1024))
 readonly MAX_GIT_FILE_BYTES=$((40 * 1024 * 1024))
 readonly COMMAND_CAPTURE_BYTES=$((4 * 1024 * 1024))
 readonly PLANNER_RECORD_HEADROOM_BYTES=$((1 * 1024 * 1024))
+readonly TOPIC_TIMING_MAX_BYTES=$((4 * 1024 * 1024))
+readonly HESAI_TAIL_BYTES=$((256 * 1024))
 readonly MAX_LOCAL_SESSIONS=20
 
 PLANNER_RESULT_FILE=''
@@ -70,6 +72,10 @@ declare -ar REPAIRABLE_SESSION_TEXT_FILES=(
   'body_odom_pose.csv'
   'sdk2_commands.csv'
   'process_health.csv'
+  'topic_timing.csv'
+  'system_health.csv'
+  'network_health.csv'
+  'hesai_summary.csv'
   'events.jsonl'
   'planner_input_inspections.jsonl'
   'rosout_warn_error.txt'
@@ -266,7 +272,7 @@ enforce_session_size_limit() {
   while IFS= read -r -d '' path; do
     cap_text_file "${path}" $((512 * 1024))
   done < <(find "${session_dir}" -maxdepth 1 -type f -name 'parameters_*.yaml' -print0)
-  for path in topic_rates.csv odom_position.csv body_odom_pose.csv sdk2_commands.csv process_health.csv events.jsonl; do
+  for path in topic_rates.csv odom_position.csv body_odom_pose.csv sdk2_commands.csv process_health.csv topic_timing.csv system_health.csv network_health.csv hesai_summary.csv events.jsonl; do
     [[ "${protect_repair_outputs}" != true ]] || continue
     cap_text_file "${session_dir}/${path}" $((8 * 1024 * 1024))
   done
@@ -284,12 +290,15 @@ owned_names = {
     "git.txt", "ros_dds_environment.txt", "network.txt", "system.txt",
     "topics.txt", "nodes.txt", "rosout_warn_error.txt", "collector.log",
     "topic_rates.csv", "odom_position.csv", "body_odom_pose.csv", "sdk2_commands.csv",
-    "process_health.csv", "events.jsonl", "capacity_reached.txt",
-    "rosout.identity",
+    "process_health.csv", "topic_timing.csv", "system_health.csv",
+    "network_health.csv", "hesai_summary.csv", "events.jsonl",
+    "capacity_reached.txt", "topic_timing_capacity_reached.txt",
+    "rosout.identity", "timing.identity",
 }
 repair_protected_names = {
     "topic_rates.csv", "odom_position.csv", "body_odom_pose.csv",
-    "sdk2_commands.csv", "process_health.csv", "events.jsonl",
+    "sdk2_commands.csv", "process_health.csv", "topic_timing.csv",
+    "system_health.csv", "network_health.csv", "hesai_summary.csv", "events.jsonl",
     "rosout_warn_error.txt", "collector.log",
 }
 protect_repair_outputs = (root / "repair_manifest.jsonl").is_file()
@@ -356,14 +365,15 @@ collector_is_running() {
     [[ "${command_line}" == *"${session_dir}"* ]]
 }
 
-rosout_identity_matches() {
+diagnostic_writer_identity_matches() {
   local pid="$1"
   local expected_boot_id="$2"
   local expected_start_ticks="$3"
   local session_dir="$4"
+  local subcommand="$5"
   [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ -n "${expected_boot_id}" && "${expected_start_ticks}" =~ ^[0-9]+$ ]] || return 1
-  [[ -n "${session_dir}" ]] || return 1
+  [[ -n "${session_dir}" && "${subcommand}" == _* ]] || return 1
   [[ "$(boot_id 2>/dev/null || true)" == "${expected_boot_id}" ]] || return 1
   kill -0 "${pid}" 2>/dev/null || return 1
   [[ "$(process_start_ticks "${pid}" 2>/dev/null || true)" == "${expected_start_ticks}" ]] || return 1
@@ -372,18 +382,27 @@ rosout_identity_matches() {
   local command_line
   command_line="$(tr '\0' ' ' < "/proc/${pid}/cmdline")"
   [[ "${command_line}" == *"go2-log"* ]] &&
-    [[ "${command_line}" == *"_rosout"* ]] &&
+    [[ "${command_line}" == *"${subcommand}"* ]] &&
     [[ "${command_line}" == *"${session_dir}"* ]]
 }
 
-write_rosout_identity() {
+rosout_identity_matches() {
+  diagnostic_writer_identity_matches "$@" _rosout
+}
+
+timing_identity_matches() {
+  diagnostic_writer_identity_matches "$@" _timing
+}
+
+write_diagnostic_writer_identity() {
   local session_dir="$1"
   local pid="$2"
   local captured_boot_id="$3"
   local captured_start_ticks="$4"
+  local writer_name="$5"
   local pgid identity_file temporary
   pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
-  identity_file="${session_dir}/rosout.identity"
+  identity_file="${session_dir}/${writer_name}.identity"
   temporary="${identity_file}.tmp.$$"
   {
     echo "pid=${pid}"
@@ -391,23 +410,36 @@ write_rosout_identity() {
     echo "start_ticks=${captured_start_ticks}"
     echo "pgid=${pgid:-unknown}"
     echo "session_dir=${session_dir}"
+    echo "writer=${writer_name}"
     echo "collector_pid=$$"
     echo "captured_at=$(utc_now)"
   } > "${temporary}"
   mv -f -- "${temporary}" "${identity_file}"
 }
 
-capture_rosout_identity() {
+write_rosout_identity() {
+  write_diagnostic_writer_identity "$@" rosout
+}
+
+write_timing_identity() {
+  write_diagnostic_writer_identity "$@" timing
+}
+
+capture_diagnostic_writer_identity() {
   local pid="$1"
   local session_dir="$2"
+  local writer_name="$3"
+  local subcommand="$4"
   local attempt captured_boot_id captured_start_ticks
   for (( attempt = 0; attempt < 100; attempt++ )); do
     captured_boot_id="$(boot_id 2>/dev/null || true)"
     captured_start_ticks="$(process_start_ticks "${pid}" 2>/dev/null || true)"
-    if rosout_identity_matches \
-      "${pid}" "${captured_boot_id}" "${captured_start_ticks}" "${session_dir}"; then
-      write_rosout_identity \
-        "${session_dir}" "${pid}" "${captured_boot_id}" "${captured_start_ticks}"
+    if diagnostic_writer_identity_matches \
+      "${pid}" "${captured_boot_id}" "${captured_start_ticks}" \
+      "${session_dir}" "${subcommand}"; then
+      write_diagnostic_writer_identity \
+        "${session_dir}" "${pid}" "${captured_boot_id}" \
+        "${captured_start_ticks}" "${writer_name}"
       printf '%s %s\n' "${captured_boot_id}" "${captured_start_ticks}"
       return 0
     fi
@@ -417,76 +449,174 @@ capture_rosout_identity() {
   return 1
 }
 
-stop_rosout_collector_process() {
+capture_rosout_identity() {
+  capture_diagnostic_writer_identity "$@" rosout _rosout
+}
+
+capture_timing_identity() {
+  capture_diagnostic_writer_identity "$@" timing _timing
+}
+
+read_recorded_writer_pgid() {
+  local session_dir="$1"
+  local writer_name="$2"
+  local expected_pid="$3"
+  local expected_boot_id="$4"
+  local expected_start_ticks="$5"
+  local identity_file="${session_dir}/${writer_name}.identity"
+  [[ -f "${identity_file}" && ! -L "${identity_file}" ]] || return 1
+
+  local key value pid='' captured_boot_id='' captured_start_ticks=''
+  local pgid='' recorded_session='' recorded_writer=''
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      pid) pid="${value}" ;;
+      boot_id) captured_boot_id="${value}" ;;
+      start_ticks) captured_start_ticks="${value}" ;;
+      pgid) pgid="${value}" ;;
+      session_dir) recorded_session="${value}" ;;
+      writer) recorded_writer="${value}" ;;
+    esac
+  done < "${identity_file}"
+  [[ "${pid}" == "${expected_pid}" ]] || return 1
+  [[ "${captured_boot_id}" == "${expected_boot_id}" ]] || return 1
+  [[ "${captured_start_ticks}" == "${expected_start_ticks}" ]] || return 1
+  [[ "${pgid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "${recorded_session}" == "${session_dir}" ]] || return 1
+  [[ -z "${recorded_writer}" || "${recorded_writer}" == "${writer_name}" ]] || return 1
+  printf '%s\n' "${pgid}"
+}
+
+stop_diagnostic_writer_process() {
   local pid="$1"
   local expected_boot_id="$2"
   local expected_start_ticks="$3"
   local session_dir="$4"
+  local subcommand="$5"
+  local writer_name="${subcommand#_}"
+  local recorded_pgid=''
+  recorded_pgid="$(read_recorded_writer_pgid \
+    "${session_dir}" "${writer_name}" "${pid}" "${expected_boot_id}" \
+    "${expected_start_ticks}" 2>/dev/null || true)"
 
-  # A child which no longer exists can be reaped without addressing a PID.
+  # Once the identity anchor is gone, never signal its old group: the numeric
+  # PGID may have been reused. A still-existing recorded group is fail-closed.
   if ! kill -0 "${pid}" 2>/dev/null; then
     wait "${pid}" 2>/dev/null || true
+    if [[ "${recorded_pgid}" =~ ^[1-9][0-9]*$ ]] &&
+      kill -0 -- "-${recorded_pgid}" 2>/dev/null; then
+      return 1
+    fi
     return 0
   fi
 
-  # A matching zombie is still the original child and only needs wait(2).
-  if [[ "$(boot_id 2>/dev/null || true)" == "${expected_boot_id}" ]] &&
-    [[ "$(process_start_ticks "${pid}" 2>/dev/null || true)" == "${expected_start_ticks}" ]] &&
-    [[ "$(process_state "${pid}" 2>/dev/null || true)" == Z ]]; then
-    wait "${pid}" 2>/dev/null || true
-    return 0
-  fi
-
-  rosout_identity_matches \
-    "${pid}" "${expected_boot_id}" "${expected_start_ticks}" "${session_dir}" || return 2
-
-  local pgid
+  local pgid leader_state
+  leader_state="$(process_state "${pid}" 2>/dev/null || true)"
   pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "${leader_state}" == Z ]]; then
+    # A zombie has no cmdline, so anchor the group to its still-live kernel
+    # identity. Requiring a session leader prevents signalling a group which
+    # was inherited from an unrelated parent.
+    [[ "$(boot_id 2>/dev/null || true)" == "${expected_boot_id}" ]] || return 2
+    [[ "$(process_start_ticks "${pid}" 2>/dev/null || true)" == "${expected_start_ticks}" ]] ||
+      return 2
+    [[ "${pgid}" == "${pid}" ]] || return 2
+    [[ "${recorded_pgid}" == "${pgid}" ]] || return 2
+  else
+    diagnostic_writer_identity_matches \
+      "${pid}" "${expected_boot_id}" "${expected_start_ticks}" \
+      "${session_dir}" "${subcommand}" || return 2
+    if [[ -n "${recorded_pgid}" && "${recorded_pgid}" != "${pgid}" ]]; then
+      return 2
+    fi
+  fi
 
   # Close the check-to-signal window as much as shell APIs allow. Never signal
   # after any identity field changes, even if the numeric PID is still live.
-  rosout_identity_matches \
-    "${pid}" "${expected_boot_id}" "${expected_start_ticks}" "${session_dir}" || return 2
+  if [[ "${leader_state}" == Z ]]; then
+    [[ "$(boot_id 2>/dev/null || true)" == "${expected_boot_id}" ]] || return 2
+    [[ "$(process_start_ticks "${pid}" 2>/dev/null || true)" == "${expected_start_ticks}" ]] ||
+      return 2
+    [[ "$(process_state "${pid}" 2>/dev/null || true)" == Z ]] || return 2
+    [[ "$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)" == "${pgid}" ]] ||
+      return 2
+  else
+    diagnostic_writer_identity_matches \
+      "${pid}" "${expected_boot_id}" "${expected_start_ticks}" \
+      "${session_dir}" "${subcommand}" || return 2
+  fi
   if [[ "${pgid}" == "${pid}" ]]; then
     kill -TERM -- "-${pid}" 2>/dev/null || return 1
   else
     kill -TERM "${pid}" 2>/dev/null || return 1
   fi
   for _ in {1..50}; do
-    if ! rosout_identity_matches \
-      "${pid}" "${expected_boot_id}" "${expected_start_ticks}" "${session_dir}"; then
+    if [[ "${pgid}" == "${pid}" ]]; then
+      if ! kill -0 -- "-${pgid}" 2>/dev/null; then
+        wait "${pid}" 2>/dev/null || true
+        return 0
+      fi
+    elif ! diagnostic_writer_identity_matches \
+      "${pid}" "${expected_boot_id}" "${expected_start_ticks}" \
+      "${session_dir}" "${subcommand}"; then
       wait "${pid}" 2>/dev/null || true
       return 0
     fi
     if [[ "$(process_state "${pid}" 2>/dev/null || true)" == Z ]]; then
+      # Reap only when this shell is the parent. A surviving same-PGID child
+      # keeps the group probe alive, so reaping the leader cannot mask it.
       wait "${pid}" 2>/dev/null || true
-      return 0
     fi
     sleep 0.1
   done
   wait "${pid}" 2>/dev/null || true
-  rosout_identity_matches \
-    "${pid}" "${expected_boot_id}" "${expected_start_ticks}" "${session_dir}" && return 1
+  if [[ "${pgid}" == "${pid}" ]]; then
+    kill -0 -- "-${pgid}" 2>/dev/null && return 1
+  elif diagnostic_writer_identity_matches \
+    "${pid}" "${expected_boot_id}" "${expected_start_ticks}" \
+    "${session_dir}" "${subcommand}"; then
+    return 1
+  fi
   return 0
 }
 
-read_rosout_identity() {
+stop_rosout_collector_process() {
+  stop_diagnostic_writer_process "$@" _rosout
+}
+
+stop_timing_sampler_process() {
+  stop_diagnostic_writer_process "$@" _timing
+}
+
+read_diagnostic_writer_identity() {
   local session_dir="$1"
-  local identity_file="${session_dir}/rosout.identity"
+  local writer_name="$2"
+  local identity_file="${session_dir}/${writer_name}.identity"
   [[ -f "${identity_file}" && ! -L "${identity_file}" ]] || return 1
-  local key value pid='' captured_boot_id='' captured_start_ticks='' recorded_session=''
+  local key value pid='' captured_boot_id='' captured_start_ticks=''
+  local recorded_session='' recorded_writer=''
   while IFS='=' read -r key value; do
     case "${key}" in
       pid) pid="${value}" ;;
       boot_id) captured_boot_id="${value}" ;;
       start_ticks) captured_start_ticks="${value}" ;;
       session_dir) recorded_session="${value}" ;;
+      writer) recorded_writer="${value}" ;;
     esac
   done < "${identity_file}"
   [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ "${captured_start_ticks}" =~ ^[0-9]+$ ]] || return 1
   [[ -n "${captured_boot_id}" && "${recorded_session}" == "${session_dir}" ]] || return 1
+  [[ -z "${recorded_writer}" || "${recorded_writer}" == "${writer_name}" ]] || return 1
   printf '%s %s %s\n' "${pid}" "${captured_boot_id}" "${captured_start_ticks}"
+}
+
+read_rosout_identity() {
+  read_diagnostic_writer_identity "$1" rosout
+}
+
+read_timing_identity() {
+  read_diagnostic_writer_identity "$1" timing
 }
 
 active_session_dir() {
@@ -1031,7 +1161,20 @@ PY
   printf '%s\n' "${odometry_header}" > "${session_dir}/odom_position.csv"
   printf '%s\n' "${odometry_header}" > "${session_dir}/body_odom_pose.csv"
   printf 'timestamp,vx,vy,yaw_rate,status\n' > "${session_dir}/sdk2_commands.csv"
-  printf 'timestamp,component,running,pids\n' > "${session_dir}/process_health.csv"
+  printf 'timestamp,component,running,pids,states,cpu_percent_interval,rss_kib,threads,metrics_status\n' \
+    > "${session_dir}/process_health.csv"
+  printf '%s\n' \
+    'window_end,window_duration_sec,topic,status,message_count,first_receive_ns,last_receive_ns,first_header_ns,last_header_ns,latest_header_age_ms,header_span_ms,first_local_sequence,last_local_sequence,unique_header_count,duplicate_header_count,nonmonotonic_header_count,invalid_header_count,min_header_gap_ms,max_header_gap_ms,max_receive_gap_ms' \
+    > "${session_dir}/topic_timing.csv"
+  printf '%s\n' \
+    'timestamp,monotonic_ns,load1,load5,load15,mem_available_kib,swap_free_kib,thermal_max_millic,thermal_zone,status' \
+    > "${session_dir}/system_health.csv"
+  printf '%s\n' \
+    'timestamp,monotonic_ns,interface,operstate,carrier,rx_bytes,rx_packets,rx_errors,rx_dropped,tx_bytes,tx_packets,tx_errors,tx_dropped,status' \
+    > "${session_dir}/network_health.csv"
+  printf '%s\n' \
+    'timestamp,status,file_size_bytes,mtime_epoch,last_frame,frame_delta,last_points,last_packets,last_start_time,last_end_time,tail_warning_lines,tail_error_lines' \
+    > "${session_dir}/hesai_summary.csv"
   : > "${session_dir}/events.jsonl"
   : > "${session_dir}/planner_input_inspections.jsonl"
   : > "${session_dir}/rosout_warn_error.txt"
@@ -1039,20 +1182,28 @@ PY
 
 capture_ros_graph() {
   local session_dir="$1"
+  declare -n stop_requested_ref="$2"
   command -v ros2 >/dev/null 2>&1 || return 0
   (( $(session_bytes "${session_dir}") < SESSION_STOP_BYTES )) || return 0
+  (( stop_requested_ref == 0 )) || return 0
 
   timeout 8 ros2 topic list -t > "${session_dir}/topics.txt.tmp" 2>&1 || true
+  if (( stop_requested_ref != 0 )); then
+    rm -f -- "${session_dir}/topics.txt.tmp"
+    return 0
+  fi
   cap_text_file "${session_dir}/topics.txt.tmp"
   mv -f -- "${session_dir}/topics.txt.tmp" "${session_dir}/topics.txt"
 
   local nodes
   nodes="$(timeout 8 ros2 node list 2>/dev/null || true)"
+  (( stop_requested_ref == 0 )) || return 0
   printf '%s\n' "${nodes}" > "${session_dir}/nodes.txt"
   cap_text_file "${session_dir}/nodes.txt"
 
   local node safe_name output_file
   while IFS= read -r node; do
+    (( stop_requested_ref == 0 )) || break
     [[ "${node}" =~ (super_lio|body_odom_adapter|terrain_mapper|body_lattice_planner|go2_sdk2_bridge|go2_imu_bridge|hesai_ros_driver) ]] || continue
     safe_name="$(printf '%s' "${node#/}" | tr -c 'A-Za-z0-9_.-' '_')"
     output_file="${session_dir}/parameters_${safe_name}.yaml"
@@ -1299,11 +1450,54 @@ sample_sdk2_command() {
     >> "${session_dir}/sdk2_commands.csv"
 }
 
+process_resource_sample() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  local stat_line stat_tail page_size
+  local -a fields=()
+  IFS= read -r stat_line < "/proc/${pid}/stat" || return 1
+  stat_tail="${stat_line##*) }"
+  read -r -a fields <<< "${stat_tail}"
+  (( ${#fields[@]} >= 22 )) || return 1
+  page_size="$(getconf PAGESIZE 2>/dev/null || printf '4096')"
+  printf '%s %s %s %s %s\n' \
+    "${fields[0]}" \
+    "${fields[19]}" \
+    "$(( fields[11] + fields[12] ))" \
+    "$(( fields[21] * page_size / 1024 ))" \
+    "${fields[17]}"
+}
+
+classify_process_metrics_status() {
+  local running="$1"
+  local failures="$2"
+  local cpu_clock_available="$3"
+  local metric_samples="$4"
+  local cpu_samples="$5"
+  if (( running == 0 )); then
+    printf 'stopped\n'
+  elif (( failures > 0 || cpu_clock_available == 0 )); then
+    printf 'partial\n'
+  elif (( cpu_samples == 0 )); then
+    printf 'baseline\n'
+  elif (( cpu_samples < metric_samples )); then
+    printf 'partial\n'
+  else
+    printf 'ok\n'
+  fi
+}
+
 sample_process_health() {
   local session_dir="$1"
   local timestamp="$2"
   local spec component pattern pids running previous
   declare -n previous_states_ref="$3"
+  declare -n previous_cpu_ref="$4"
+
+  local clock_ticks uptime_ticks
+  clock_ticks="$(getconf CLK_TCK 2>/dev/null || printf '100')"
+  uptime_ticks="$(LC_ALL=C awk -v hz="${clock_ticks}" \
+    '{printf "%.0f", $1 * hz}' /proc/uptime 2>/dev/null || true)"
 
   for spec in "${COMPONENT_SPECS[@]}"; do
     component="${spec%%:*}"
@@ -1314,7 +1508,54 @@ sample_process_health() {
     else
       running=0
     fi
-    printf '%s,%s,%s,%s\n' "${timestamp}" "${component}" "${running}" "${pids}" \
+
+    local pid metrics state start_ticks process_ticks rss threads key prior
+    local prior_ticks prior_uptime delta_ticks delta_uptime
+    local states='' rss_total=0 thread_total=0 cpu_total='0'
+    local cpu_samples=0 metric_samples=0 failures=0 cpu_clock_available=0
+    [[ "${uptime_ticks}" =~ ^[0-9]+$ ]] && cpu_clock_available=1
+    while IFS= read -r pid; do
+      [[ -n "${pid}" ]] || continue
+      if ! metrics="$(process_resource_sample "${pid}" 2>/dev/null)"; then
+        failures=$((failures + 1))
+        continue
+      fi
+      read -r state start_ticks process_ticks rss threads <<< "${metrics}"
+      metric_samples=$((metric_samples + 1))
+      states+="${states:+;}${pid}:${state}"
+      rss_total=$((rss_total + rss))
+      thread_total=$((thread_total + threads))
+      key="${pid}:${start_ticks}"
+      prior="${previous_cpu_ref[${key}]:-}"
+      if [[ -n "${prior}" && "${uptime_ticks}" =~ ^[0-9]+$ ]]; then
+        read -r prior_ticks prior_uptime <<< "${prior}"
+        delta_ticks=$((process_ticks - prior_ticks))
+        delta_uptime=$((uptime_ticks - prior_uptime))
+        if (( delta_ticks >= 0 && delta_uptime > 0 )); then
+          cpu_total="$(LC_ALL=C awk \
+            -v total="${cpu_total}" -v work="${delta_ticks}" -v elapsed="${delta_uptime}" \
+            'BEGIN {printf "%.3f", total + 100.0 * work / elapsed}')"
+          cpu_samples=$((cpu_samples + 1))
+        fi
+      fi
+      if [[ "${uptime_ticks}" =~ ^[0-9]+$ ]]; then
+        previous_cpu_ref["${key}"]="${process_ticks} ${uptime_ticks}"
+      fi
+    done < <(tr ';' '\n' <<< "${pids}")
+
+    local cpu_value='' metrics_status
+    metrics_status="$(classify_process_metrics_status \
+      "${running}" "${failures}" "${cpu_clock_available}" \
+      "${metric_samples}" "${cpu_samples}")"
+    if [[ "${metrics_status}" == stopped ]]; then
+      rss_total=0
+      thread_total=0
+    elif (( cpu_samples > 0 )); then
+      cpu_value="${cpu_total}"
+    fi
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "${timestamp}" "${component}" "${running}" "${pids}" "${states}" \
+      "${cpu_value}" "${rss_total}" "${thread_total}" "${metrics_status}" \
       >> "${session_dir}/process_health.csv"
 
     previous="${previous_states_ref[${component}]:-unknown}"
@@ -1327,6 +1568,177 @@ sample_process_health() {
       previous_states_ref["${component}"]="${running}"
     fi
   done
+}
+
+sample_system_health() {
+  local session_dir="$1"
+  local timestamp="$2"
+  local monotonic_ns='' load1='' load5='' load15=''
+  local mem_available='' swap_free='' thermal_max='' thermal_zone='' status=ok
+  monotonic_ns="$(LC_ALL=C awk '{printf "%.0f", $1 * 1000000000}' \
+    /proc/uptime 2>/dev/null || true)"
+  read -r load1 load5 load15 _ < /proc/loadavg || status=partial
+  mem_available="$(awk '$1 == "MemAvailable:" {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+  swap_free="$(awk '$1 == "SwapFree:" {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+
+  local path value zone
+  for path in /sys/class/thermal/thermal_zone*/temp; do
+    [[ -r "${path}" ]] || continue
+    value="$(read_first_line "${path}" 2>/dev/null || true)"
+    [[ "${value}" =~ ^-?[0-9]+$ ]] || continue
+    zone="$(read_first_line "${path%/temp}/type" 2>/dev/null || basename "${path%/temp}")"
+    if [[ -z "${thermal_max}" ]] || (( value > thermal_max )); then
+      thermal_max="${value}"
+      thermal_zone="${zone//,/__}"
+    fi
+  done
+  [[ -n "${monotonic_ns}" && -n "${load1}" && -n "${mem_available}" ]] || status=partial
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "${timestamp}" "${monotonic_ns}" "${load1}" "${load5}" "${load15}" \
+    "${mem_available}" "${swap_free}" "${thermal_max}" "${thermal_zone}" "${status}" \
+    >> "${session_dir}/system_health.csv"
+}
+
+sample_network_health() {
+  local session_dir="$1"
+  local timestamp="$2"
+  local monotonic_ns path interface operstate carrier status field value
+  local -a fields=(rx_bytes rx_packets rx_errors rx_dropped tx_bytes tx_packets tx_errors tx_dropped)
+  monotonic_ns="$(LC_ALL=C awk '{printf "%.0f", $1 * 1000000000}' \
+    /proc/uptime 2>/dev/null || true)"
+  for path in /sys/class/net/*; do
+    [[ -d "${path}" ]] || continue
+    interface="$(basename -- "${path}")"
+    [[ "${interface}" != lo ]] || continue
+    operstate="$(read_first_line "${path}/operstate" 2>/dev/null || true)"
+    carrier="$(read_first_line "${path}/carrier" 2>/dev/null || true)"
+    status=ok
+    [[ "${monotonic_ns}" =~ ^[0-9]+$ && -n "${operstate}" && "${carrier}" =~ ^[01]$ ]] ||
+      status=partial
+    local -a values=()
+    for field in "${fields[@]}"; do
+      value="$(read_first_line "${path}/statistics/${field}" 2>/dev/null || true)"
+      [[ "${value}" =~ ^[0-9]+$ ]] || status=partial
+      values+=("${value}")
+    done
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "${timestamp}" "${monotonic_ns}" "${interface}" "${operstate}" "${carrier}" \
+      "${values[0]}" "${values[1]}" "${values[2]}" "${values[3]}" \
+      "${values[4]}" "${values[5]}" "${values[6]}" "${values[7]}" "${status}" \
+      >> "${session_dir}/network_health.csv"
+  done
+}
+
+sample_hesai_summary() {
+  local session_dir="$1"
+  local timestamp="$2"
+  declare -n previous_frame_ref="$3"
+  local log_path="${SLAM_LOG_DIR:-${HOME}/slam_logs}/hesai.log"
+  local status=missing size='' modified='' frame='' delta='' points='' packets=''
+  local start_time='' end_time='' warning_lines='' error_lines='' tail_text='' last_line=''
+  if [[ -f "${log_path}" && ! -L "${log_path}" ]]; then
+    size="$(stat -c '%s' -- "${log_path}" 2>/dev/null || true)"
+    modified="$(stat -c '%Y' -- "${log_path}" 2>/dev/null || true)"
+    tail_text="$(
+      LC_ALL=C tail -c "${HESAI_TAIL_BYTES}" -- "${log_path}" 2>/dev/null |
+        tail -n 512 || true
+    )"
+    last_line="$(awk '/raw frame:/ {line=$0} END {print line}' <<< "${tail_text}")"
+    warning_lines="$(grep -Eic 'warn|warning' <<< "${tail_text}" || true)"
+    error_lines="$(grep -Eic 'error|fatal|exception' <<< "${tail_text}" || true)"
+    if [[ "${last_line}" =~ raw[[:space:]]+frame:([0-9]+)[[:space:]]+points:([0-9]+)[[:space:]]+packet:([0-9]+)[[:space:]]+start[[:space:]]+time:([^[:space:]]+)[[:space:]]+end[[:space:]]+time:([^[:space:]]+) ]]; then
+      frame="${BASH_REMATCH[1]}"
+      points="${BASH_REMATCH[2]}"
+      packets="${BASH_REMATCH[3]}"
+      start_time="${BASH_REMATCH[4]}"
+      end_time="${BASH_REMATCH[5]}"
+      status=ok
+      if [[ "${previous_frame_ref}" =~ ^[0-9]+$ ]]; then
+        if (( frame >= previous_frame_ref )); then
+          delta=$((frame - previous_frame_ref))
+        else
+          status=frame_reset
+        fi
+      fi
+      previous_frame_ref="${frame}"
+    else
+      status=unparsed
+    fi
+  fi
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "${timestamp}" "${status}" "${size}" "${modified}" "${frame}" "${delta}" \
+    "${points}" "${packets}" "${start_time}" "${end_time}" \
+    "${warning_lines}" "${error_lines}" >> "${session_dir}/hesai_summary.csv"
+}
+
+run_topic_timing_sampler() {
+  local session_dir="$1"
+  local timing_file="${session_dir}/topic_timing.csv"
+  local status=0
+  # TERM at seven seconds and KILL one second later bounds even a stuck helper
+  # to eight seconds of wall-clock time.
+  if [[ -n "${GO2_TOPIC_TIMING_COMMAND:-}" ]]; then
+    timeout --foreground --kill-after=1 7 "${GO2_TOPIC_TIMING_COMMAND}" \
+      --timing-csv "${timing_file}" \
+      --rates-csv "${session_dir}/topic_rates.csv" \
+      --duration 5 --max-bytes "${TOPIC_TIMING_MAX_BYTES}" || status=$?
+  else
+    local helper="${REPO_ROOT}/tools/sample_topic_timing.py"
+    [[ -r "${helper}" ]] || helper="${SCRIPT_DIR}/sample_topic_timing.py"
+    timeout --foreground --kill-after=1 7 python3 "${helper}" \
+      --timing-csv "${timing_file}" \
+      --rates-csv "${session_dir}/topic_rates.csv" \
+      --duration 5 --max-bytes "${TOPIC_TIMING_MAX_BYTES}" || status=$?
+  fi
+  return "${status}"
+}
+
+sample_topic_timing() {
+  local session_dir="$1"
+  declare -n timing_pid_ref="$2"
+  declare -n timing_boot_id_ref="$3"
+  declare -n timing_start_ticks_ref="$4"
+  local timing_file="${session_dir}/topic_timing.csv"
+  local marker="${session_dir}/topic_timing_capacity_reached.txt"
+  local size
+  size="$(stat -c '%s' -- "${timing_file}" 2>/dev/null || printf '0')"
+  if (( size >= TOPIC_TIMING_MAX_BYTES )); then
+    [[ -f "${marker}" ]] || printf '%s topic timing capture reached %s bytes\n' \
+      "$(utc_now)" "${TOPIC_TIMING_MAX_BYTES}" > "${marker}"
+    return 0
+  fi
+
+  if ! command -v setsid >/dev/null 2>&1; then
+    append_event "${session_dir}" warning collector \
+      "topic timing sampler skipped because setsid is unavailable"
+    return 0
+  fi
+
+  local status=0 timing_identity=''
+  setsid "${SCRIPT_DIR}/go2-log" _timing "${session_dir}" &
+  timing_pid_ref="$!"
+  if timing_identity="$(capture_timing_identity "${timing_pid_ref}" "${session_dir}")"; then
+    read -r timing_boot_id_ref timing_start_ticks_ref <<< "${timing_identity}"
+  elif kill -0 "${timing_pid_ref}" 2>/dev/null; then
+    append_event "${session_dir}" warning collector \
+      "could not capture the complete timing identity for PID ${timing_pid_ref}"
+  fi
+  wait "${timing_pid_ref}" 2>/dev/null || status=$?
+  if ! kill -0 "${timing_pid_ref}" 2>/dev/null ||
+    [[ "$(process_state "${timing_pid_ref}" 2>/dev/null || true)" == Z ]]; then
+    rm -f -- "${session_dir}/timing.identity"
+    timing_pid_ref=''
+    timing_boot_id_ref=''
+    timing_start_ticks_ref=''
+  fi
+
+  if (( status == 3 )); then
+    [[ -f "${marker}" ]] || printf '%s topic timing capture reached its file ceiling\n' \
+      "$(utc_now)" > "${marker}"
+  elif (( status != 0 )); then
+    append_event "${session_dir}" warning collector \
+      "topic timing sampler failed with exit ${status}"
+  fi
 }
 
 run_rosout_collector() {
@@ -1351,24 +1763,55 @@ run_collector() {
   local rosout_pid=''
   local rosout_boot_id=''
   local rosout_start_ticks=''
+  local timing_pid=''
+  local timing_boot_id=''
+  local timing_start_ticks=''
   # Passed by name to sample_process_health via Bash's declare -n.
   # shellcheck disable=SC2034
   declare -A previous_states=()
+  # shellcheck disable=SC2034
+  declare -A previous_cpu_samples=()
+  local previous_hesai_frame=''
 
   request_stop() {
     stop_requested=1
   }
 
   finish_collector() {
+    local writer_cleanup_failed=0
+    if [[ -n "${timing_pid}" ]]; then
+      local timing_stop_status=0
+      if [[ -n "${timing_boot_id}" && -n "${timing_start_ticks}" ]]; then
+        stop_timing_sampler_process \
+          "${timing_pid}" "${timing_boot_id}" "${timing_start_ticks}" "${session_dir}" ||
+          timing_stop_status=$?
+      else
+        timing_stop_status=2
+      fi
+      if (( timing_stop_status == 2 )); then
+        writer_cleanup_failed=1
+        append_event "${session_dir}" warning collector \
+          "timing identity mismatch for PID ${timing_pid}; no signal was sent"
+      elif (( timing_stop_status != 0 )); then
+        writer_cleanup_failed=1
+        append_event "${session_dir}" warning collector \
+          "failed to stop the verified timing process PID ${timing_pid}"
+      else
+        rm -f -- "${session_dir}/timing.identity"
+      fi
+      timing_pid=''
+    fi
     if [[ -n "${rosout_pid}" ]]; then
       local rosout_stop_status=0
       stop_rosout_collector_process \
         "${rosout_pid}" "${rosout_boot_id}" "${rosout_start_ticks}" "${session_dir}" ||
         rosout_stop_status=$?
       if (( rosout_stop_status == 2 )); then
+        writer_cleanup_failed=1
         append_event "${session_dir}" warning collector \
           "rosout identity mismatch for PID ${rosout_pid}; no signal was sent"
       elif (( rosout_stop_status != 0 )); then
+        writer_cleanup_failed=1
         append_event "${session_dir}" warning collector \
           "failed to stop the verified rosout process PID ${rosout_pid}"
       fi
@@ -1379,7 +1822,15 @@ run_collector() {
     enforce_session_size_limit "${session_dir}" ||
       echo "WARNING: preserve the oversized session with SCP: ${session_dir}" >&2
     if [[ -f "${ACTIVE_FILE}" ]] && [[ "$(< "${ACTIVE_FILE}")" == "${session_dir}" ]]; then
-      rm -f -- "${ACTIVE_FILE}"
+      local remaining_writers
+      remaining_writers="$(running_auxiliary_diagnostic_writers |
+        grep -F -- "${session_dir}" || true)"
+      if (( writer_cleanup_failed == 0 )) && [[ -z "${remaining_writers}" ]]; then
+        rm -f -- "${ACTIVE_FILE}"
+      else
+        append_event "${session_dir}" warning collector \
+          "active-session state preserved because a diagnostic writer is still running"
+      fi
     fi
   }
 
@@ -1410,11 +1861,19 @@ run_collector() {
     fi
 
     timestamp="$(utc_now)"
-    sample_process_health "${session_dir}" "${timestamp}" previous_states
+    sample_process_health \
+      "${session_dir}" "${timestamp}" previous_states previous_cpu_samples
+    sample_system_health "${session_dir}" "${timestamp}"
+    sample_network_health "${session_dir}" "${timestamp}"
+    sample_hesai_summary "${session_dir}" "${timestamp}" previous_hesai_frame
+    sample_topic_timing \
+      "${session_dir}" timing_pid timing_boot_id timing_start_ticks
+    (( stop_requested == 0 )) || break
 
     if (( graph_cycle % 4 == 0 )); then
-      capture_ros_graph "${session_dir}"
+      capture_ros_graph "${session_dir}" stop_requested
     fi
+    (( stop_requested == 0 )) || break
     graph_cycle=$((graph_cycle + 1))
 
     for topic in /imu/data /lio/odom /lio/body_odom /body_path /terrain_costmap /sdk2_command; do
@@ -1444,7 +1903,7 @@ start_session() {
   acquire_lock
   command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
-  local current pid
+  local current pid writers
   if current="$(active_session_dir 2>/dev/null)"; then
     pid="$(read_first_line "${current}/collector.pid" 2>/dev/null || true)"
     if collector_is_running "${pid}" "${current}"; then
@@ -1454,7 +1913,13 @@ start_session() {
       echo "Collector PID: ${pid}"
       return 0
     fi
-    rm -f -- "${ACTIVE_FILE}"
+    die "active diagnostic session is stale ($(basename -- "${current}")); run './tools/go2-log stop' before starting a new session"
+  fi
+
+  writers="$(running_diagnostic_writers)"
+  if [[ -n "${writers}" ]]; then
+    echo "${writers}" >&2
+    die "live diagnostic writer exists without active-session state; inspect and stop it before starting a new session"
   fi
 
   cleanup_uploaded_sessions 19
@@ -1525,7 +1990,8 @@ status_session() {
 stop_session() {
   acquire_lock
   local session_dir pid rosout_details rosout_pid rosout_boot rosout_start
-  local rosout_status writers
+  local timing_details timing_pid timing_boot timing_start
+  local rosout_status timing_status writers
   session_dir="$(active_session_dir 2>/dev/null)" || die "no active session"
   pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
 
@@ -1537,7 +2003,17 @@ stop_session() {
         "${rosout_pid}" "${rosout_boot}" "${rosout_start}" "${session_dir}" ||
         rosout_status=$?
       if (( rosout_status != 0 && rosout_status != 2 )); then
-        die "stale collector has a verified rosout writer that could not be stopped"
+        die "stale collector has a verified rosout writer that could not be stopped; active state was preserved"
+      fi
+    fi
+    if timing_details="$(read_timing_identity "${session_dir}" 2>/dev/null)"; then
+      read -r timing_pid timing_boot timing_start <<< "${timing_details}"
+      timing_status=0
+      stop_timing_sampler_process \
+        "${timing_pid}" "${timing_boot}" "${timing_start}" "${session_dir}" ||
+        timing_status=$?
+      if (( timing_status != 0 && timing_status != 2 )); then
+        die "stale collector has a verified timing writer that could not be stopped; active state was preserved"
       fi
     fi
     writers="$(running_diagnostic_writers | grep -F -- "${session_dir}" || true)"
@@ -1556,6 +2032,12 @@ stop_session() {
     die "collector did not stop within 20 seconds; inspect PID ${pid} before taking further action"
   fi
 
+  if [[ -f "${ACTIVE_FILE}" ]] && [[ "$(< "${ACTIVE_FILE}")" == "${session_dir}" ]]; then
+    die "collector stopped but writer cleanup did not complete; active state was preserved"
+  fi
+  writers="$(running_diagnostic_writers | grep -F -- "${session_dir}" || true)"
+  [[ -z "${writers}" ]] ||
+    die "session still has a live diagnostic writer; active state was preserved"
   rm -f -- "${ACTIVE_FILE}"
   echo "Stopped diagnostic session: $(basename -- "${session_dir}")"
   echo "Directory: ${session_dir}"
@@ -1577,7 +2059,11 @@ assert_robot_idle() {
 }
 
 running_diagnostic_writers() {
-  pgrep -af '[g]o2-log (_collect|_rosout)' 2>/dev/null || true
+  pgrep -af '[g]o2-log (_collect|_rosout|_timing)' 2>/dev/null || true
+}
+
+running_auxiliary_diagnostic_writers() {
+  pgrep -af '[g]o2-log (_rosout|_timing)' 2>/dev/null || true
 }
 
 validate_session_for_upload() {
@@ -2930,6 +3416,10 @@ main() {
     _rosout)
       [[ $# -eq 2 ]] || exit 2
       run_rosout_collector "$2"
+      ;;
+    _timing)
+      [[ $# -eq 2 ]] || exit 2
+      run_topic_timing_sampler "$2"
       ;;
     -h|--help|help)
       show_usage

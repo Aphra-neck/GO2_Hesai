@@ -65,6 +65,14 @@ class PlannerThresholds:
 
 
 @dataclass(frozen=True)
+class PlannerFreshnessSettings:
+    max_map_age: float = 1.0
+    max_odom_age: float = 0.5
+    future_tolerance: float = 0.2
+    input_watchdog_rate: float = 10.0
+
+
+@dataclass(frozen=True)
 class InputContract:
     map_frame: str = "world"
     body_frame: str = "base_link"
@@ -171,8 +179,8 @@ def _read_live_planner_thresholds(
     service_timeout: float,
     response_timeout: float,
     max_attempts: int,
-) -> PlannerThresholds:
-    """Read mapper and planner thresholds using two bounded service calls."""
+) -> tuple[PlannerThresholds, PlannerFreshnessSettings]:
+    """Read mapper and planner settings using two bounded service calls."""
     mapper_service = "/terrain_mapper/get_parameters"
     mapper_names = ("min_observed_frames", "max_slope", "max_roughness")
     mapper_values = _request_parameter_batch(
@@ -192,6 +200,10 @@ def _read_live_planner_thresholds(
         "max_step_height",
         "start_snap_radius",
         "snap_radius",
+        "max_map_age",
+        "max_odom_age",
+        "timestamp_future_tolerance",
+        "input_watchdog_rate",
     )
     planner_values = _request_parameter_batch(
         node,
@@ -286,7 +298,50 @@ def _read_live_planner_thresholds(
         ),
     )
     _validate_thresholds(thresholds)
-    return thresholds
+    freshness = PlannerFreshnessSettings(
+        max_map_age=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[5],
+                planner_values[5],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        max_odom_age=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[6],
+                planner_values[6],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        future_tolerance=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[7],
+                planner_values[7],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        input_watchdog_rate=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[8],
+                planner_values[8],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+    )
+    _validate_freshness_settings(freshness)
+    return thresholds, freshness
 
 
 def _validate_grid(grid: GridSnapshot) -> None:
@@ -333,6 +388,19 @@ def _validate_thresholds(thresholds: PlannerThresholds) -> None:
         raise ValueError("start_snap_radius must be finite and non-negative")
     if thresholds.min_observed_frames < 1:
         raise ValueError("min_observed_frames must be positive")
+
+
+def _validate_freshness_settings(settings: PlannerFreshnessSettings) -> None:
+    for name, value, minimum, maximum in (
+        ("max_map_age", settings.max_map_age, 0.001, 60.0),
+        ("max_odom_age", settings.max_odom_age, 0.001, 60.0),
+        ("future_tolerance", settings.future_tolerance, 0.0, 5.0),
+        ("input_watchdog_rate", settings.input_watchdog_rate, 0.1, 100.0),
+    ):
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(
+                f"{name} must be finite and in [{minimum}, {maximum}]"
+            )
 
 
 def _validate_pose(name: str, pose: Pose2D) -> None:
@@ -1152,6 +1220,7 @@ def collect_ros_inputs(
     int,
     str | None,
     PlannerThresholds | None,
+    PlannerFreshnessSettings | None,
 ]:
     try:
         import rclpy
@@ -1193,13 +1262,14 @@ def collect_ros_inputs(
     try:
         node = Node("inspect_planner_inputs")
         live_thresholds = None
+        live_freshness = None
         if args.read_live_parameters:
             print(
                 "Reading live terrain mapper and planner parameters...",
                 file=sys.stderr,
                 flush=True,
             )
-            live_thresholds = _read_live_planner_thresholds(
+            live_thresholds, live_freshness = _read_live_planner_thresholds(
                 node,
                 GetParameters,
                 ParameterType,
@@ -1253,6 +1323,7 @@ def collect_ros_inputs(
             now_ns,
             received.get("goal_capture_failure"),
             live_thresholds,
+            live_freshness,
         )
     finally:
         if node is not None:
@@ -1629,6 +1700,7 @@ def main() -> int:
             now_ns,
             goal_capture_failure,
             live_thresholds,
+            live_freshness,
         ) = collect_ros_inputs(args)
         thresholds = live_thresholds or PlannerThresholds(
             min_traversability=args.min_traversability,
@@ -1648,13 +1720,29 @@ def main() -> int:
             InputContract(
                 map_frame=args.expected_map_frame,
                 body_frame=args.expected_body_frame,
-                max_map_age=args.max_map_age,
-                max_odom_age=args.max_odom_age,
+                max_map_age=(
+                    live_freshness.max_map_age
+                    if live_freshness is not None
+                    else args.max_map_age
+                ),
+                max_odom_age=(
+                    live_freshness.max_odom_age
+                    if live_freshness is not None
+                    else args.max_odom_age
+                ),
                 max_goal_age=args.max_goal_age,
-                future_tolerance=args.future_tolerance,
+                future_tolerance=(
+                    live_freshness.future_tolerance
+                    if live_freshness is not None
+                    else args.future_tolerance
+                ),
             ),
             now_ns=now_ns,
         )
+        if live_freshness is not None:
+            result["runtime_parameters"] = {
+                "input_watchdog_rate": live_freshness.input_watchdog_rate,
+            }
         if goal_capture_failure is not None:
             _mark_goal_capture_failure(result, goal_capture_failure)
     except (RuntimeError, ValueError) as error:

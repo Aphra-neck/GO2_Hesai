@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <memory>
 
 #include "utree_dog_navigation/lattice_planner.hpp"
@@ -61,6 +62,129 @@ TEST(LatticePlanner, FindsPathAcrossFlatTraversableMap)
   ASSERT_FALSE(result.states.empty());
   EXPECT_EQ(result.states.front().x, 1);
   EXPECT_EQ(result.states.back().x, 6);
+}
+
+TEST(LatticePlanner, RejectsNonFiniteMapMetadataAndLayers)
+{
+  auto map = makeSparseMap(0.2F);
+  LatticePlanner planner(LatticePlannerConfig{});
+  planner.setMap(map);
+  ASSERT_TRUE(planner.mapValid());
+
+  map->resolution = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(planner.mapValid());
+  map->resolution = 0.2F;
+
+  map->origin_x = std::numeric_limits<float>::infinity();
+  EXPECT_FALSE(planner.mapValid());
+  map->origin_x = 0.0F;
+
+  map->unknown_value = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(planner.mapValid());
+  map->unknown_value = -1000.0F;
+
+  map->elevation[0] = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(planner.mapValid());
+  map->elevation[0] = map->unknown_value;
+
+  map->slope[0] = std::numeric_limits<float>::infinity();
+  EXPECT_FALSE(planner.mapValid());
+  map->slope[0] = map->unknown_value;
+
+  map->traversability[0] = -std::numeric_limits<float>::infinity();
+  EXPECT_FALSE(planner.mapValid());
+}
+
+TEST(LatticePlanner, RejectsOutOfRangeSlopeAndTraversability)
+{
+  auto map = makeSparseMap(0.2F);
+  LatticePlanner planner(LatticePlannerConfig{});
+  planner.setMap(map);
+
+  ASSERT_TRUE(planner.mapValid());
+
+  map->elevation[0] = -42.0F;
+  EXPECT_TRUE(planner.mapValid());
+
+  map->slope[0] = -0.01F;
+  EXPECT_FALSE(planner.mapValid());
+  map->slope[0] = map->unknown_value;
+
+  map->traversability[0] = -0.01F;
+  EXPECT_FALSE(planner.mapValid());
+  map->traversability[0] = 1.01F;
+  EXPECT_FALSE(planner.mapValid());
+  map->traversability[0] = map->unknown_value;
+
+  EXPECT_TRUE(planner.mapValid());
+}
+
+TEST(LatticePlanner, DoesNotPlanThroughCellWithUnknownElevation)
+{
+  auto map = makeSparseMap(0.2F);
+  const std::size_t index = map->width + 1U;
+  map->slope[index] = 0.0F;
+  map->traversability[index] = 1.0F;
+
+  LatticePlannerConfig config;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  ASSERT_TRUE(planner.mapValid());
+  const auto result = planner.plan({0.3, 0.3, 0.0}, {0.3, 0.3, 0.0});
+
+  EXPECT_FALSE(result.success);
+  EXPECT_TRUE(result.states.empty());
+}
+
+TEST(LatticePlanner, RejectsNonFiniteWorldStatesBeforeGridConversion)
+{
+  auto map = makeSparseMap(0.2F);
+  makeCellValid(map, 1, 1);
+  LatticePlanner planner(LatticePlannerConfig{});
+  planner.setMap(map);
+
+  const WorldState finite_state{0.3, 0.3, 0.0};
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  const double infinity = std::numeric_limits<double>::infinity();
+
+  EXPECT_FALSE(planner.plan({nan, 0.3, 0.0}, finite_state).success);
+  EXPECT_FALSE(planner.plan({0.3, infinity, 0.0}, finite_state).success);
+  EXPECT_FALSE(planner.plan({0.3, 0.3, nan}, finite_state).success);
+  EXPECT_FALSE(planner.plan(finite_state, {nan, 0.3, 0.0}).success);
+  EXPECT_FALSE(planner.plan(finite_state, {0.3, infinity, 0.0}).success);
+  EXPECT_FALSE(planner.plan(finite_state, {0.3, 0.3, nan}).success);
+}
+
+TEST(LatticePlanner, StopsSearchWhenCancellationIsRequested)
+{
+  auto map = std::make_shared<utree_dog_msgs::msg::TerrainGrid>();
+  map->resolution = 0.2F;
+  map->width = 40;
+  map->height = 40;
+  map->origin_x = 0.0F;
+  map->origin_y = 0.0F;
+  map->unknown_value = -1000.0F;
+  const std::size_t cell_count = map->width * map->height;
+  map->elevation.assign(cell_count, 0.0F);
+  map->slope.assign(cell_count, 0.0F);
+  map->traversability.assign(cell_count, 1.0F);
+
+  LatticePlannerConfig config;
+  config.motion_step = 0.2;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  int cancellation_checks = 0;
+  const auto result = planner.plan(
+    {0.3, 0.3, 0.0}, {7.5, 7.5, 0.0},
+    [&cancellation_checks]() {return ++cancellation_checks >= 3;});
+
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(cancellation_checks, 3);
+  EXPECT_LT(result.expansions, config.max_expansions);
 }
 
 TEST(LatticePlanner, RejectsSnapCandidateOutsideEuclideanRadius)

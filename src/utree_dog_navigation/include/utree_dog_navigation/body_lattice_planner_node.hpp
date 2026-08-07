@@ -18,22 +18,41 @@ namespace utree_dog_navigation
 class BodyLatticePlannerNode : public rclcpp::Node
 {
 public:
-  BodyLatticePlannerNode();
+  explicit BodyLatticePlannerNode(
+    const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
 
 private:
   void mapCallback(const utree_dog_msgs::msg::TerrainGrid::SharedPtr msg);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
   void goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   void requestPlan();
-  nav_msgs::msg::Path makePath(const std::vector<GridState> & states) const;
+  void watchdogTick();
+  bool framesValid();
+  bool posesValid();
+  bool inputsFresh(const rclcpp::Time & current_time);
+  bool stampFresh(
+    const builtin_interfaces::msg::Time & stamp, const rclcpp::Time & current_time,
+    double maximum_age, const char * input_name);
+  void clearPath(const char * reason);
+  nav_msgs::msg::Path makePath(
+    const std::vector<GridState> & states,
+    const builtin_interfaces::msg::Time & source_stamp) const;
 
   std::string map_topic_;
   std::string odom_topic_;
   std::string goal_topic_;
   std::string path_topic_;
+  std::string map_frame_;
+  std::string body_frame_;
   double nominal_body_height_{0.42};
+  double max_map_age_{1.0};
+  double max_odom_age_{0.5};
+  double timestamp_future_tolerance_{0.2};
+  double input_watchdog_rate_{10.0};
   bool have_odom_{false};
   bool have_goal_{false};
+  bool path_active_{false};
+  std::string last_path_frame_;
   std::unique_ptr<LatticePlanner> planner_;
   nav_msgs::msg::Odometry::SharedPtr odom_;
   geometry_msgs::msg::PoseStamped::SharedPtr goal_;
@@ -41,6 +60,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+  rclcpp::TimerBase::SharedPtr input_watchdog_timer_;
 };
 
 }  // namespace utree_dog_navigation

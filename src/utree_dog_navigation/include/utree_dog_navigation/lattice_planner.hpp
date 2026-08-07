@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -61,7 +62,9 @@ public:
   void setMap(utree_dog_msgs::msg::TerrainGrid::SharedPtr map);
   bool hasMap() const noexcept;
   bool mapValid() const;
-  PlanningResult plan(const WorldState & start, const WorldState & goal) const;
+  PlanningResult plan(
+    const WorldState & start, const WorldState & goal,
+    const std::function<bool()> & cancellation_requested = {}) const;
   double yawAngle(int bin) const;
   double elevationAt(int x, int y, double fallback) const;
   const utree_dog_msgs::msg::TerrainGrid & map() const;

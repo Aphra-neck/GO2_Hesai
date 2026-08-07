@@ -161,6 +161,102 @@ PLANNER_SERIES_CSV_FIELDS = (
     "goal_connectivity_unknown",
     "goal_connectivity_bool_flips",
 )
+PROCESS_SUMMARY_FIELDS = (
+    "component",
+    "samples",
+    "running_samples",
+    "running_percent",
+    "last_state",
+    "last_pids",
+    "last_states",
+    "metrics_ok_samples",
+    "metrics_partial_samples",
+    "metrics_baseline_samples",
+    "cpu_samples",
+    "mean_cpu_percent",
+    "max_cpu_percent",
+    "latest_cpu_percent",
+    "rss_samples",
+    "mean_rss_kib",
+    "max_rss_kib",
+    "latest_rss_kib",
+    "thread_samples",
+    "max_threads",
+    "latest_threads",
+    "last_metrics_status",
+)
+TOPIC_TIMING_SUMMARY_FIELDS = (
+    "topic",
+    "windows",
+    "ok_windows",
+    "no_data_windows",
+    "invalid_header_windows",
+    "total_duration_sec",
+    "total_messages",
+    "unique_headers",
+    "duplicate_headers",
+    "nonmonotonic_headers",
+    "invalid_headers",
+    "mean_messages_per_sec",
+    "min_latest_header_age_ms",
+    "max_latest_header_age_ms",
+    "min_header_gap_ms",
+    "max_header_gap_ms",
+    "max_receive_gap_ms",
+)
+SYSTEM_HEALTH_SUMMARY_FIELDS = (
+    "samples",
+    "ok_samples",
+    "partial_samples",
+    "max_load1",
+    "max_load5",
+    "max_load15",
+    "min_mem_available_kib",
+    "min_swap_free_kib",
+    "max_thermal_millic",
+    "last_thermal_zone",
+    "last_status",
+)
+NETWORK_COUNTER_FIELDS = (
+    "rx_bytes",
+    "rx_packets",
+    "rx_errors",
+    "rx_dropped",
+    "tx_bytes",
+    "tx_packets",
+    "tx_errors",
+    "tx_dropped",
+)
+NETWORK_HEALTH_SUMMARY_FIELDS = (
+    "interface",
+    "samples",
+    "ok_samples",
+    "partial_samples",
+    "down_samples",
+    "last_operstate",
+    "last_carrier",
+    *(f"{field}_delta" for field in NETWORK_COUNTER_FIELDS),
+    "counter_resets",
+)
+HESAI_SUMMARY_FIELDS = (
+    "samples",
+    "ok_samples",
+    "missing_samples",
+    "unparsed_samples",
+    "frame_reset_samples",
+    "first_frame",
+    "last_frame",
+    "frame_advance_total",
+    "max_frame_delta",
+    "last_points",
+    "last_packets",
+    "latest_file_size_bytes",
+    "max_file_size_bytes",
+    "max_tail_warning_lines",
+    "max_tail_error_lines",
+    "last_status",
+)
+TIMING_EXPECTED_TOPICS = ("/lio/odom", "/lio/body_odom")
 
 
 @dataclass(frozen=True)
@@ -1072,6 +1168,30 @@ def as_float(value: str | None) -> float | None:
     return parsed if parsed is not None and math.isfinite(parsed) else None
 
 
+def as_nonnegative_int(value: str | None) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def nonnegative_float(value: str | None) -> float | None:
+    parsed = as_float(value)
+    return parsed if parsed is not None and parsed >= 0.0 else None
+
+
+def format_float(value: float | None) -> str:
+    return "" if value is None else f"{value:.6f}"
+
+
+def last_present(values: Iterable[object]) -> object:
+    present = [value for value in values if value not in (None, "")]
+    return present[-1] if present else ""
+
+
 def read_environment(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
     try:
@@ -1253,6 +1373,26 @@ def summarize_processes(rows: list[dict[str, str]]) -> list[dict[str, object]]:
         component_rows = grouped[component]
         running = sum(row.get("running") == "1" for row in component_rows)
         samples = len(component_rows)
+        running_rows = [row for row in component_rows if row.get("running") == "1"]
+        cpu_values = [
+            value
+            for row in running_rows
+            if (value := nonnegative_float(row.get("cpu_percent_interval")))
+            is not None
+        ]
+        rss_values = [
+            value
+            for row in running_rows
+            if (value := nonnegative_float(row.get("rss_kib"))) is not None
+        ]
+        thread_values = [
+            value
+            for row in running_rows
+            if (value := as_nonnegative_int(row.get("threads"))) is not None
+        ]
+        metric_statuses = Counter(
+            row.get("metrics_status", "") for row in component_rows
+        )
         summaries.append(
             {
                 "component": component,
@@ -1261,9 +1401,321 @@ def summarize_processes(rows: list[dict[str, str]]) -> list[dict[str, object]]:
                 "running_percent": f"{(100.0 * running / samples):.2f}" if samples else "",
                 "last_state": "running" if component_rows[-1].get("running") == "1" else "stopped",
                 "last_pids": component_rows[-1].get("pids", ""),
+                "last_states": component_rows[-1].get("states", ""),
+                "metrics_ok_samples": metric_statuses["ok"],
+                "metrics_partial_samples": metric_statuses["partial"],
+                "metrics_baseline_samples": metric_statuses["baseline"],
+                "cpu_samples": len(cpu_values),
+                "mean_cpu_percent": format_float(
+                    statistics.fmean(cpu_values) if cpu_values else None
+                ),
+                "max_cpu_percent": format_float(
+                    max(cpu_values) if cpu_values else None
+                ),
+                "latest_cpu_percent": format_float(
+                    cpu_values[-1] if cpu_values else None
+                ),
+                "rss_samples": len(rss_values),
+                "mean_rss_kib": format_float(
+                    statistics.fmean(rss_values) if rss_values else None
+                ),
+                "max_rss_kib": format_float(
+                    max(rss_values) if rss_values else None
+                ),
+                "latest_rss_kib": format_float(
+                    rss_values[-1] if rss_values else None
+                ),
+                "thread_samples": len(thread_values),
+                "max_threads": max(thread_values) if thread_values else "",
+                "latest_threads": thread_values[-1] if thread_values else "",
+                "last_metrics_status": component_rows[-1].get(
+                    "metrics_status", ""
+                ),
             }
         )
     return summaries
+
+
+def summarize_topic_timing(
+    rows: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        topic = row.get("topic", "")
+        if topic:
+            grouped[topic].append(row)
+
+    topics = [topic for topic in TIMING_EXPECTED_TOPICS if topic in grouped]
+    topics.extend(sorted(set(grouped).difference(topics)))
+    summaries: list[dict[str, object]] = []
+    for topic in topics:
+        topic_rows = grouped[topic]
+        durations = [
+            value
+            for row in topic_rows
+            if (value := nonnegative_float(row.get("window_duration_sec")))
+            is not None
+        ]
+        count_fields = {
+            output: sum(
+                value
+                for row in topic_rows
+                if (value := as_nonnegative_int(row.get(source))) is not None
+            )
+            for output, source in (
+                ("total_messages", "message_count"),
+                ("unique_headers", "unique_header_count"),
+                ("duplicate_headers", "duplicate_header_count"),
+                ("nonmonotonic_headers", "nonmonotonic_header_count"),
+                ("invalid_headers", "invalid_header_count"),
+            )
+        }
+        timing_values: dict[str, list[float]] = {
+            field: [
+                value
+                for row in topic_rows
+                if (value := nonnegative_float(row.get(field))) is not None
+            ]
+            for field in (
+                "min_header_gap_ms",
+                "max_header_gap_ms",
+                "max_receive_gap_ms",
+            )
+        }
+        header_age_values = [
+            value
+            for row in topic_rows
+            if (value := as_float(row.get("latest_header_age_ms"))) is not None
+        ]
+        duration_total = sum(durations)
+        summaries.append(
+            {
+                "topic": topic,
+                "windows": len(topic_rows),
+                "ok_windows": sum(row.get("status") == "ok" for row in topic_rows),
+                "no_data_windows": sum(
+                    row.get("status") == "no_data" for row in topic_rows
+                ),
+                "invalid_header_windows": sum(
+                    row.get("status") == "invalid_header" for row in topic_rows
+                ),
+                "total_duration_sec": format_float(duration_total),
+                **count_fields,
+                "mean_messages_per_sec": format_float(
+                    count_fields["total_messages"] / duration_total
+                    if duration_total > 0.0
+                    else None
+                ),
+                "min_latest_header_age_ms": format_float(
+                    min(header_age_values) if header_age_values else None
+                ),
+                "max_latest_header_age_ms": format_float(
+                    max(header_age_values) if header_age_values else None
+                ),
+                "min_header_gap_ms": format_float(
+                    min(timing_values["min_header_gap_ms"])
+                    if timing_values["min_header_gap_ms"]
+                    else None
+                ),
+                "max_header_gap_ms": format_float(
+                    max(timing_values["max_header_gap_ms"])
+                    if timing_values["max_header_gap_ms"]
+                    else None
+                ),
+                "max_receive_gap_ms": format_float(
+                    max(timing_values["max_receive_gap_ms"])
+                    if timing_values["max_receive_gap_ms"]
+                    else None
+                ),
+            }
+        )
+    return summaries
+
+
+def summarize_system_health(
+    rows: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    if not rows:
+        return []
+
+    numeric: dict[str, list[float]] = {
+        field: [
+            value
+            for row in rows
+            if (value := nonnegative_float(row.get(field))) is not None
+        ]
+        for field in (
+            "load1",
+            "load5",
+            "load15",
+            "mem_available_kib",
+            "swap_free_kib",
+            "thermal_max_millic",
+        )
+    }
+    return [
+        {
+            "samples": len(rows),
+            "ok_samples": sum(row.get("status") == "ok" for row in rows),
+            "partial_samples": sum(
+                row.get("status") == "partial" for row in rows
+            ),
+            "max_load1": format_float(
+                max(numeric["load1"]) if numeric["load1"] else None
+            ),
+            "max_load5": format_float(
+                max(numeric["load5"]) if numeric["load5"] else None
+            ),
+            "max_load15": format_float(
+                max(numeric["load15"]) if numeric["load15"] else None
+            ),
+            "min_mem_available_kib": format_float(
+                min(numeric["mem_available_kib"])
+                if numeric["mem_available_kib"]
+                else None
+            ),
+            "min_swap_free_kib": format_float(
+                min(numeric["swap_free_kib"])
+                if numeric["swap_free_kib"]
+                else None
+            ),
+            "max_thermal_millic": format_float(
+                max(numeric["thermal_max_millic"])
+                if numeric["thermal_max_millic"]
+                else None
+            ),
+            "last_thermal_zone": last_present(
+                row.get("thermal_zone", "") for row in rows
+            ),
+            "last_status": rows[-1].get("status", ""),
+        }
+    ]
+
+
+def _counter_delta(rows: list[dict[str, str]], field: str) -> tuple[object, int]:
+    values = [
+        value
+        for row in rows
+        if (value := as_nonnegative_int(row.get(field))) is not None
+    ]
+    if len(values) < 2:
+        return "", 0
+    total = 0
+    resets = 0
+    for previous, current in zip(values, values[1:]):
+        if current >= previous:
+            total += current - previous
+        else:
+            total += current
+            resets += 1
+    return total, resets
+
+
+def summarize_network_health(
+    rows: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        interface = row.get("interface", "")
+        if interface:
+            grouped[interface].append(row)
+
+    summaries: list[dict[str, object]] = []
+    for interface in sorted(grouped):
+        interface_rows = grouped[interface]
+        deltas: dict[str, object] = {}
+        reset_count = 0
+        for field in NETWORK_COUNTER_FIELDS:
+            delta, resets = _counter_delta(interface_rows, field)
+            deltas[f"{field}_delta"] = delta
+            reset_count += resets
+        summaries.append(
+            {
+                "interface": interface,
+                "samples": len(interface_rows),
+                "ok_samples": sum(
+                    row.get("status") == "ok" for row in interface_rows
+                ),
+                "partial_samples": sum(
+                    row.get("status") == "partial" for row in interface_rows
+                ),
+                "down_samples": sum(
+                    row.get("operstate") != "up" or row.get("carrier") != "1"
+                    for row in interface_rows
+                ),
+                "last_operstate": interface_rows[-1].get("operstate", ""),
+                "last_carrier": interface_rows[-1].get("carrier", ""),
+                **deltas,
+                "counter_resets": reset_count,
+            }
+        )
+    return summaries
+
+
+def summarize_hesai(rows: list[dict[str, str]]) -> list[dict[str, object]]:
+    if not rows:
+        return []
+
+    frames = [
+        value
+        for row in rows
+        if (value := as_nonnegative_int(row.get("last_frame"))) is not None
+    ]
+    frame_deltas = [
+        value
+        for row in rows
+        if (value := as_nonnegative_int(row.get("frame_delta"))) is not None
+    ]
+    points = [
+        value
+        for row in rows
+        if (value := as_nonnegative_int(row.get("last_points"))) is not None
+    ]
+    packets = [
+        value
+        for row in rows
+        if (value := as_nonnegative_int(row.get("last_packets"))) is not None
+    ]
+    file_sizes = [
+        value
+        for row in rows
+        if (value := as_nonnegative_int(row.get("file_size_bytes"))) is not None
+    ]
+    warning_counts = [
+        value
+        for row in rows
+        if (value := as_nonnegative_int(row.get("tail_warning_lines")))
+        is not None
+    ]
+    error_counts = [
+        value
+        for row in rows
+        if (value := as_nonnegative_int(row.get("tail_error_lines")))
+        is not None
+    ]
+    statuses = Counter(row.get("status", "") for row in rows)
+    return [
+        {
+            "samples": len(rows),
+            "ok_samples": statuses["ok"],
+            "missing_samples": statuses["missing"],
+            "unparsed_samples": statuses["unparsed"],
+            "frame_reset_samples": statuses["frame_reset"],
+            "first_frame": frames[0] if frames else "",
+            "last_frame": frames[-1] if frames else "",
+            "frame_advance_total": sum(frame_deltas),
+            "max_frame_delta": max(frame_deltas) if frame_deltas else "",
+            "last_points": points[-1] if points else "",
+            "last_packets": packets[-1] if packets else "",
+            "latest_file_size_bytes": file_sizes[-1] if file_sizes else "",
+            "max_file_size_bytes": max(file_sizes) if file_sizes else "",
+            "max_tail_warning_lines": (
+                max(warning_counts) if warning_counts else ""
+            ),
+            "max_tail_error_lines": max(error_counts) if error_counts else "",
+            "last_status": rows[-1].get("status", ""),
+        }
+    ]
 
 
 def summarize_sdk2_commands(rows: list[dict[str, str]]) -> dict[str, object]:
@@ -1617,6 +2069,10 @@ def generate_report(
     dense_output_mode, dense_output_source = load_dense_output_mode(session)
     rate_rows = read_csv(session / "topic_rates.csv")
     process_rows = read_csv(session / "process_health.csv")
+    timing_rows = read_csv(session / "topic_timing.csv")
+    system_rows = read_csv(session / "system_health.csv")
+    network_rows = read_csv(session / "network_health.csv")
+    hesai_rows = read_csv(session / "hesai_summary.csv")
     sdk2_rows = read_csv(session / "sdk2_commands.csv")
     raw_odometry_rows = read_csv(session / "odom_position.csv")
     body_odometry_rows = read_csv(session / "body_odom_pose.csv")
@@ -1627,6 +2083,10 @@ def generate_report(
     planner_summary = summarize_planner_inspections(planner_records)
     rate_summaries = summarize_rates(rate_rows)
     process_summaries = summarize_processes(process_rows)
+    timing_summaries = summarize_topic_timing(timing_rows)
+    system_summaries = summarize_system_health(system_rows)
+    network_summaries = summarize_network_health(network_rows)
+    hesai_summaries = summarize_hesai(hesai_rows)
     sdk2_summary = summarize_sdk2_commands(sdk2_rows)
     raw_odometry_summary, raw_odometry_samples = summarize_odometry(
         raw_odometry_rows,
@@ -1650,6 +2110,10 @@ def generate_report(
     output_dir.mkdir(parents=True, exist_ok=True)
     rate_csv = output_dir / "topic_rates_summary.csv"
     process_csv = output_dir / "process_health_summary.csv"
+    timing_csv = output_dir / "topic_timing_summary.csv"
+    system_csv = output_dir / "system_health_summary.csv"
+    network_csv = output_dir / "network_health_summary.csv"
+    hesai_csv = output_dir / "hesai_driver_summary.csv"
     sdk2_csv = output_dir / "sdk2_command_summary.csv"
     odometry_csv = output_dir / "body_odometry_audit.csv"
     planner_csv = output_dir / "planner_input_summary.csv"
@@ -1663,8 +2127,28 @@ def generate_report(
     )
     write_csv_atomic(
         process_csv,
-        ("component", "samples", "running_samples", "running_percent", "last_state", "last_pids"),
+        PROCESS_SUMMARY_FIELDS,
         process_summaries,
+    )
+    write_csv_atomic(
+        timing_csv,
+        TOPIC_TIMING_SUMMARY_FIELDS,
+        timing_summaries,
+    )
+    write_csv_atomic(
+        system_csv,
+        SYSTEM_HEALTH_SUMMARY_FIELDS,
+        system_summaries,
+    )
+    write_csv_atomic(
+        network_csv,
+        NETWORK_HEALTH_SUMMARY_FIELDS,
+        network_summaries,
+    )
+    write_csv_atomic(
+        hesai_csv,
+        HESAI_SUMMARY_FIELDS,
+        hesai_summaries,
     )
     sdk2_output = {
         **sdk2_summary,
@@ -1846,6 +2330,38 @@ def generate_report(
                 maximum=format_rate(rate_value(summary, "max_hz")),
                 latest=format_rate(rate_value(summary, "latest_hz")),
             )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Topic Timing",
+            "",
+            "| Topic | Windows | OK | No data | Messages | Unique headers | Duplicate | Nonmonotonic | Invalid | Mean msg/s | Header age min / max (ms) | Max receive gap (ms) |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |",
+        ]
+    )
+    if timing_summaries:
+        for summary in timing_summaries:
+            lines.append(
+                f"| {markdown_cell(summary['topic'])} | {summary['windows']} | "
+                f"{summary['ok_windows']} | {summary['no_data_windows']} | "
+                f"{summary['total_messages']} | {summary['unique_headers']} | "
+                f"{summary['duplicate_headers']} | "
+                f"{summary['nonmonotonic_headers']} | "
+                f"{summary['invalid_headers']} | "
+                f"{planner_markdown_value(summary['mean_messages_per_sec'])} | "
+                f"{planner_markdown_value(summary['min_latest_header_age_ms'])} / "
+                f"{planner_markdown_value(summary['max_latest_header_age_ms'])} | "
+                f"{planner_markdown_value(summary['max_receive_gap_ms'])} |"
+            )
+    else:
+        lines.extend(
+            [
+                "| - | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | - | - | - |",
+                "",
+                "No topic timing windows were captured.",
+            ]
         )
 
     lines.extend(
@@ -2057,8 +2573,8 @@ def generate_report(
             "",
             "## Process Health",
             "",
-            "| Component | Samples | Running | Running % | Last state | Last PIDs |",
-            "| --- | ---: | ---: | ---: | --- | --- |",
+            "| Component | Samples | Running | Running % | Mean CPU % | Max CPU % | Max RSS KiB | Max threads | Metric OK / partial / baseline | Last state | Last PIDs | Last process states |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |",
         ]
     )
     if process_summaries:
@@ -2066,10 +2582,123 @@ def generate_report(
             lines.append(
                 f"| {markdown_cell(summary['component'])} | {summary['samples']} | "
                 f"{summary['running_samples']} | {summary['running_percent']} | "
-                f"{summary['last_state']} | {markdown_cell(summary['last_pids']) or '-'} |"
+                f"{planner_markdown_value(summary['mean_cpu_percent'])} | "
+                f"{planner_markdown_value(summary['max_cpu_percent'])} | "
+                f"{planner_markdown_value(summary['max_rss_kib'])} | "
+                f"{planner_markdown_value(summary['max_threads'])} | "
+                f"{summary['metrics_ok_samples']} / "
+                f"{summary['metrics_partial_samples']} / "
+                f"{summary['metrics_baseline_samples']} | "
+                f"{summary['last_state']} | "
+                f"{markdown_cell(summary['last_pids']) or '-'} | "
+                f"{markdown_cell(summary['last_states']) or '-'} |"
             )
     else:
-        lines.append("| - | 0 | 0 | - | - | - |")
+        lines.append("| - | 0 | 0 | - | - | - | - | - | 0 / 0 / 0 | - | - | - |")
+
+    lines.extend(
+        [
+            "",
+            "## System Health",
+            "",
+            "| Samples | OK | Partial | Max load 1/5/15 | Min memory available (KiB) | Min swap free (KiB) | Max thermal (milli-C) | Last thermal zone | Last status |",
+            "| ---: | ---: | ---: | --- | ---: | ---: | ---: | --- | --- |",
+        ]
+    )
+    if system_summaries:
+        summary = system_summaries[0]
+        lines.append(
+            f"| {summary['samples']} | {summary['ok_samples']} | "
+            f"{summary['partial_samples']} | "
+            f"{planner_markdown_value(summary['max_load1'])} / "
+            f"{planner_markdown_value(summary['max_load5'])} / "
+            f"{planner_markdown_value(summary['max_load15'])} | "
+            f"{planner_markdown_value(summary['min_mem_available_kib'])} | "
+            f"{planner_markdown_value(summary['min_swap_free_kib'])} | "
+            f"{planner_markdown_value(summary['max_thermal_millic'])} | "
+            f"{markdown_cell(summary['last_thermal_zone']) or '-'} | "
+            f"{markdown_cell(summary['last_status']) or '-'} |"
+        )
+    else:
+        lines.extend(
+            [
+                "| 0 | 0 | 0 | - | - | - | - | - | - |",
+                "",
+                "No system health samples were captured.",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Network Health",
+            "",
+            "| Interface | Samples | OK | Partial | Down | Last state / carrier | RX bytes / packets | RX errors / drops | TX bytes / packets | TX errors / drops | Counter resets |",
+            "| --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    if network_summaries:
+        for summary in network_summaries:
+            lines.append(
+                f"| {markdown_cell(summary['interface'])} | {summary['samples']} | "
+                f"{summary['ok_samples']} | {summary['partial_samples']} | "
+                f"{summary['down_samples']} | "
+                f"{markdown_cell(summary['last_operstate']) or '-'} / "
+                f"{markdown_cell(summary['last_carrier']) or '-'} | "
+                f"{planner_markdown_value(summary['rx_bytes_delta'])} / "
+                f"{planner_markdown_value(summary['rx_packets_delta'])} | "
+                f"{planner_markdown_value(summary['rx_errors_delta'])} / "
+                f"{planner_markdown_value(summary['rx_dropped_delta'])} | "
+                f"{planner_markdown_value(summary['tx_bytes_delta'])} / "
+                f"{planner_markdown_value(summary['tx_packets_delta'])} | "
+                f"{planner_markdown_value(summary['tx_errors_delta'])} / "
+                f"{planner_markdown_value(summary['tx_dropped_delta'])} | "
+                f"{summary['counter_resets']} |"
+            )
+    else:
+        lines.extend(
+            [
+                "| - | 0 | 0 | 0 | 0 | - / - | - / - | - / - | - / - | - / - | 0 |",
+                "",
+                "No network health samples were captured.",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Hesai Driver Summary",
+            "",
+            "| Samples | OK | Missing | Unparsed | Frame reset | First / last frame | Frame advance | Max delta | Last points / packets | Latest / max log bytes | Max tail warning / error | Last status |",
+            "| ---: | ---: | ---: | ---: | ---: | --- | ---: | ---: | --- | --- | --- | --- |",
+        ]
+    )
+    if hesai_summaries:
+        summary = hesai_summaries[0]
+        lines.append(
+            f"| {summary['samples']} | {summary['ok_samples']} | "
+            f"{summary['missing_samples']} | {summary['unparsed_samples']} | "
+            f"{summary['frame_reset_samples']} | "
+            f"{planner_markdown_value(summary['first_frame'])} / "
+            f"{planner_markdown_value(summary['last_frame'])} | "
+            f"{summary['frame_advance_total']} | "
+            f"{planner_markdown_value(summary['max_frame_delta'])} | "
+            f"{planner_markdown_value(summary['last_points'])} / "
+            f"{planner_markdown_value(summary['last_packets'])} | "
+            f"{planner_markdown_value(summary['latest_file_size_bytes'])} / "
+            f"{planner_markdown_value(summary['max_file_size_bytes'])} | "
+            f"{planner_markdown_value(summary['max_tail_warning_lines'])} / "
+            f"{planner_markdown_value(summary['max_tail_error_lines'])} | "
+            f"{markdown_cell(summary['last_status']) or '-'} |"
+        )
+    else:
+        lines.extend(
+            [
+                "| 0 | 0 | 0 | 0 | 0 | - / - | 0 | - | - / - | - / - | - / - | - |",
+                "",
+                "No Hesai driver samples were captured.",
+            ]
+        )
 
     lines.extend(
         [
@@ -2112,8 +2741,9 @@ def generate_report(
             "",
             "The analyzer does not modify raw files. Review `events.jsonl`, `topic_rates.csv`, "
             "`odom_position.csv`, `body_odom_pose.csv`, `sdk2_commands.csv`, `process_health.csv`, "
-            "`planner_input_inspections.jsonl`, `rosout_warn_error.txt`, parameter dumps, "
-            "and the Git/network/environment snapshots alongside this report.",
+            "`topic_timing.csv`, `system_health.csv`, `network_health.csv`, `hesai_summary.csv`, "
+            "`planner_input_inspections.jsonl`, `rosout_warn_error.txt`, parameter dumps, and the "
+            "Git/network/environment snapshots alongside this report.",
             "",
         ]
     )
@@ -2149,6 +2779,10 @@ def main() -> int:
     print(f"Report: {report}")
     print(f"Topic summary: {rate_csv}")
     print(f"Process summary: {process_csv}")
+    print(f"Topic timing summary: {output_dir / 'topic_timing_summary.csv'}")
+    print(f"System health summary: {output_dir / 'system_health_summary.csv'}")
+    print(f"Network health summary: {output_dir / 'network_health_summary.csv'}")
+    print(f"Hesai driver summary: {output_dir / 'hesai_driver_summary.csv'}")
     print(f"SDK2 summary: {sdk2_csv}")
     print(f"Body odometry audit: {odometry_csv}")
     print(f"Planner input summary: {planner_csv}")

@@ -5,13 +5,23 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <stdexcept>
 
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 
 namespace utree_dog_navigation
 {
+namespace
+{
+bool validRosTimestamp(const builtin_interfaces::msg::Time & stamp) noexcept
+{
+  return stamp.sec >= 0 && stamp.nanosec < 1000000000U &&
+         (stamp.sec != 0 || stamp.nanosec != 0U);
+}
+}  // namespace
 
-TerrainMapperNode::TerrainMapperNode() : Node("terrain_mapper")
+TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
+: Node("terrain_mapper", options)
 {
   map_frame_ = declare_parameter("map_frame", "world");
   cloud_topic_ = declare_parameter("cloud_topic", "/lio/cloud_world");
@@ -39,6 +49,13 @@ TerrainMapperNode::TerrainMapperNode() : Node("terrain_mapper")
   self_width_ = declare_parameter("self_filter.width", 0.55);
   self_height_ = declare_parameter("self_filter.height", 0.7);
   publish_rate_ = declare_parameter("publish_rate", 2.0);
+  cloud_stale_warning_age_ = declare_parameter("cloud_stale_warning_age", 1.0);
+  if (!std::isfinite(cloud_stale_warning_age_) ||
+    cloud_stale_warning_age_ < 0.001 || cloud_stale_warning_age_ > 60.0)
+  {
+    throw std::invalid_argument(
+            "cloud_stale_warning_age must be finite and in [0.001, 60] seconds");
+  }
   map_builder_ = std::make_unique<TerrainMapBuilder>(config);
 
   const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
@@ -83,6 +100,13 @@ void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Share
       msg->header.frame_id.c_str(), map_frame_.c_str());
     return;
   }
+  if (!validRosTimestamp(msg->header.stamp)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Rejected point cloud with invalid timestamp sec=%d nanosec=%u",
+      msg->header.stamp.sec, msg->header.stamp.nanosec);
+    return;
+  }
 
   sensor_msgs::PointCloud2ConstIterator<float> x(*msg, "x");
   sensor_msgs::PointCloud2ConstIterator<float> y(*msg, "y");
@@ -107,10 +131,45 @@ void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Share
     static_cast<double>(msg->header.stamp.nanosec) * 1.0e-9;
   map_builder_->integrateFrame(accepted_points, stamp_seconds);
   last_cloud_stamp_ = msg->header.stamp;
+  last_cloud_received_ = std::chrono::steady_clock::now();
 }
 
 void TerrainMapperNode::publishMap()
 {
+  const rclcpp::Time current_time = now();
+  if (last_cloud_received_ == std::chrono::steady_clock::time_point{}) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Terrain map has not received an accepted world-frame point cloud");
+  } else if (!validRosTimestamp(last_cloud_stamp_)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Terrain source cloud state has an invalid timestamp sec=%d nanosec=%u",
+      last_cloud_stamp_.sec, last_cloud_stamp_.nanosec);
+  } else {
+    const rclcpp::Time cloud_time(last_cloud_stamp_, current_time.get_clock_type());
+    const double header_age = (current_time - cloud_time).seconds();
+    const double receive_gap = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - last_cloud_received_).count();
+    if (!std::isfinite(header_age) || !std::isfinite(receive_gap) ||
+      header_age > cloud_stale_warning_age_ || receive_gap > cloud_stale_warning_age_ ||
+      header_age < -0.2)
+    {
+      const char * classification = "invalid_timing";
+      if (receive_gap > cloud_stale_warning_age_) {
+        classification = "accepted_cloud_callbacks_stopped";
+      } else if (header_age > cloud_stale_warning_age_) {
+        classification = "stale_source_stamp_or_cloud_backlog";
+      } else if (header_age < -0.2) {
+        classification = "source_stamp_from_future";
+      }
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Terrain source cloud timing is invalid: classification=%s, header_age=%.3f s, "
+        "receive_gap=%.3f s, warning threshold=%.3f s",
+        classification, header_age, receive_gap, cloud_stale_warning_age_);
+    }
+  }
   const auto terrain = map_builder_->build(last_cloud_stamp_, map_frame_);
   terrain_pub_->publish(terrain);
   cost_pub_->publish(makeCostmap(terrain));

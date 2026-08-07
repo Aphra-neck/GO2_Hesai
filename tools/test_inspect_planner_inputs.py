@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from inspect_planner_inputs import (
     GridSnapshot,
     InputContract,
+    PlannerFreshnessSettings,
     PlannerThresholds,
     Pose2D,
     SubscriptionSpec,
@@ -261,7 +262,16 @@ class LiveParameterServiceTests(unittest.TestCase):
             [
                 FakeParameterFuture(
                     response=parameter_response(
-                        None, 0.21, 0.61, 0.19, 0.55, 0.45
+                        None,
+                        0.21,
+                        0.61,
+                        0.19,
+                        0.55,
+                        0.45,
+                        0.8,
+                        0.4,
+                        0.15,
+                        12.0,
                     )
                 )
             ]
@@ -282,7 +292,7 @@ class LiveParameterServiceTests(unittest.TestCase):
             del unused_node, unused_future
             response_timeouts.append(timeout_sec)
 
-        thresholds = _read_live_planner_thresholds(
+        thresholds, freshness = _read_live_planner_thresholds(
             node,
             FakeGetParameters,
             FakeParameterType,
@@ -306,6 +316,15 @@ class LiveParameterServiceTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
+            freshness,
+            PlannerFreshnessSettings(
+                max_map_age=0.8,
+                max_odom_age=0.4,
+                future_tolerance=0.15,
+                input_watchdog_rate=12.0,
+            ),
+        )
+        self.assertEqual(
             mapper_client.requests,
             [
                 ["min_observed_frames", "max_slope", "max_roughness"],
@@ -320,6 +339,10 @@ class LiveParameterServiceTests(unittest.TestCase):
                 "max_step_height",
                 "start_snap_radius",
                 "snap_radius",
+                "max_map_age",
+                "max_odom_age",
+                "timestamp_future_tolerance",
+                "input_watchdog_rate",
             ]],
         )
         self.assertEqual(response_timeouts, [0.5, 0.5, 0.5])
@@ -382,7 +405,16 @@ class LiveParameterServiceTests(unittest.TestCase):
                     [
                         FakeParameterFuture(
                             response=parameter_response(
-                                None, 0.21, 0.61, 0.19, 0.55, 0.45
+                                None,
+                                0.21,
+                                0.61,
+                                0.19,
+                                0.55,
+                                0.45,
+                                0.8,
+                                0.4,
+                                0.15,
+                                12.0,
                             )
                         )
                     ]
@@ -419,7 +451,16 @@ class LiveParameterServiceTests(unittest.TestCase):
                     [
                         FakeParameterFuture(
                             response=parameter_response(
-                                None, 0.21, 0.61, 0.19, 0.55, 0.45
+                                None,
+                                0.21,
+                                0.61,
+                                0.19,
+                                0.55,
+                                0.45,
+                                0.8,
+                                0.4,
+                                0.15,
+                                12.0,
                             )
                         )
                     ]

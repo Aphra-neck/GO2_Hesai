@@ -36,6 +36,8 @@ terrain_mapper:
     height_bin_resolution: 0.015
     confidence_frames: 8.0
     publish_rate: 2.0
+    # Diagnostic only: warn when cloud delivery or its source stamp stops advancing.
+    cloud_stale_warning_age: 1.0
 
 body_lattice_planner:
   ros__parameters:
@@ -43,6 +45,14 @@ body_lattice_planner:
     odom_topic: /lio/body_odom
     goal_topic: /goal_pose
     path_topic: body_path
+    map_frame: world
+    body_frame: base_link
+    # Reject planning inputs whose sensor timestamps no longer advance. The
+    # watchdog clears a previously published transient-local path on timeout.
+    max_map_age: 1.0
+    max_odom_age: 0.5
+    timestamp_future_tolerance: 0.2
+    input_watchdog_rate: 10.0
     yaw_bins: 16
     motion_step: 0.20
     nominal_body_height: 0.42

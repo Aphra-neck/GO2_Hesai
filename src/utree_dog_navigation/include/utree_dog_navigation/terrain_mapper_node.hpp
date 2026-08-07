@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -18,7 +19,8 @@ namespace utree_dog_navigation
 class TerrainMapperNode : public rclcpp::Node
 {
 public:
-  TerrainMapperNode();
+  explicit TerrainMapperNode(
+    const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
 
 private:
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
@@ -38,10 +40,12 @@ private:
   double self_width_{0.55};
   double self_height_{0.7};
   double publish_rate_{2.0};
+  double cloud_stale_warning_age_{1.0};
   double robot_x_{0.0};
   double robot_y_{0.0};
   double robot_z_{0.0};
   bool have_odom_{false};
+  std::chrono::steady_clock::time_point last_cloud_received_{};
   builtin_interfaces::msg::Time last_cloud_stamp_;
   std::unique_ptr<TerrainMapBuilder> map_builder_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
