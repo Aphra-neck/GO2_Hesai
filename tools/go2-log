@@ -1202,20 +1202,28 @@ capture_ros_graph() {
   printf '%s\n' "${nodes}" > "${session_dir}/nodes.txt"
   cap_text_file "${session_dir}/nodes.txt"
 
-  local node safe_name output_file
+  local node safe_name output_file param_status
   while IFS= read -r node; do
     (( stop_requested_ref == 0 )) || break
     [[ "${node}" =~ (super_lio|body_odom_adapter|terrain_mapper|body_lattice_planner|go2_sdk2_bridge|go2_imu_bridge|hesai_ros_driver) ]] || continue
     safe_name="$(printf '%s' "${node#/}" | tr -c 'A-Za-z0-9_.-' '_')"
     output_file="${session_dir}/parameters_${safe_name}.yaml"
     [[ -f "${output_file}" ]] && continue
-    timeout 8 ros2 param dump --no-daemon --spin-time 5 "${node}" \
-      > "${output_file}.tmp" 2>&1 || true
-    if [[ -s "${output_file}.tmp" ]]; then
+    # Humble param dump creates two DirectNodes before querying services.
+    param_status=0
+    timeout 15 ros2 param dump --no-daemon --spin-time 3 "${node}" \
+      > "${output_file}.tmp" 2>&1 || param_status=$?
+    if (( stop_requested_ref != 0 )); then
+      rm -f -- "${output_file}.tmp"
+      break
+    fi
+    if (( param_status == 0 )) && [[ -s "${output_file}.tmp" ]]; then
       cap_text_file "${output_file}.tmp"
       mv -f -- "${output_file}.tmp" "${output_file}"
     else
       rm -f -- "${output_file}.tmp"
+      append_event "${session_dir}" warning collector \
+        "parameter capture for ${node} failed or was empty (exit ${param_status}); will retry"
     fi
   done <<< "${nodes}"
 }
