@@ -1187,7 +1187,8 @@ capture_ros_graph() {
   (( $(session_bytes "${session_dir}") < SESSION_STOP_BYTES )) || return 0
   (( stop_requested_ref == 0 )) || return 0
 
-  timeout 8 ros2 topic list -t > "${session_dir}/topics.txt.tmp" 2>&1 || true
+  timeout 8 ros2 topic list --no-daemon --spin-time 3 -t \
+    > "${session_dir}/topics.txt.tmp" 2>&1 || true
   if (( stop_requested_ref != 0 )); then
     rm -f -- "${session_dir}/topics.txt.tmp"
     return 0
@@ -1196,7 +1197,7 @@ capture_ros_graph() {
   mv -f -- "${session_dir}/topics.txt.tmp" "${session_dir}/topics.txt"
 
   local nodes
-  nodes="$(timeout 8 ros2 node list 2>/dev/null || true)"
+  nodes="$(timeout 8 ros2 node list --no-daemon --spin-time 3 2>/dev/null || true)"
   (( stop_requested_ref == 0 )) || return 0
   printf '%s\n' "${nodes}" > "${session_dir}/nodes.txt"
   cap_text_file "${session_dir}/nodes.txt"
@@ -1208,7 +1209,8 @@ capture_ros_graph() {
     safe_name="$(printf '%s' "${node#/}" | tr -c 'A-Za-z0-9_.-' '_')"
     output_file="${session_dir}/parameters_${safe_name}.yaml"
     [[ -f "${output_file}" ]] && continue
-    timeout 8 ros2 param dump "${node}" > "${output_file}.tmp" 2>&1 || true
+    timeout 8 ros2 param dump --no-daemon --spin-time 5 "${node}" \
+      > "${output_file}.tmp" 2>&1 || true
     if [[ -s "${output_file}.tmp" ]]; then
       cap_text_file "${output_file}.tmp"
       mv -f -- "${output_file}.tmp" "${output_file}"
@@ -1417,7 +1419,7 @@ sample_sdk2_command() {
     return 0
   fi
 
-  result="$(timeout 3 ros2 topic echo --once \
+  result="$(timeout 3 ros2 topic echo --no-daemon --spin-time 1 --once \
     /sdk2_command geometry_msgs/msg/TwistStamped --field twist 2>/dev/null || true)"
   vx="$(awk '
     /^linear:$/ {section="linear"; next}
@@ -1747,7 +1749,7 @@ run_rosout_collector() {
 
   # A 32 MiB per-file ceiling stays inside the headroom above the stop threshold.
   ulimit -f 32768 2>/dev/null || true
-  ros2 topic echo /rosout 2>/dev/null | awk '
+  ros2 topic echo --no-daemon --spin-time 3 /rosout 2>/dev/null | awk '
     BEGIN { RS="---[[:space:]]*\n"; ORS="---\n" }
     /(^|\n)level: (30|40|50)(\n|$)/ { print; fflush() }
   ' >> "${session_dir}/rosout_warn_error.txt"
