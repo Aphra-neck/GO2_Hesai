@@ -44,6 +44,7 @@ private:
   double robot_x_{0.0};
   double robot_y_{0.0};
   double robot_z_{0.0};
+  double robot_yaw_{0.0};
   bool have_odom_{false};
   std::chrono::steady_clock::time_point last_cloud_received_{};
   builtin_interfaces::msg::Time last_cloud_stamp_;

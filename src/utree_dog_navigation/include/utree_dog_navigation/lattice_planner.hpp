@@ -1,15 +1,35 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <string_view>
 #include <vector>
 
 #include "utree_dog_msgs/msg/terrain_grid.hpp"
 
 namespace utree_dog_navigation
 {
+
+struct VerifiedFlatStartConfig
+{
+  bool enabled{false};
+  double support_inner_radius{1.0};
+  double support_outer_radius{2.5};
+  double fill_radius{1.35};
+  int sector_count{8};
+  int min_supported_sectors{7};
+  int min_cells_per_sector{3};
+  int min_support_cells{32};
+  int min_observation_count{4};
+  double max_plane_slope{0.15};
+  double max_plane_rmse{0.04};
+  double max_plane_residual{0.10};
+  double max_elevation_range{0.18};
+  double inferred_traversability{0.20};
+};
 
 struct LatticePlannerConfig
 {
@@ -29,6 +49,7 @@ struct LatticePlannerConfig
   double snap_radius{0.5};
   // A negative value preserves the legacy contract: use snap_radius for both endpoints.
   double start_snap_radius{-1.0};
+  VerifiedFlatStartConfig verified_flat_start{};
 };
 
 struct GridState
@@ -45,11 +66,44 @@ struct WorldState
   double yaw{0.0};
 };
 
+enum class VerifiedFlatStartStatus : std::uint8_t
+{
+  kNotNeeded,
+  kDisabled,
+  kApplied,
+  kInvalidConfiguration,
+  kMissingObservationLayer,
+  kInsufficientSupport,
+  kInsufficientSectors,
+  kPlaneFitFailed,
+  kSupportNotFlat,
+  kNoInferredStartCell,
+  kNoObservedConnection,
+};
+
+std::string_view verifiedFlatStartStatusName(VerifiedFlatStartStatus status) noexcept;
+
+struct PlannedGridState
+{
+  int x{0};
+  int y{0};
+  int yaw{0};
+  bool inferred{false};
+  double elevation{0.0};
+  double dzdx{0.0};
+  double dzdy{0.0};
+};
+
 struct PlanningResult
 {
   bool success{false};
   int expansions{0};
-  std::vector<GridState> states;
+  VerifiedFlatStartStatus start_status{VerifiedFlatStartStatus::kNotNeeded};
+  bool exact_start_inferred{false};
+  double exact_start_elevation{0.0};
+  double exact_start_dzdx{0.0};
+  double exact_start_dzdy{0.0};
+  std::vector<PlannedGridState> states;
 };
 
 // Sparse A* over body position and heading. The class is independent of ROS nodes
@@ -78,19 +132,60 @@ private:
     double factor;
   };
 
+  struct SearchState
+  {
+    GridState grid;
+    bool inferred_prefix{false};
+  };
+
+  struct PlanningOverlay
+  {
+    bool active{false};
+    double center_x{0.0};
+    double center_y{0.0};
+    double plane_x{0.0};
+    double plane_y{0.0};
+    double plane_z{0.0};
+    double slope{0.0};
+    double traversability{0.0};
+    std::vector<std::uint8_t> inferred_cells;
+  };
+
+  struct CellProperties
+  {
+    double elevation{0.0};
+    double slope{0.0};
+    double traversability{0.0};
+    bool inferred{false};
+  };
+
+  std::array<Motion, 10> motions() const;
   bool toGrid(double x, double y, int & gx, int & gy) const;
   bool inside(int x, int y) const;
   std::size_t cellAddress(int x, int y) const;
-  std::uint64_t key(const GridState & state) const;
-  GridState decode(std::uint64_t value) const;
+  std::uint64_t key(const SearchState & state) const;
+  SearchState decode(std::uint64_t value) const;
   int yawBin(double yaw) const;
-  bool validCell(int x, int y) const;
-  bool nearestValid(
+  bool observedValidCell(int x, int y) const;
+  bool nearestObservedValid(
     double world_x, double world_y, double snap_radius, int & x, int & y) const;
+  bool verifiedFlatConfigurationValid() const;
+  VerifiedFlatStartStatus buildVerifiedFlatOverlay(
+    double start_x, double start_y, PlanningOverlay & overlay) const;
+  bool overlayCell(int x, int y, const PlanningOverlay & overlay) const;
+  bool inferredStartConnectsToObserved(
+    const SearchState & start, const PlanningOverlay & overlay) const;
+  bool cellProperties(
+    int x, int y, const PlanningOverlay & overlay, bool allow_inferred,
+    CellProperties & properties) const;
+  double surfaceElevation(
+    int x, int y, const PlanningOverlay & overlay, double fallback) const;
   double heuristic(const GridState & state, const GridState & goal) const;
   bool transition(
-    const GridState & current, const Motion & motion, GridState & next,
-    double & transition_cost) const;
+    const SearchState & current, const Motion & motion, const PlanningOverlay & overlay,
+    SearchState & next, double & transition_cost) const;
+  PlannedGridState plannedState(
+    const SearchState & state, const PlanningOverlay & overlay) const;
 
   LatticePlannerConfig config_;
   utree_dog_msgs::msg::TerrainGrid::SharedPtr map_;

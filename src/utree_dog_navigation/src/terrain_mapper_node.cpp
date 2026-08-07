@@ -13,6 +13,8 @@ namespace utree_dog_navigation
 {
 namespace
 {
+constexpr double kQuaternionNormEpsilon = 1.0e-12;
+
 bool validRosTimestamp(const builtin_interfaces::msg::Time & stamp) noexcept
 {
   return stamp.sec >= 0 && stamp.nanosec < 1000000000U &&
@@ -79,9 +81,29 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
 
 void TerrainMapperNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
+  const auto & orientation = msg->pose.pose.orientation;
+  const double norm_squared =
+    orientation.x * orientation.x + orientation.y * orientation.y +
+    orientation.z * orientation.z + orientation.w * orientation.w;
+  if (!std::isfinite(norm_squared) || norm_squared <= kQuaternionNormEpsilon ||
+    !std::isfinite(orientation.x) || !std::isfinite(orientation.y) ||
+    !std::isfinite(orientation.z) || !std::isfinite(orientation.w))
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Rejected odometry with a non-finite or zero-norm orientation");
+    return;
+  }
+
+  const double inverse_norm = 1.0 / std::sqrt(norm_squared);
+  const double x = orientation.x * inverse_norm;
+  const double y = orientation.y * inverse_norm;
+  const double z = orientation.z * inverse_norm;
+  const double w = orientation.w * inverse_norm;
   robot_x_ = msg->pose.pose.position.x;
   robot_y_ = msg->pose.pose.position.y;
   robot_z_ = msg->pose.pose.position.z;
+  robot_yaw_ = std::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
   have_odom_ = true;
 }
 
@@ -113,6 +135,8 @@ void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Share
   sensor_msgs::PointCloud2ConstIterator<float> z(*msg, "z");
   std::vector<TerrainPoint> accepted_points;
   accepted_points.reserve(msg->width * msg->height / 2);
+  const double cos_yaw = std::cos(robot_yaw_);
+  const double sin_yaw = std::sin(robot_yaw_);
   for (; x != x.end(); ++x, ++y, ++z) {
     if (!std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z)) {continue;}
     const double dx = *x - robot_x_;
@@ -121,9 +145,10 @@ void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Share
     const double range = std::hypot(dx, dy);
     if (range < min_range_ || range > max_range_ ||
       dz < min_z_relative_ || dz > max_z_relative_) {continue;}
-    // Axis-aligned self filtering assumes the Super-LIO body frame is close to map yaw.
-    // A future footprint filter can rotate this box using odometry orientation.
-    if (std::abs(dx) < self_length_ * 0.5 && std::abs(dy) < self_width_ * 0.5 &&
+    const double body_x = cos_yaw * dx + sin_yaw * dy;
+    const double body_y = -sin_yaw * dx + cos_yaw * dy;
+    if (std::abs(body_x) < self_length_ * 0.5 &&
+      std::abs(body_y) < self_width_ * 0.5 &&
       std::abs(dz) < self_height_ * 0.5) {continue;}
     accepted_points.push_back({*x, *y, *z});
   }

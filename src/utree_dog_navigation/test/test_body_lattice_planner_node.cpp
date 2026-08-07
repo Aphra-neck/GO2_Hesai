@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <functional>
 #include <limits>
@@ -62,6 +63,7 @@ protected:
       rclcpp::Parameter("max_odom_age", 1.0),
       rclcpp::Parameter("timestamp_future_tolerance", 0.05),
       rclcpp::Parameter("input_watchdog_rate", 50.0),
+      rclcpp::Parameter("verified_flat_start.enabled", true),
     });
     planner_node_ = std::make_shared<BodyLatticePlannerNode>(options);
     harness_node_ = std::make_shared<rclcpp::Node>("planner_safety_harness_" + suffix);
@@ -140,6 +142,39 @@ protected:
     map.elevation.assign(cell_count, value);
     map.slope.assign(cell_count, value);
     map.traversability.assign(cell_count, traversable ? 1.0F : map.unknown_value);
+    return map;
+  }
+
+  utree_dog_msgs::msg::TerrainGrid makeStandingBlindRingMap(
+    const rclcpp::Time & stamp) const
+  {
+    utree_dog_msgs::msg::TerrainGrid map;
+    map.header.stamp = stamp;
+    map.header.frame_id = "world";
+    map.resolution = 0.2F;
+    map.width = 31;
+    map.height = 31;
+    map.origin_x = -3.1F;
+    map.origin_y = -3.1F;
+    map.unknown_value = -1000.0F;
+    const std::size_t cell_count = map.width * map.height;
+    map.elevation.assign(cell_count, map.unknown_value);
+    map.slope.assign(cell_count, map.unknown_value);
+    map.traversability.assign(cell_count, map.unknown_value);
+    map.observation_count.assign(cell_count, 0U);
+    for (std::size_t y = 0; y < map.height; ++y) {
+      for (std::size_t x = 0; x < map.width; ++x) {
+        const double world_x = map.origin_x + (static_cast<double>(x) + 0.5) * map.resolution;
+        const double world_y = map.origin_y + (static_cast<double>(y) + 0.5) * map.resolution;
+        const double radius = std::hypot(world_x, world_y);
+        if (radius < 1.2 || radius > 2.4) {continue;}
+        const std::size_t index = y * map.width + x;
+        map.elevation[index] = 0.1F;
+        map.slope[index] = 0.0F;
+        map.traversability[index] = 1.0F;
+        map.observation_count[index] = 4U;
+      }
+    }
     return map;
   }
 
@@ -406,6 +441,18 @@ TEST_F(BodyLatticePlannerNodeTest, RejectsWatchdogPeriodLongerThanFreshnessBudge
     std::invalid_argument);
 }
 
+TEST_F(BodyLatticePlannerNodeTest, RejectsNonFiniteNominalBodyHeight)
+{
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+    rclcpp::Parameter("nominal_body_height", std::numeric_limits<double>::quiet_NaN()),
+  });
+
+  EXPECT_THROW(
+    std::make_shared<BodyLatticePlannerNode>(options),
+    std::invalid_argument);
+}
+
 TEST_F(BodyLatticePlannerNodeTest, WatchdogClearsAPathWhenInputsStop)
 {
   publishFreshPlan();
@@ -423,6 +470,62 @@ TEST_F(BodyLatticePlannerNodeTest, PathTimestampPreservesOldestCausalInput)
   EXPECT_EQ(
     rclcpp::Time(paths_.back().header.stamp).nanoseconds(),
     rclcpp::Time(expected_stamp).nanoseconds());
+}
+
+TEST_F(BodyLatticePlannerNodeTest, ObservedFlatPathRetainsHeightAndUnitOrientation)
+{
+  publishFreshPlan();
+
+  ASSERT_FALSE(paths_.back().poses.empty());
+  for (const auto & pose : paths_.back().poses) {
+    EXPECT_NEAR(pose.pose.position.z, 0.42, 1.0e-9);
+    const double orientation_norm =
+      std::sqrt(
+      pose.pose.orientation.x * pose.pose.orientation.x +
+      pose.pose.orientation.y * pose.pose.orientation.y +
+      pose.pose.orientation.z * pose.pose.orientation.z +
+      pose.pose.orientation.w * pose.pose.orientation.w);
+    EXPECT_NEAR(orientation_norm, 1.0, 1.0e-9);
+  }
+}
+
+TEST_F(BodyLatticePlannerNodeTest, VerifiedFlatStartPublishesFinitePathFromExactOdometry)
+{
+  const auto current_time = harness_node_->now();
+  auto odom = makeOdom(current_time - 20ms);
+  odom.pose.pose.position.x = 0.03;
+  odom.pose.pose.position.y = -0.04;
+  auto goal = makeGoal(current_time);
+  goal.pose.position.x = 1.4;
+  goal.pose.position.y = 0.0;
+
+  map_pub_->publish(makeStandingBlindRingMap(current_time - 50ms));
+  odom_pub_->publish(odom);
+  goal_pub_->publish(goal);
+
+  ASSERT_TRUE(spinUntil(
+      [this]() {return !paths_.empty() && !paths_.back().poses.empty();}, 2s));
+  const auto & path = paths_.back();
+  ASSERT_FALSE(path.poses.empty());
+  EXPECT_NEAR(path.poses.front().pose.position.x, odom.pose.pose.position.x, 1.0e-9);
+  EXPECT_NEAR(path.poses.front().pose.position.y, odom.pose.pose.position.y, 1.0e-9);
+  EXPECT_NEAR(path.poses.front().pose.position.z, 0.52, 1.0e-5);
+  for (const auto & pose : path.poses) {
+    EXPECT_TRUE(std::isfinite(pose.pose.position.x));
+    EXPECT_TRUE(std::isfinite(pose.pose.position.y));
+    EXPECT_TRUE(std::isfinite(pose.pose.position.z));
+    EXPECT_TRUE(std::isfinite(pose.pose.orientation.x));
+    EXPECT_TRUE(std::isfinite(pose.pose.orientation.y));
+    EXPECT_TRUE(std::isfinite(pose.pose.orientation.z));
+    EXPECT_TRUE(std::isfinite(pose.pose.orientation.w));
+    const double orientation_norm =
+      std::sqrt(
+      pose.pose.orientation.x * pose.pose.orientation.x +
+      pose.pose.orientation.y * pose.pose.orientation.y +
+      pose.pose.orientation.z * pose.pose.orientation.z +
+      pose.pose.orientation.w * pose.pose.orientation.w);
+    EXPECT_NEAR(orientation_norm, 1.0, 1.0e-9);
+  }
 }
 
 TEST_F(BodyLatticePlannerNodeTest, PlanningFailureReplacesTransientLocalPathWithEmptyPath)

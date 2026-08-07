@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <memory>
 #include <string>
@@ -113,22 +115,44 @@ protected:
   sensor_msgs::msg::PointCloud2 makeCloud(
     const builtin_interfaces::msg::Time & stamp) const
   {
+    return makeCloud(stamp, {{{2.0F, 0.0F, 0.0F}}});
+  }
+
+  sensor_msgs::msg::PointCloud2 makeCloud(
+    const builtin_interfaces::msg::Time & stamp,
+    const std::vector<std::array<float, 3>> & points) const
+  {
     sensor_msgs::msg::PointCloud2 cloud;
     cloud.header.stamp = stamp;
     cloud.header.frame_id = "world";
     cloud.height = 1U;
-    cloud.width = 1U;
+    cloud.width = static_cast<std::uint32_t>(points.size());
     cloud.is_dense = true;
     sensor_msgs::PointCloud2Modifier modifier(cloud);
     modifier.setPointCloud2FieldsByString(1, "xyz");
-    modifier.resize(1U);
+    modifier.resize(points.size());
     sensor_msgs::PointCloud2Iterator<float> x(cloud, "x");
     sensor_msgs::PointCloud2Iterator<float> y(cloud, "y");
     sensor_msgs::PointCloud2Iterator<float> z(cloud, "z");
-    *x = 2.0F;
-    *y = 0.0F;
-    *z = 0.0F;
+    for (const auto & point : points) {
+      *x = point[0];
+      *y = point[1];
+      *z = point[2];
+      ++x;
+      ++y;
+      ++z;
+    }
     return cloud;
+  }
+
+  std::size_t cellIndex(
+    const utree_dog_msgs::msg::TerrainGrid & terrain, double world_x, double world_y) const
+  {
+    const auto grid_x = static_cast<std::size_t>(
+      std::floor((world_x - terrain.origin_x) / terrain.resolution));
+    const auto grid_y = static_cast<std::size_t>(
+      std::floor((world_y - terrain.origin_y) / terrain.resolution));
+    return grid_y * terrain.width + grid_x;
   }
 
   void expectCloudStampRejected(const builtin_interfaces::msg::Time & invalid_stamp)
@@ -190,6 +214,38 @@ TEST_F(TerrainMapperNodeTest, RejectsOutOfRangeCloudNanosecondsWithoutThrowing)
 TEST_F(TerrainMapperNodeTest, RejectsZeroCloudTimestampWithoutThrowing)
 {
   expectCloudStampRejected(builtin_interfaces::msg::Time{});
+}
+
+TEST_F(TerrainMapperNodeTest, AppliesSelfFilterInBodyFrameAtNinetyDegreeYaw)
+{
+  nav_msgs::msg::Odometry odom;
+  odom.header.stamp = harness_node_->now();
+  odom.header.frame_id = "world";
+  odom.child_frame_id = "base_link";
+  odom.pose.pose.orientation.z = std::sqrt(0.5);
+  odom.pose.pose.orientation.w = std::sqrt(0.5);
+  odom_pub_->publish(odom);
+  spinFor(50ms);
+
+  const builtin_interfaces::msg::Time cloud_stamp = harness_node_->now();
+  cloud_pub_->publish(makeCloud(
+      cloud_stamp,
+      {{{0.01F, 0.39F, 0.0F}, {-0.39F, 0.01F, 0.0F}}}));
+  ASSERT_TRUE(spinUntil(
+      [this, &cloud_stamp]() {
+        return !terrain_maps_.empty() &&
+               terrain_maps_.back().header.stamp.sec == cloud_stamp.sec &&
+               terrain_maps_.back().header.stamp.nanosec == cloud_stamp.nanosec;
+      },
+      1s));
+
+  const auto & terrain = terrain_maps_.back();
+  const std::size_t inside_rotated_length = cellIndex(terrain, 0.01, 0.39);
+  const std::size_t outside_rotated_width = cellIndex(terrain, -0.39, 0.01);
+  ASSERT_LT(inside_rotated_length, terrain.observation_count.size());
+  ASSERT_LT(outside_rotated_width, terrain.observation_count.size());
+  EXPECT_EQ(terrain.observation_count[inside_rotated_length], 0U);
+  EXPECT_EQ(terrain.observation_count[outside_rotated_width], 1U);
 }
 
 }  // namespace

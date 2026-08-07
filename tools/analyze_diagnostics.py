@@ -30,6 +30,7 @@ RFC3339_UTC = re.compile(
 )
 PLANNER_SUCCESS_DIAGNOSES = {
     "start_ready_waiting_for_goal",
+    "start_ready_with_verified_flat_start_waiting_for_goal",
     "same_continuous_ground_component_not_planner_approval",
 }
 PLANNER_LAYER_SOURCE_FIELDS = (
@@ -2039,10 +2040,7 @@ def planner_inspection_observations(
             "evidence was retained "
             f"with start-map diagnosis `{start_map_diagnosis}`."
         )
-    if diagnosis not in {
-        "start_ready_waiting_for_goal",
-        "same_continuous_ground_component_not_planner_approval",
-    }:
+    if diagnosis not in PLANNER_SUCCESS_DIAGNOSES:
         observations.append(
             f"Latest planner input inspection diagnosis: `{diagnosis}`."
         )

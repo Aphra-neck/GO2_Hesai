@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
 import math
@@ -20,6 +20,7 @@ from inspect_planner_inputs import (
     PlannerThresholds,
     Pose2D,
     SubscriptionSpec,
+    VerifiedFlatStartConfig,
     _diagnosis_exit_code,
     _capture_runtime_messages,
     _capture_stage,
@@ -29,6 +30,7 @@ from inspect_planner_inputs import (
     _read_live_planner_thresholds,
     _terrain_layer_stats,
     analyze_planner_inputs,
+    print_human,
 )
 
 
@@ -57,6 +59,46 @@ def make_grid(
         roughness=[0.0] * cells,
         traversability=[1.0] * cells,
         observation_count=[4] * cells,
+    )
+
+
+def make_planar_blind_ring() -> tuple[GridSnapshot, Pose2D, float]:
+    grid = make_grid(width=31, height=31, resolution=0.2)
+    cells = grid.width * grid.height
+    elevation = [UNKNOWN] * cells
+    slope = [UNKNOWN] * cells
+    roughness = [UNKNOWN] * cells
+    traversability = [UNKNOWN] * cells
+    observation_count = [0] * cells
+    start = pose(3.1, 3.1)
+    gradient_x = 0.02
+    gradient_y = -0.01
+    plane_slope = math.atan(math.hypot(gradient_x, gradient_y))
+    for y in range(grid.height):
+        cell_y = grid.origin_y + (y + 0.5) * grid.resolution
+        for x in range(grid.width):
+            cell_x = grid.origin_x + (x + 0.5) * grid.resolution
+            dx = cell_x - start.x
+            dy = cell_y - start.y
+            radius = math.hypot(dx, dy)
+            if 1.0 <= radius <= 2.5:
+                index = y * grid.width + x
+                elevation[index] = 0.4 + gradient_x * dx + gradient_y * dy
+                slope[index] = plane_slope
+                roughness[index] = 0.01
+                traversability[index] = 0.8
+                observation_count[index] = 4
+    return (
+        replace(
+            grid,
+            elevation=elevation,
+            slope=slope,
+            roughness=roughness,
+            traversability=traversability,
+            observation_count=observation_count,
+        ),
+        start,
+        plane_slope,
     )
 
 
@@ -134,6 +176,7 @@ class FakeNode:
 
 
 class FakeParameterType:
+    PARAMETER_BOOL = 1
     PARAMETER_INTEGER = 2
     PARAMETER_DOUBLE = 3
 
@@ -149,10 +192,12 @@ class FakeParameterValue:
         self,
         parameter_type: int,
         *,
+        bool_value: bool = False,
         integer_value: int = 0,
         double_value: float = 0.0,
     ) -> None:
         self.type = parameter_type
+        self.bool_value = bool_value
         self.integer_value = integer_value
         self.double_value = double_value
 
@@ -247,6 +292,35 @@ def parameter_response(
     return FakeParameterResponse(encoded)
 
 
+def full_planner_parameter_response() -> FakeParameterResponse:
+    values = [
+        FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=value)
+        for value in (0.21, 0.61, 0.19, 0.55, 0.45, 0.8, 0.4, 0.15, 12.0)
+    ]
+    values.extend(
+        [
+            FakeParameterValue(
+                FakeParameterType.PARAMETER_BOOL, bool_value=True
+            ),
+            FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=1.0),
+            FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=2.5),
+            FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=1.35),
+            FakeParameterValue(FakeParameterType.PARAMETER_INTEGER, integer_value=8),
+            FakeParameterValue(FakeParameterType.PARAMETER_INTEGER, integer_value=7),
+            FakeParameterValue(FakeParameterType.PARAMETER_INTEGER, integer_value=3),
+            FakeParameterValue(FakeParameterType.PARAMETER_INTEGER, integer_value=32),
+            FakeParameterValue(FakeParameterType.PARAMETER_INTEGER, integer_value=4),
+            FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=0.15),
+            FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=0.04),
+            FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=0.10),
+            FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=0.18),
+            FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=0.20),
+            FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=0.20),
+        ]
+    )
+    return FakeParameterResponse(values)
+
+
 class LiveParameterServiceTests(unittest.TestCase):
     def test_transient_response_failure_is_retried_with_batched_requests(
         self,
@@ -262,18 +336,7 @@ class LiveParameterServiceTests(unittest.TestCase):
         planner_client = FakeParameterClient(
             [
                 FakeParameterFuture(
-                    response=parameter_response(
-                        None,
-                        0.21,
-                        0.61,
-                        0.19,
-                        0.55,
-                        0.45,
-                        0.8,
-                        0.4,
-                        0.15,
-                        12.0,
-                    )
+                    response=full_planner_parameter_response()
                 )
             ]
         )
@@ -293,7 +356,7 @@ class LiveParameterServiceTests(unittest.TestCase):
             del unused_node, unused_future
             response_timeouts.append(timeout_sec)
 
-        thresholds, freshness = _read_live_planner_thresholds(
+        thresholds, freshness, verified_flat_start = _read_live_planner_thresholds(
             node,
             FakeGetParameters,
             FakeParameterType,
@@ -326,6 +389,10 @@ class LiveParameterServiceTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
+            verified_flat_start,
+            VerifiedFlatStartConfig(enabled=True),
+        )
+        self.assertEqual(
             mapper_client.requests,
             [
                 ["min_observed_frames", "max_slope", "max_roughness"],
@@ -344,6 +411,21 @@ class LiveParameterServiceTests(unittest.TestCase):
                 "max_odom_age",
                 "timestamp_future_tolerance",
                 "input_watchdog_rate",
+                "verified_flat_start.enabled",
+                "verified_flat_start.support_inner_radius",
+                "verified_flat_start.support_outer_radius",
+                "verified_flat_start.fill_radius",
+                "verified_flat_start.sector_count",
+                "verified_flat_start.min_supported_sectors",
+                "verified_flat_start.min_cells_per_sector",
+                "verified_flat_start.min_support_cells",
+                "verified_flat_start.min_observation_count",
+                "verified_flat_start.max_plane_slope",
+                "verified_flat_start.max_plane_rmse",
+                "verified_flat_start.max_plane_residual",
+                "verified_flat_start.max_elevation_range",
+                "verified_flat_start.inferred_traversability",
+                "motion_step",
             ]],
         )
         self.assertEqual(response_timeouts, [0.5, 0.5, 0.5])
@@ -405,18 +487,7 @@ class LiveParameterServiceTests(unittest.TestCase):
                 "/body_lattice_planner/get_parameters": FakeParameterClient(
                     [
                         FakeParameterFuture(
-                            response=parameter_response(
-                                None,
-                                0.21,
-                                0.61,
-                                0.19,
-                                0.55,
-                                0.45,
-                                0.8,
-                                0.4,
-                                0.15,
-                                12.0,
-                            )
+                            response=full_planner_parameter_response()
                         )
                     ]
                 ),
@@ -451,18 +522,7 @@ class LiveParameterServiceTests(unittest.TestCase):
                 "/body_lattice_planner/get_parameters": FakeParameterClient(
                     [
                         FakeParameterFuture(
-                            response=parameter_response(
-                                None,
-                                0.21,
-                                0.61,
-                                0.19,
-                                0.55,
-                                0.45,
-                                0.8,
-                                0.4,
-                                0.15,
-                                12.0,
-                            )
+                            response=full_planner_parameter_response()
                         )
                     ]
                 ),
@@ -853,6 +913,12 @@ class PlannerInputInspectionTests(unittest.TestCase):
             0,
         )
         self.assertEqual(_diagnosis_exit_code("start_ready_waiting_for_goal"), 0)
+        self.assertEqual(
+            _diagnosis_exit_code(
+                "start_ready_with_verified_flat_start_waiting_for_goal"
+            ),
+            0,
+        )
         self.assertEqual(_diagnosis_exit_code("goal_stale"), 2)
         self.assertEqual(_diagnosis_exit_code("goal_wait_timeout"), 2)
         self.assertEqual(
@@ -897,6 +963,295 @@ class PlannerInputInspectionTests(unittest.TestCase):
         )
         self.assertEqual(result["start"]["valid_cells_in_snap_square"], 0)
         self.assertEqual(result["start"]["valid_cells_in_snap_radius"], 0)
+
+    def test_verified_flat_start_disabled_preserves_existing_diagnosis(self) -> None:
+        grid = make_grid(width=5, height=5, resolution=0.1)
+        grid = replace(
+            grid,
+            slope=[UNKNOWN] * 25,
+            traversability=[UNKNOWN] * 25,
+        )
+
+        result = analyze_planner_inputs(
+            grid,
+            pose(0.25, 0.25),
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(enabled=False),
+        )
+
+        self.assertEqual(
+            result["diagnosis"], "start_has_no_valid_cell_in_snap_radius"
+        )
+        self.assertEqual(result["verified_flat_start"]["status"], "disabled")
+
+    def test_verified_flat_start_is_not_evaluated_after_ordinary_snap(self) -> None:
+        result = analyze_planner_inputs(
+            make_grid(),
+            pose(1.5, 1.5),
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(enabled=True),
+        )
+
+        self.assertEqual(result["diagnosis"], "start_ready_waiting_for_goal")
+        self.assertEqual(result["verified_flat_start"]["status"], "not_needed")
+        self.assertIsNone(result["verified_flat_start"]["fit"])
+
+    def test_verified_flat_start_applies_planar_multi_sector_overlay(self) -> None:
+        grid, start, expected_slope = make_planar_blind_ring()
+        center = 15 * grid.width + 15
+        self.assertEqual(grid.elevation[center], UNKNOWN)
+
+        result = analyze_planner_inputs(
+            grid,
+            start,
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(enabled=True),
+        )
+
+        assessment = result["verified_flat_start"]
+        self.assertEqual(
+            result["diagnosis"],
+            "start_ready_with_verified_flat_start_waiting_for_goal",
+        )
+        self.assertEqual(assessment["status"], "applied")
+        self.assertGreaterEqual(assessment["support_cells"], 32)
+        self.assertEqual(assessment["support_sectors"], 8)
+        self.assertGreater(assessment["filled_cells"], 0)
+        self.assertEqual(
+            assessment["planner_valid_filled_cells"],
+            assessment["filled_cells"],
+        )
+        self.assertAlmostEqual(
+            assessment["fit"]["slope_rad"], expected_slope, places=6
+        )
+        self.assertAlmostEqual(assessment["fit"]["rmse_m"], 0.0, places=9)
+        self.assertTrue(result["start"]["snapped"])
+        self.assertTrue(result["start"]["inferred"])
+        self.assertTrue(assessment["exact_start_inferred"])
+        self.assertEqual(result["map"]["valid_cells"], assessment["support_cells"])
+        self.assertEqual(grid.elevation[center], UNKNOWN)
+
+    def test_verified_flat_start_fit_is_reported_in_human_output(self) -> None:
+        grid, start, _ = make_planar_blind_ring()
+        result = analyze_planner_inputs(
+            grid,
+            start,
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(enabled=True),
+        )
+        output = StringIO()
+
+        with redirect_stdout(output):
+            print_human(result)
+
+        text = output.getvalue()
+        self.assertIn("verified_flat_start: status=applied enabled=True", text)
+        self.assertIn("connected_support=", text)
+        self.assertIn("support=1.000-2.500 m fill=1.350 m", text)
+        self.assertIn("motion_step=0.200 m", text)
+        self.assertIn("plane_slope=", text)
+        self.assertIn("max_residual=", text)
+
+    def test_verified_flat_start_rejects_insufficient_support_sectors(self) -> None:
+        grid, start, _ = make_planar_blind_ring()
+        elevation = list(grid.elevation)
+        slope = list(grid.slope)
+        roughness = list(grid.roughness)
+        traversability = list(grid.traversability)
+        observations = list(grid.observation_count)
+        for y in range(grid.height):
+            cell_y = grid.origin_y + (y + 0.5) * grid.resolution
+            for x in range(grid.width):
+                cell_x = grid.origin_x + (x + 0.5) * grid.resolution
+                angle = math.atan2(cell_y - start.y, cell_x - start.x)
+                sector = int((angle % (2.0 * math.pi)) / (math.pi / 4.0))
+                if sector < 5:
+                    continue
+                index = y * grid.width + x
+                elevation[index] = UNKNOWN
+                slope[index] = UNKNOWN
+                roughness[index] = UNKNOWN
+                traversability[index] = UNKNOWN
+                observations[index] = 0
+        grid = replace(
+            grid,
+            elevation=elevation,
+            slope=slope,
+            roughness=roughness,
+            traversability=traversability,
+            observation_count=observations,
+        )
+
+        result = analyze_planner_inputs(
+            grid,
+            start,
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(enabled=True),
+        )
+
+        assessment = result["verified_flat_start"]
+        self.assertEqual(
+            result["diagnosis"], "start_has_no_valid_cell_in_snap_radius"
+        )
+        self.assertGreaterEqual(assessment["support_cells"], 32)
+        self.assertEqual(assessment["support_sectors"], 5)
+        self.assertEqual(assessment["status"], "insufficient_sectors")
+        self.assertEqual(
+            assessment["rejection_reason"], "min_supported_sectors"
+        )
+        self.assertIsNone(assessment["fit"])
+
+    def test_verified_flat_start_rejects_large_plane_residual(self) -> None:
+        grid, start, _ = make_planar_blind_ring()
+        elevation = list(grid.elevation)
+        outlier = 23 * grid.width + 7
+        self.assertEqual(grid.observation_count[outlier], 4)
+        elevation[outlier] += 0.11
+        grid = replace(
+            grid,
+            elevation=elevation,
+        )
+
+        result = analyze_planner_inputs(
+            grid,
+            start,
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(enabled=True),
+        )
+
+        assessment = result["verified_flat_start"]
+        self.assertEqual(
+            result["diagnosis"], "start_has_no_valid_cell_in_snap_radius"
+        )
+        self.assertEqual(assessment["status"], "support_not_flat")
+        self.assertEqual(
+            assessment["rejection_reason"], "plane_residual_exceeds_limit"
+        )
+        self.assertGreater(
+            assessment["fit"]["max_residual_m"],
+            assessment["config"]["max_plane_residual"],
+        )
+        self.assertEqual(assessment["filled_cells"], 0)
+
+    def test_verified_flat_start_never_accepts_an_inferred_goal(self) -> None:
+        grid, start, _ = make_planar_blind_ring()
+
+        result = analyze_planner_inputs(
+            grid,
+            start,
+            pose(start.x + 0.4, start.y),
+            verified_flat_start=VerifiedFlatStartConfig(enabled=True),
+        )
+
+        self.assertEqual(result["verified_flat_start"]["status"], "applied")
+        self.assertEqual(
+            result["diagnosis"], "goal_has_no_valid_cell_in_snap_radius"
+        )
+
+    def test_verified_flat_start_requires_completely_unknown_exact_start(self) -> None:
+        grid, start, _ = make_planar_blind_ring()
+        center = 15 * grid.width + 15
+        slope = list(grid.slope)
+        slope[center] = 0.0
+        grid = replace(grid, slope=slope)
+
+        result = analyze_planner_inputs(
+            grid,
+            start,
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(enabled=True),
+        )
+
+        assessment = result["verified_flat_start"]
+        self.assertEqual(
+            result["diagnosis"], "start_has_no_valid_cell_in_snap_radius"
+        )
+        self.assertEqual(assessment["status"], "no_inferred_start_cell")
+        self.assertEqual(
+            assessment["rejection_reason"], "exact_start_cell_not_inferred"
+        )
+
+    def test_verified_flat_start_rejects_unreachable_support_annulus(self) -> None:
+        grid, start, _ = make_planar_blind_ring()
+
+        result = analyze_planner_inputs(
+            grid,
+            start,
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(
+                enabled=True,
+                support_inner_radius=1.6,
+                fill_radius=1.35,
+                motion_step=0.2,
+            ),
+        )
+
+        assessment = result["verified_flat_start"]
+        self.assertEqual(
+            result["diagnosis"], "start_has_no_valid_cell_in_snap_radius"
+        )
+        self.assertEqual(assessment["status"], "invalid_configuration")
+        self.assertEqual(
+            assessment["rejection_reason"],
+            "fill_radius_plus_motion_step_below_support_inner_radius",
+        )
+        self.assertEqual(assessment["config"]["motion_step"], 0.2)
+
+    def test_verified_flat_start_rejects_disconnected_observed_support(self) -> None:
+        grid, start, _ = make_planar_blind_ring()
+        elevation = list(grid.elevation)
+        slope = list(grid.slope)
+        roughness = list(grid.roughness)
+        traversability = list(grid.traversability)
+        observations = list(grid.observation_count)
+        for y in range(grid.height):
+            cell_y = grid.origin_y + (y + 0.5) * grid.resolution
+            for x in range(grid.width):
+                cell_x = grid.origin_x + (x + 0.5) * grid.resolution
+                radius = math.hypot(cell_x - start.x, cell_y - start.y)
+                if radius >= 1.8:
+                    continue
+                index = y * grid.width + x
+                elevation[index] = UNKNOWN
+                slope[index] = UNKNOWN
+                roughness[index] = UNKNOWN
+                traversability[index] = UNKNOWN
+                observations[index] = 0
+        grid = replace(
+            grid,
+            elevation=elevation,
+            slope=slope,
+            roughness=roughness,
+            traversability=traversability,
+            observation_count=observations,
+        )
+
+        result = analyze_planner_inputs(
+            grid,
+            start,
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(enabled=True),
+        )
+
+        assessment = result["verified_flat_start"]
+        self.assertEqual(
+            result["diagnosis"], "start_has_no_valid_cell_in_snap_radius"
+        )
+        self.assertGreaterEqual(
+            assessment["support_cells"],
+            assessment["config"]["min_support_cells"],
+        )
+        self.assertGreaterEqual(
+            assessment["support_sectors"],
+            assessment["config"]["min_supported_sectors"],
+        )
+        self.assertIsNotNone(assessment["fit"])
+        self.assertEqual(assessment["connected_support_cells"], 0)
+        self.assertEqual(assessment["status"], "no_observed_connection")
+        self.assertEqual(
+            assessment["rejection_reason"],
+            "inferred_component_does_not_reach_observed_support",
+        )
 
     def test_goal_outside_map_is_explicit(self) -> None:
         result = analyze_planner_inputs(

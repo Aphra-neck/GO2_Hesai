@@ -6,6 +6,7 @@ WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PLANNING_RVIZ="${PLANNING_RVIZ:-false}"
 BODY_YAW_OFFSET="${GO2_BODY_YAW_OFFSET_RAD:--1.5707963267948966}"
 NAVIGATION_CONFIG="${GO2_NAVIGATION_CONFIG:-${WORKSPACE_DIR}/src/utree_dog_navigation/config/terrain_navigation.yaml}"
+VERIFIED_FLAT_START="${GO2_VERIFIED_FLAT_START:-false}"
 GO2_BODY_YAW_OFFSET_RAD="${BODY_YAW_OFFSET}"
 export GO2_BODY_YAW_OFFSET_RAD
 
@@ -13,6 +14,14 @@ case "${PLANNING_RVIZ}" in
   true|false) ;;
   *)
     echo "PLANNING_RVIZ must be true or false, got: ${PLANNING_RVIZ}" >&2
+    exit 1
+    ;;
+esac
+
+case "${VERIFIED_FLAT_START}" in
+  true|false) ;;
+  *)
+    echo "GO2_VERIFIED_FLAT_START must be true or false, got: ${VERIFIED_FLAT_START}" >&2
     exit 1
     ;;
 esac
@@ -66,6 +75,7 @@ echo " ROS RMW: ${RMW_IMPLEMENTATION}"
 echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Planning RViz: ${PLANNING_RVIZ}"
+echo " Verified flat start: ${VERIFIED_FLAT_START}"
 echo " Body yaw offset: ${BODY_YAW_OFFSET} rad"
 echo " Navigation config: ${NAVIGATION_CONFIG}"
 echo "======================================"
@@ -85,4 +95,5 @@ echo "Set a goal with RViz or publish geometry_msgs/msg/PoseStamped to /goal_pos
 ros2 launch utree_dog_navigation terrain_navigation.launch.py \
   "config:=${NAVIGATION_CONFIG}" \
   "rviz:=${PLANNING_RVIZ}" \
-  "body_yaw_offset:=${BODY_YAW_OFFSET}"
+  "body_yaw_offset:=${BODY_YAW_OFFSET}" \
+  "verified_flat_start:=${VERIFIED_FLAT_START}"

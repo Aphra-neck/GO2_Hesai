@@ -27,6 +27,7 @@ def generate_launch_description():
     rviz_config = LaunchConfiguration("rviz_config")
     body_yaw_offset = LaunchConfiguration("body_yaw_offset")
     body_frame = LaunchConfiguration("body_frame")
+    verified_flat_start = LaunchConfiguration("verified_flat_start")
 
     body_odom_adapter = Node(
         package="utree_dog_navigation",
@@ -67,6 +68,10 @@ def generate_launch_description():
                 default_value="-1.5707963267948966",
             ),
             DeclareLaunchArgument("body_frame", default_value="base_link"),
+            DeclareLaunchArgument(
+                "verified_flat_start",
+                default_value="false",
+            ),
             RegisterEventHandler(
                 OnProcessExit(
                     target_action=body_odom_adapter,
@@ -116,7 +121,15 @@ def generate_launch_description():
                 executable="body_lattice_planner_node",
                 name="body_lattice_planner",
                 output="screen",
-                parameters=[config],
+                parameters=[
+                    config,
+                    {
+                        "verified_flat_start.enabled": ParameterValue(
+                            verified_flat_start,
+                            value_type=bool,
+                        ),
+                    },
+                ],
             ),
             Node(
                 package="rviz2",

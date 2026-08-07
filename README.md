@@ -449,8 +449,10 @@ pgrep -af \
 
 ### 1. Jetson 终端 1：启动无界面 SLAM
 
-当前 XT-16 平地集成的日常候选模式是 `dense=true`。它已经通过连续 10 帧起点门禁，但仍只用于
-静止和短距离无运动规划验证，不代表允许启动 SDK2 bridge。日常启动使用：
+当前 XT-16 平地集成的点云输出候选模式是 `dense=true`，但它不再代表普通起点吸附必然通过。
+2026-08-07 的站立静止会话证明，XT-16 近场盲环可以让普通起点门禁连续失败；后续只能在本轮
+实时门禁通过后继续，不能沿用旧会话的结论。该模式仍只用于静止和短距离无运动规划验证，
+不代表允许启动 SDK2 bridge。日常启动使用：
 
 ```bash
 cd ~/catkin_ws
@@ -517,6 +519,18 @@ cd ~/catkin_ws
 该脚本默认 `PLANNING_RVIZ=false`。只有临时改回 Jetson 本地可视化时才使用
 `PLANNING_RVIZ=true ./shell/start_navigation.sh`；分布式日常流程不要设置它。
 
+`verified-flat-start` 同样默认关闭。仅在机器人正常站立、保持静止并执行当前平地无运动验证时，
+可以显式启动本次规划私有的近场补全与 Jetson 本地规划 RViz：
+
+```bash
+cd ~/catkin_ws
+GO2_VERIFIED_FLAT_START=true PLANNING_RVIZ=true ./shell/start_navigation.sh
+```
+
+执行该命令前必须关闭 WSL2 RViz，避免同时运行两个 RViz。该命令不会启动或授权
+`utree_go2_sdk2_bridge`；SDK2 bridge 与 RL controller 必须继续保持关闭。分布式验证仍使用
+`PLANNING_RVIZ=false` 和唯一的 WSL2 RViz，只显式设置 `GO2_VERIFIED_FLAT_START=true`。
+
 正常情况下会启动：
 
 ```text
@@ -543,6 +557,7 @@ body_lattice_planner_node
 | `timestamp_future_tolerance` | `0.2 s` | 跨主机时钟误差的最大未来容差 |
 | `input_watchdog_rate` | `10 Hz` | 没有新回调时检查活动路径的频率 |
 | `cloud_stale_warning_age` | `1.0 s` | mapper 对点云 source stamp 或接收间隔发出诊断警告的阈值 |
+| `verified_flat_start.enabled` | `false` | 仅显式无运动验证时启用本次 plan 私有的起点近场补全 |
 
 `resolution` 和 `motion_step` 是两个独立参数；当前值恰好同为 `0.20 m`，不能用修改其中一个
 代替另一个。watchdog 周期还必须满足
@@ -590,7 +605,7 @@ rviz2 -d "$HOME/go2_rviz/rviz/hesai_navigation.rviz"
 RViz 配置固定使用：
 
 - Fixed Frame：`world`
-- `/lio/cloud_world`：Best Effort、Volatile、Decay Time `10` 秒
+- `/lio/cloud_world`：Best Effort、Volatile、Decay Time `10` 秒，显示默认关闭
 - `/lio/body_odom`
 - `/terrain_costmap`：Reliable、Transient Local
 - `/body_path`：Reliable、Transient Local
@@ -600,6 +615,10 @@ WSLg 可能输出一条 GLSL sampler 警告。只要 RViz 进程仍存活且点�
 与 DDS 无关；如果仅代价地图贴图异常，再单独排查 WSLg 渲染。
 
 #### RViz PointCloud 负载复测
+
+`Super-LIO World Cloud` 现在默认关闭。2026-08-07 的 OFF -> ON -> OFF 静止对照中，手动开启该
+显示会让 Jetson `/lio/odom` 从约 `8 Hz` 立即下降到约 `4 Hz`，再次关闭后恢复到约 `8 Hz`。
+因此日常规划不要打开世界点云；`/lio/body_odom`、`/terrain_costmap` 和 `/body_path` 保持显示即可。
 
 首次 dense A/B 必须关闭 `Super-LIO World Cloud` 显示。选定 dense 模式并通过平地起点门禁后，
 如果要判断 WSL2 RViz 点云显示是否加重 Jetson/DDS 负载，使用三个完全独立的静止会话：
@@ -705,6 +724,34 @@ cd ~/catkin_ws
 姿态切换期间会改变雷达离地高度、机身遮挡和近场地面几何，采集结果无效，不能用于判断规划器
 是否通过。SDK2 bridge 和 RL controller 在整个检查期间必须保持关闭。
 
+#### 站立 XT-16 近场盲环与 verified-flat-start
+
+会话 `20260807T092515Z-unitree-jetson-payload-3123` 在 RViz 世界点云关闭、机器人站立静止时，
+连续 10 次得到 `start_has_no_valid_cell_in_snap_radius`。`0.55 m` 起点圆内的 24 个格全部为
+`observation_count=0`，最近原始观测约为 `0.86-0.95 m`，最近 planner-valid 格稳定在约
+`1.21 m`。因此本轮失败发生在坡度、粗糙度或通行度门槛之前，不能通过放宽这些阈值解决。
+
+terrain mapper 的 self-filter 曾直接在 `world` 轴上应用 length/width，机器人转向后会错误交换
+机身纵横向过滤范围。现在 mapper 先校验 `/lio/body_odom` 四元数并保存 body yaw，再把点相对
+机器人位置的 `dx/dy` 旋转到 body 坐标后应用 self-filter。该修复消除了随 yaw 变化的错误过滤，
+但不会消除 XT-16 由安装高度、垂直视场和机身遮挡形成的物理近场盲环。
+
+`verified-flat-start` 是严格受限的起点兜底，不是通用未知区规划：
+
+- 默认关闭，而且只在普通 `start_snap_radius` 找不到实测有效起点时评估；
+- overlay 只属于当前一次 `plan()`，不会写回或发布为 `/terrain_map`；
+- 只补全当前起点 `fill_radius` 内 observation、高程、坡度和通行度全部 unknown 的格；
+- 只使用外部实测 planner-valid 环带，必须同时通过最少观测数、扇区覆盖、高程范围、平面坡度、
+  RMSE 和最大残差检查；默认 profile 要求 8 个扇区中至少 7 个有支撑；
+- Python 诊断先用四邻接与 step-height 做有界拓扑检查，要求 inferred 连通区接入至少一个
+  实测支撑格；C++ planner 随后独立使用真实 motion primitives 检查 inferred 起点能否接入
+  实测 planner-valid 格。两层检查都不通过时拒绝，且 Python 拓扑检查不等同于 A* 可达性；
+- goal 始终只吸附实测 planner-valid 格，永不使用 inferred 格；
+- 搜索从 inferred 起点前缀进入第一个实测有效格后，不能再次返回 inferred 区域。
+
+即使这些检查全部通过，盲环中的真实障碍仍未被传感器观测。该功能当前只批准静止、短距离、
+无运动的规划链路验证；不能据此启动 SDK2 bridge，也不能把生成的 `/body_path` 当作运动批准。
+
 ```bash
 ./tools/go2-log planner-series --no-goal --samples 10 --interval 1.0
 ```
@@ -717,9 +764,15 @@ cd ~/catkin_ws
 平地起点门禁必须同时满足以下条件，缺一项都不要发目标：
 
 - `planner-series` 最终退出码为 `0`；
-- 10 个样本全部为 `diagnosis=start_ready_waiting_for_goal`；
+- 普通模式的 10 个样本全部为 `diagnosis=start_ready_waiting_for_goal`；显式启用
+  verified-flat-start 时，普通实测起点仍可返回该诊断并报告 `status=not_needed`。只有普通吸附
+  失败且兜底实际生效的样本才应返回
+  `diagnosis=start_ready_with_verified_flat_start_waiting_for_goal`，并报告
+  `verified_flat_start.status=applied` 与 `exact_start_inferred=true`；
 - 每个样本都为 `snapped=true`、`valid_in_snap_radius>=1` 且
   `start_component_cells>0`；
+- 每个 `status=applied` 样本还必须满足
+  `verified_flat_start.connected_support_cells>=1`；
 - 没有 capture error、frame mismatch、stale 或 timestamp future 诊断。
 
 首次/变更后 A/B 的 `dense=false` 和 `dense=true` 两轮都必须采集。第一轮结束后，先在规划终端和 SLAM
@@ -733,9 +786,10 @@ cd ~/catkin_ws
 正在运行的第二轮模式，先正常停止第二轮和日志会话，再用选定模式新开一轮，并重新通过
 一次 `planner-series` 门禁。
 
-当前实机证据中只有 `dense=true` 连续 10 帧通过，所以它是现阶段日常候选。该选择只限定
-平地、静止、短距离无运动验证；如果后续 A/B 结果改变，必须保留独立日志并更新本节，不能在
-运行中的会话里临时切换模式。
+`dense=true` 仍是现阶段点云输出候选，但最新站立会话的普通 `0.55 m` 起点门禁为 10/10 失败。
+任何模式都必须以当前会话的 `planner-series` 结果为准；只有显式 verified-flat-start 门禁通过时，
+才能继续本轮平地、静止、短距离无运动目标验证。如果后续 A/B 结果改变，必须保留独立日志并
+更新本节，不能在运行中的会话里临时切换模式。
 
 选定模式通过门禁且仍在运行后，才执行目标检查：
 
@@ -755,6 +809,8 @@ Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。检查器会�
 里程计订阅，再创建 `/goal_pose` 订阅并确认兼容发布者，随后才开始目标倒计时；收到目标
 后再分别抓取一条比各自初始样本更新的 `/terrain_map` 和 `/lio/body_odom`。两条消息并非
 时间同步的数据对。检查器不会发布目标、路径或运动命令。
+启用 verified-flat-start 也不会改变 goal 规则：目标仍必须落在实测 planner-valid 区域，
+不会吸附到任何 inferred 起点格。
 
 检查器会分别统计整张地图、起点/目标吸附方框以及规划器实际使用的欧氏圆半径。吸附
 结论只使用圆半径内的候选；方框只保留为诊断上下文。`observation_below_min`
@@ -839,6 +895,7 @@ pgrep -af \
 | `UNITREE_SDK_LIBRARY_DIR` | `/usr/local/lib` | Unitree SDK 配套 DDS 动态库目录 |
 | `GO2_BODY_YAW_OFFSET_RAD` | `-1.5707963267948966` | IMU 到 `base_link` 的 yaw 校正 |
 | `PLANNING_RVIZ` | `false` | 仅显式设为 `true` 时在 Jetson 启动规划 RViz |
+| `GO2_VERIFIED_FLAT_START` | `false` | 仅显式设为 `true` 时启用当前 plan 私有的 verified-flat-start |
 
 ### 坐标与 RViz 所有权
 

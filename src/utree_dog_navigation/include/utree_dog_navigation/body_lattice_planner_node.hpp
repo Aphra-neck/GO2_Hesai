@@ -35,7 +35,7 @@ private:
     double maximum_age, const char * input_name);
   void clearPath(const char * reason);
   nav_msgs::msg::Path makePath(
-    const std::vector<GridState> & states,
+    const PlanningResult & result, const WorldState & exact_start,
     const builtin_interfaces::msg::Time & source_stamp) const;
 
   std::string map_topic_;

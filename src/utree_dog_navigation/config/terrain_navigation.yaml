@@ -71,3 +71,17 @@ body_lattice_planner:
     # bounded start-only allowance separate from goal snapping.
     start_snap_radius: 0.55
     snap_radius: 0.50
+    verified_flat_start.enabled: false
+    verified_flat_start.support_inner_radius: 1.0
+    verified_flat_start.support_outer_radius: 2.5
+    verified_flat_start.fill_radius: 1.35
+    verified_flat_start.sector_count: 8
+    verified_flat_start.min_supported_sectors: 7
+    verified_flat_start.min_cells_per_sector: 3
+    verified_flat_start.min_support_cells: 32
+    verified_flat_start.min_observation_count: 4
+    verified_flat_start.max_plane_slope: 0.15
+    verified_flat_start.max_plane_rmse: 0.04
+    verified_flat_start.max_plane_residual: 0.10
+    verified_flat_start.max_elevation_range: 0.18
+    verified_flat_start.inferred_traversability: 0.20

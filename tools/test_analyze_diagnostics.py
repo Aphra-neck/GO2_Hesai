@@ -560,6 +560,29 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
             ["map", "start"],
         )
 
+    def test_verified_flat_no_goal_success_is_accepted(self) -> None:
+        record = no_goal_record()
+        inspection = record["inspection"]
+        assert isinstance(inspection, dict)
+        inspection["diagnosis"] = (
+            "start_ready_with_verified_flat_start_waiting_for_goal"
+        )
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 0)
+        self.assertEqual(len(summary["completed_records"]), 1)
+        self.assertEqual(
+            summary["diagnoses"][
+                "start_ready_with_verified_flat_start_waiting_for_goal"
+            ],
+            1,
+        )
+        self.assertEqual(
+            [row["scope"] for row in summary["rows"]],
+            ["map", "start"],
+        )
+
     def test_goal_timeout_retains_start_map_rows_and_diagnosis(self) -> None:
         record = no_goal_record()
         record["exit_code"] = 2

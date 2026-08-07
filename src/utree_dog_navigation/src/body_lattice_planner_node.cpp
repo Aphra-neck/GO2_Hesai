@@ -59,6 +59,9 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
   const auto finite_in_range = [](double value, double minimum, double maximum) {
       return std::isfinite(value) && value >= minimum && value <= maximum;
     };
+  if (!finite_in_range(nominal_body_height_, 0.0, 2.0)) {
+    throw std::invalid_argument("nominal_body_height must be finite and in [0, 2] metres");
+  }
   if (!finite_in_range(max_map_age_, 0.001, 60.0)) {
     throw std::invalid_argument("max_map_age must be finite and in [0.001, 60] seconds");
   }
@@ -96,6 +99,34 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
   config.max_expansions = declare_parameter("max_expansions", 250000);
   config.snap_radius = declare_parameter("snap_radius", 0.5);
   config.start_snap_radius = declare_parameter("start_snap_radius", config.snap_radius);
+  config.verified_flat_start.enabled =
+    declare_parameter("verified_flat_start.enabled", false);
+  config.verified_flat_start.support_inner_radius =
+    declare_parameter("verified_flat_start.support_inner_radius", 1.0);
+  config.verified_flat_start.support_outer_radius =
+    declare_parameter("verified_flat_start.support_outer_radius", 2.5);
+  config.verified_flat_start.fill_radius =
+    declare_parameter("verified_flat_start.fill_radius", 1.35);
+  config.verified_flat_start.sector_count =
+    declare_parameter("verified_flat_start.sector_count", 8);
+  config.verified_flat_start.min_supported_sectors =
+    declare_parameter("verified_flat_start.min_supported_sectors", 7);
+  config.verified_flat_start.min_cells_per_sector =
+    declare_parameter("verified_flat_start.min_cells_per_sector", 3);
+  config.verified_flat_start.min_support_cells =
+    declare_parameter("verified_flat_start.min_support_cells", 32);
+  config.verified_flat_start.min_observation_count =
+    declare_parameter("verified_flat_start.min_observation_count", 4);
+  config.verified_flat_start.max_plane_slope =
+    declare_parameter("verified_flat_start.max_plane_slope", 0.15);
+  config.verified_flat_start.max_plane_rmse =
+    declare_parameter("verified_flat_start.max_plane_rmse", 0.04);
+  config.verified_flat_start.max_plane_residual =
+    declare_parameter("verified_flat_start.max_plane_residual", 0.10);
+  config.verified_flat_start.max_elevation_range =
+    declare_parameter("verified_flat_start.max_elevation_range", 0.18);
+  config.verified_flat_start.inferred_traversability =
+    declare_parameter("verified_flat_start.inferred_traversability", 0.20);
   planner_ = std::make_unique<LatticePlanner>(config);
 
   const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
@@ -212,16 +243,18 @@ void BodyLatticePlannerNode::requestPlan()
     return;
   }
   if (!result.success) {
+    const auto start_status = verifiedFlatStartStatusName(result.start_status);
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), 3000,
-      "Planning failed after %d state expansions", result.expansions);
+      "Planning failed after %d state expansions (start=%.*s)", result.expansions,
+      static_cast<int>(start_status.size()), start_status.data());
     clearPath("planning failed");
     return;
   }
   const rclcpp::Time map_time(map.header.stamp, completion_time.get_clock_type());
   const rclcpp::Time odom_time(odom_->header.stamp, completion_time.get_clock_type());
   const auto & source_stamp = map_time <= odom_time ? map.header.stamp : odom_->header.stamp;
-  const nav_msgs::msg::Path path = makePath(result.states, source_stamp);
+  const nav_msgs::msg::Path path = makePath(result, start, source_stamp);
   const rclcpp::Time publish_time = now();
   if (!framesValid() || !posesValid() || !inputsFresh(publish_time)) {
     clearPath("planning inputs became stale or invalid before path publication");
@@ -230,9 +263,15 @@ void BodyLatticePlannerNode::requestPlan()
   path_pub_->publish(path);
   path_active_ = true;
   last_path_frame_ = map.header.frame_id;
+  const auto start_status = verifiedFlatStartStatusName(result.start_status);
+  const auto inferred_count = static_cast<std::size_t>(std::count_if(
+      result.states.begin(), result.states.end(),
+      [](const PlannedGridState & state) {return state.inferred;}));
   RCLCPP_INFO(
-    get_logger(), "Planned %zu body poses after %d expansions",
-    result.states.size(), result.expansions);
+    get_logger(),
+    "Planned %zu body poses after %d expansions (start=%.*s inferred_prefix=%zu)",
+    path.poses.size(), result.expansions, static_cast<int>(start_status.size()),
+    start_status.data(), inferred_count);
 }
 
 void BodyLatticePlannerNode::watchdogTick()
@@ -321,36 +360,50 @@ void BodyLatticePlannerNode::clearPath(const char * reason)
 }
 
 nav_msgs::msg::Path BodyLatticePlannerNode::makePath(
-  const std::vector<GridState> & states,
+  const PlanningResult & result, const WorldState & exact_start,
   const builtin_interfaces::msg::Time & source_stamp) const
 {
   const auto & map = planner_->map();
   nav_msgs::msg::Path path;
   path.header.stamp = source_stamp;
   path.header.frame_id = map.header.frame_id;
-  path.poses.reserve(states.size());
-  for (const auto & state : states) {
-    const std::size_t index = static_cast<std::size_t>(state.y) * map.width + state.x;
-    const double z = map.elevation[index];
-    const double dzdx =
-      (planner_->elevationAt(state.x + 1, state.y, z) -
-      planner_->elevationAt(state.x - 1, state.y, z)) / (2.0 * map.resolution);
-    const double dzdy =
-      (planner_->elevationAt(state.x, state.y + 1, z) -
-      planner_->elevationAt(state.x, state.y - 1, z)) / (2.0 * map.resolution);
-
-    // Body z is measured above the support surface; roll/pitch follow its local normal.
+  path.poses.reserve(result.states.size() + static_cast<std::size_t>(result.exact_start_inferred));
+  const auto append_pose = [&path, this](
+      double x, double y, double elevation, double dzdx, double dzdy, double yaw)
+    {
     tf2::Quaternion orientation;
     orientation.setRPY(
       std::atan2(dzdy, std::sqrt(1.0 + dzdx * dzdx)),
-      -std::atan2(dzdx, 1.0), planner_->yawAngle(state.yaw));
+      -std::atan2(dzdx, 1.0), yaw);
     geometry_msgs::msg::PoseStamped pose;
     pose.header = path.header;
-    pose.pose.position.x = map.origin_x + (state.x + 0.5) * map.resolution;
-    pose.pose.position.y = map.origin_y + (state.y + 0.5) * map.resolution;
-    pose.pose.position.z = z + nominal_body_height_;
+    pose.pose.position.x = x;
+    pose.pose.position.y = y;
+    pose.pose.position.z = elevation + nominal_body_height_;
     pose.pose.orientation = tf2::toMsg(orientation);
     path.poses.push_back(pose);
+    };
+
+  std::size_t first_grid_state = 0U;
+  if (result.exact_start_inferred) {
+    append_pose(
+      exact_start.x, exact_start.y, result.exact_start_elevation,
+      result.exact_start_dzdx, result.exact_start_dzdy, exact_start.yaw);
+    if (!result.states.empty()) {
+      const double first_x = map.origin_x + (result.states.front().x + 0.5) * map.resolution;
+      const double first_y = map.origin_y + (result.states.front().y + 0.5) * map.resolution;
+      if (std::hypot(first_x - exact_start.x, first_y - exact_start.y) <= 1.0e-6) {
+        first_grid_state = 1U;
+      }
+    }
+  }
+
+  for (std::size_t index = first_grid_state; index < result.states.size(); ++index) {
+    const auto & state = result.states[index];
+    const double x = map.origin_x + (state.x + 0.5) * map.resolution;
+    const double y = map.origin_y + (state.y + 0.5) * map.resolution;
+    append_pose(
+      x, y, state.elevation, state.dzdx, state.dzdy, planner_->yawAngle(state.yaw));
   }
   return path;
 }

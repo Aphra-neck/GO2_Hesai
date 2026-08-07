@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -72,6 +72,25 @@ class PlannerThresholds:
     snap_radius: float = 0.5
     min_observed_frames: int = 4
     start_snap_radius: float | None = None
+
+
+@dataclass(frozen=True)
+class VerifiedFlatStartConfig:
+    enabled: bool = False
+    support_inner_radius: float = 1.0
+    support_outer_radius: float = 2.5
+    fill_radius: float = 1.35
+    motion_step: float = 0.2
+    sector_count: int = 8
+    min_supported_sectors: int = 7
+    min_cells_per_sector: int = 3
+    min_support_cells: int = 32
+    min_observation_count: int = 4
+    max_plane_slope: float = 0.15
+    max_plane_rmse: float = 0.04
+    max_plane_residual: float = 0.10
+    max_elevation_range: float = 0.18
+    inferred_traversability: float = 0.20
 
 
 @dataclass(frozen=True)
@@ -189,7 +208,11 @@ def _read_live_planner_thresholds(
     service_timeout: float,
     response_timeout: float,
     max_attempts: int,
-) -> tuple[PlannerThresholds, PlannerFreshnessSettings]:
+) -> tuple[
+    PlannerThresholds,
+    PlannerFreshnessSettings,
+    VerifiedFlatStartConfig,
+]:
     """Read mapper and planner settings using two bounded service calls."""
     mapper_service = "/terrain_mapper/get_parameters"
     mapper_names = ("min_observed_frames", "max_slope", "max_roughness")
@@ -214,6 +237,21 @@ def _read_live_planner_thresholds(
         "max_odom_age",
         "timestamp_future_tolerance",
         "input_watchdog_rate",
+        "verified_flat_start.enabled",
+        "verified_flat_start.support_inner_radius",
+        "verified_flat_start.support_outer_radius",
+        "verified_flat_start.fill_radius",
+        "verified_flat_start.sector_count",
+        "verified_flat_start.min_supported_sectors",
+        "verified_flat_start.min_cells_per_sector",
+        "verified_flat_start.min_support_cells",
+        "verified_flat_start.min_observation_count",
+        "verified_flat_start.max_plane_slope",
+        "verified_flat_start.max_plane_rmse",
+        "verified_flat_start.max_plane_residual",
+        "verified_flat_start.max_elevation_range",
+        "verified_flat_start.inferred_traversability",
+        "motion_step",
     )
     planner_values = _request_parameter_batch(
         node,
@@ -351,7 +389,160 @@ def _read_live_planner_thresholds(
         ),
     )
     _validate_freshness_settings(freshness)
-    return thresholds, freshness
+    verified_flat_start = VerifiedFlatStartConfig(
+        enabled=bool(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[9],
+                planner_values[9],
+                parameter_type.PARAMETER_BOOL,
+                "bool_value",
+                "a boolean",
+            )
+        ),
+        support_inner_radius=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[10],
+                planner_values[10],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        support_outer_radius=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[11],
+                planner_values[11],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        fill_radius=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[12],
+                planner_values[12],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        sector_count=int(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[13],
+                planner_values[13],
+                parameter_type.PARAMETER_INTEGER,
+                "integer_value",
+                "an integer",
+            )
+        ),
+        min_supported_sectors=int(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[14],
+                planner_values[14],
+                parameter_type.PARAMETER_INTEGER,
+                "integer_value",
+                "an integer",
+            )
+        ),
+        min_cells_per_sector=int(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[15],
+                planner_values[15],
+                parameter_type.PARAMETER_INTEGER,
+                "integer_value",
+                "an integer",
+            )
+        ),
+        min_support_cells=int(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[16],
+                planner_values[16],
+                parameter_type.PARAMETER_INTEGER,
+                "integer_value",
+                "an integer",
+            )
+        ),
+        min_observation_count=int(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[17],
+                planner_values[17],
+                parameter_type.PARAMETER_INTEGER,
+                "integer_value",
+                "an integer",
+            )
+        ),
+        max_plane_slope=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[18],
+                planner_values[18],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        max_plane_rmse=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[19],
+                planner_values[19],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        max_plane_residual=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[20],
+                planner_values[20],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        max_elevation_range=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[21],
+                planner_values[21],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        inferred_traversability=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[22],
+                planner_values[22],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        motion_step=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[23],
+                planner_values[23],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+    )
+    _validate_verified_flat_start(verified_flat_start)
+    return thresholds, freshness, verified_flat_start
 
 
 def _validate_grid(grid: GridSnapshot) -> None:
@@ -398,6 +589,66 @@ def _validate_thresholds(thresholds: PlannerThresholds) -> None:
         raise ValueError("start_snap_radius must be finite and non-negative")
     if thresholds.min_observed_frames < 1:
         raise ValueError("min_observed_frames must be positive")
+
+
+def _validate_verified_flat_start(config: VerifiedFlatStartConfig) -> None:
+    for name, value in (
+        ("fill_radius", config.fill_radius),
+        ("motion_step", config.motion_step),
+        ("support_inner_radius", config.support_inner_radius),
+        ("support_outer_radius", config.support_outer_radius),
+        ("max_plane_slope", config.max_plane_slope),
+        ("max_plane_rmse", config.max_plane_rmse),
+        ("max_plane_residual", config.max_plane_residual),
+        ("max_elevation_range", config.max_elevation_range),
+        ("inferred_traversability", config.inferred_traversability),
+    ):
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(
+                f"verified_flat_start.{name} must be finite and non-negative"
+            )
+    if config.fill_radius <= 0.0:
+        raise ValueError("verified_flat_start.fill_radius must be positive")
+    if config.motion_step <= 0.0:
+        raise ValueError("verified_flat_start.motion_step must be positive")
+    if config.support_outer_radius <= config.support_inner_radius:
+        raise ValueError(
+            "verified_flat_start.support_outer_radius must exceed "
+            "support_inner_radius"
+        )
+    if config.min_support_cells < 1:
+        raise ValueError(
+            "verified_flat_start.min_support_cells must be positive"
+        )
+    if config.fill_radius > config.support_outer_radius:
+        raise ValueError(
+            "verified_flat_start.fill_radius must not exceed support_outer_radius"
+        )
+    if config.sector_count < 4 or config.sector_count > 64:
+        raise ValueError(
+            "verified_flat_start.sector_count must be in [4, 64]"
+        )
+    if not 1 <= config.min_supported_sectors <= config.sector_count:
+        raise ValueError(
+            "verified_flat_start.min_supported_sectors must be in "
+            "[1, sector_count]"
+        )
+    if config.min_cells_per_sector < 1:
+        raise ValueError(
+            "verified_flat_start.min_cells_per_sector must be positive"
+        )
+    if config.min_observation_count < 1:
+        raise ValueError(
+            "verified_flat_start.min_observation_count must be positive"
+        )
+    if config.min_observation_count > 65535:
+        raise ValueError(
+            "verified_flat_start.min_observation_count must not exceed 65535"
+        )
+    if config.inferred_traversability > 1.0:
+        raise ValueError(
+            "verified_flat_start.inferred_traversability must not exceed 1"
+        )
 
 
 def _validate_freshness_settings(settings: PlannerFreshnessSettings) -> None:
@@ -917,6 +1168,243 @@ def _component_from(
     return visited, count
 
 
+def _verified_flat_start_report(
+    config: VerifiedFlatStartConfig, status: str
+) -> dict[str, object]:
+    return {
+        "config": asdict(config),
+        "status": status,
+        "rejection_reason": None,
+        "fit": None,
+        "support_cells": 0,
+        "support_sectors": 0,
+        "support_cells_per_sector": [0] * config.sector_count,
+        "preserved_inner_cells": 0,
+        "filled_cells": 0,
+        "planner_valid_filled_cells": 0,
+        "connected_support_cells": 0,
+        "exact_start_inferred": False,
+    }
+
+
+def _assess_verified_flat_start(
+    grid: GridSnapshot,
+    start: Pose2D,
+    thresholds: PlannerThresholds,
+    config: VerifiedFlatStartConfig,
+    planner_mask: bytearray,
+) -> tuple[GridSnapshot | None, dict[str, object]]:
+    """Purely assess a bounded planar overlay around a blind start cell."""
+    report = _verified_flat_start_report(config, "evaluating")
+    if (
+        config.fill_radius + config.motion_step + 1.0e-6
+        < config.support_inner_radius
+    ):
+        report["status"] = "invalid_configuration"
+        report["rejection_reason"] = (
+            "fill_radius_plus_motion_step_below_support_inner_radius"
+        )
+        return None, report
+    if (
+        config.max_plane_slope > thresholds.max_slope
+        or config.inferred_traversability < thresholds.min_traversability
+    ):
+        report["status"] = "invalid_configuration"
+        report["rejection_reason"] = "planner_threshold_contract"
+        return None, report
+    support: list[tuple[float, float, float, int]] = []
+    sector_counts = [0] * config.sector_count
+    sector_width = 2.0 * math.pi / config.sector_count
+    radius_tolerance = 1.0e-9
+
+    for y in range(grid.height):
+        cell_y = grid.origin_y + (y + 0.5) * grid.resolution
+        for x in range(grid.width):
+            cell_x = grid.origin_x + (x + 0.5) * grid.resolution
+            dx = cell_x - start.x
+            dy = cell_y - start.y
+            radius = math.hypot(dx, dy)
+            if (
+                radius + radius_tolerance < config.support_inner_radius
+                or radius > config.support_outer_radius + radius_tolerance
+            ):
+                continue
+            index = _address(grid, x, y)
+            elevation = grid.elevation[index]
+            if (
+                not planner_mask[index]
+                or int(grid.observation_count[index])
+                < config.min_observation_count
+                or not _known_layer_value(elevation, grid.unknown_value)
+            ):
+                continue
+            angle = math.atan2(dy, dx) % (2.0 * math.pi)
+            sector = min(
+                config.sector_count - 1,
+                int(angle / sector_width),
+            )
+            sector_counts[sector] += 1
+            support.append((dx, dy, float(elevation), index))
+
+    report["support_cells"] = len(support)
+    report["support_cells_per_sector"] = sector_counts
+    report["support_sectors"] = sum(
+        count >= config.min_cells_per_sector for count in sector_counts
+    )
+    if len(support) < config.min_support_cells:
+        report["status"] = "insufficient_support"
+        report["rejection_reason"] = "min_support_cells"
+        return None, report
+    if report["support_sectors"] < config.min_supported_sectors:
+        report["status"] = "insufficient_sectors"
+        report["rejection_reason"] = "min_supported_sectors"
+        return None, report
+
+    elevations = [point[2] for point in support]
+    elevation_range = max(elevations) - min(elevations)
+    if elevation_range > config.max_elevation_range:
+        report["status"] = "support_not_flat"
+        report["rejection_reason"] = "elevation_range_exceeds_limit"
+        report["fit"] = {"elevation_range_m": elevation_range}
+        return None, report
+
+    mean_x = sum(point[0] for point in support) / len(support)
+    mean_y = sum(point[1] for point in support) / len(support)
+    mean_z = sum(point[2] for point in support) / len(support)
+    xx = xy = yy = xz = yz = 0.0
+    for x, y, z, _ in support:
+        centered_x = x - mean_x
+        centered_y = y - mean_y
+        centered_z = z - mean_z
+        xx += centered_x * centered_x
+        xy += centered_x * centered_y
+        yy += centered_y * centered_y
+        xz += centered_x * centered_z
+        yz += centered_y * centered_z
+    determinant = xx * yy - xy * xy
+    scale = max(xx * yy, 1.0)
+    if not math.isfinite(determinant) or abs(determinant) <= 1.0e-12 * scale:
+        report["status"] = "plane_fit_failed"
+        report["rejection_reason"] = "singular_normal_equations"
+        return None, report
+    gradient_x = (xz * yy - yz * xy) / determinant
+    gradient_y = (yz * xx - xz * xy) / determinant
+    height_at_start = mean_z - gradient_x * mean_x - gradient_y * mean_y
+    residuals = [
+        z - (height_at_start + gradient_x * x + gradient_y * y)
+        for x, y, z, _ in support
+    ]
+    rmse = math.sqrt(
+        sum(residual * residual for residual in residuals) / len(residuals)
+    )
+    max_residual = max(abs(residual) for residual in residuals)
+    slope = math.atan(math.hypot(gradient_x, gradient_y))
+    report["fit"] = {
+        "gradient_x": gradient_x,
+        "gradient_y": gradient_y,
+        "height_at_start": height_at_start,
+        "slope_rad": slope,
+        "rmse_m": rmse,
+        "max_residual_m": max_residual,
+        "elevation_range_m": elevation_range,
+    }
+    if slope > config.max_plane_slope:
+        report["status"] = "support_not_flat"
+        report["rejection_reason"] = "plane_slope_exceeds_limit"
+        return None, report
+    if rmse > config.max_plane_rmse:
+        report["status"] = "support_not_flat"
+        report["rejection_reason"] = "plane_rmse_exceeds_limit"
+        return None, report
+    if max_residual > config.max_plane_residual:
+        report["status"] = "support_not_flat"
+        report["rejection_reason"] = "plane_residual_exceeds_limit"
+        return None, report
+
+    fill_indices: list[tuple[int, float, float]] = []
+    preserved_inner_cells = 0
+    for y in range(grid.height):
+        cell_y = grid.origin_y + (y + 0.5) * grid.resolution
+        for x in range(grid.width):
+            cell_x = grid.origin_x + (x + 0.5) * grid.resolution
+            dx = cell_x - start.x
+            dy = cell_y - start.y
+            if math.hypot(dx, dy) > config.fill_radius + radius_tolerance:
+                continue
+            index = _address(grid, x, y)
+            elevation = grid.elevation[index]
+            completely_unobserved = (
+                int(grid.observation_count[index]) == 0
+                and elevation == grid.unknown_value
+                and grid.slope[index] == grid.unknown_value
+                and grid.traversability[index] == grid.unknown_value
+            )
+            if completely_unobserved:
+                fill_indices.append((index, dx, dy))
+            else:
+                preserved_inner_cells += 1
+
+    report["preserved_inner_cells"] = preserved_inner_cells
+    if not fill_indices:
+        report["status"] = "no_inferred_start_cell"
+        report["rejection_reason"] = "no_completely_unobserved_cells"
+        return None, report
+
+    elevation = list(grid.elevation)
+    slope_layer = list(grid.slope)
+    traversability = list(grid.traversability)
+
+    filled_addresses: set[int] = set()
+    for index, dx, dy in fill_indices:
+        elevation[index] = height_at_start + gradient_x * dx + gradient_y * dy
+        slope_layer[index] = slope
+        traversability[index] = config.inferred_traversability
+        filled_addresses.add(index)
+    candidate = replace(
+        grid,
+        elevation=elevation,
+        slope=slope_layer,
+        traversability=traversability,
+    )
+    candidate_mask, _, _ = _valid_mask(candidate, thresholds)
+    report["filled_cells"] = len(filled_addresses)
+    report["planner_valid_filled_cells"] = sum(
+        bool(candidate_mask[index]) for index in filled_addresses
+    )
+    start_grid_x, start_grid_y = _world_to_grid(candidate, start.x, start.y)
+    start_address = _address(candidate, start_grid_x, start_grid_y)
+    if (
+        start_address not in filled_addresses
+        or not candidate_mask[start_address]
+    ):
+        report["status"] = "no_inferred_start_cell"
+        report["rejection_reason"] = "exact_start_cell_not_inferred"
+        return None, report
+    report["exact_start_inferred"] = True
+
+    candidate_ground, _ = _continuous_ground_mask(candidate, candidate_mask)
+    component, _ = _component_from(
+        candidate,
+        candidate_ground,
+        start_grid_x,
+        start_grid_y,
+        thresholds,
+    )
+    connected_support = sum(
+        bool(component[index]) for _, _, _, index in support
+    )
+    report["connected_support_cells"] = connected_support
+    if connected_support == 0:
+        report["status"] = "no_observed_connection"
+        report["rejection_reason"] = (
+            "inferred_component_does_not_reach_observed_support"
+        )
+        return None, report
+
+    report["status"] = "applied"
+    return candidate, report
+
+
 def _input_age(stamp_ns: int, now_ns: int | None) -> float | None:
     if now_ns is None or stamp_ns <= 0:
         return None
@@ -945,10 +1433,12 @@ def analyze_planner_inputs(
     thresholds: PlannerThresholds = PlannerThresholds(),
     contract: InputContract = InputContract(),
     now_ns: int | None = None,
+    verified_flat_start: VerifiedFlatStartConfig = VerifiedFlatStartConfig(),
 ) -> dict[str, object]:
     """Return input-contract, endpoint, and continuous-ground diagnostics."""
     _validate_grid(grid)
     _validate_thresholds(thresholds)
+    _validate_verified_flat_start(verified_flat_start)
     _validate_pose("start", start)
     if goal is not None:
         _validate_pose("goal", goal)
@@ -1022,6 +1512,10 @@ def analyze_planner_inputs(
         "start_component_cells": 0,
         "start_component_percent_of_ground": 0.0,
         "goal_in_start_component": None,
+        "verified_flat_start": _verified_flat_start_report(
+            verified_flat_start,
+            "not_evaluated" if verified_flat_start.enabled else "disabled",
+        ),
         "diagnosis": "",
         "limitations": (
             "Continuous-ground connectivity uses edge-adjacent planner-valid cells "
@@ -1052,6 +1546,40 @@ def analyze_planner_inputs(
     if not start_result["inside_map"]:
         result["diagnosis"] = "start_outside_map"
         return result
+    overlay_applied = False
+    if start_result["snapped"]:
+        result["verified_flat_start"] = _verified_flat_start_report(
+            verified_flat_start,
+            "not_needed",
+        )
+    elif verified_flat_start.enabled:
+        candidate, assessment = _assess_verified_flat_start(
+            grid,
+            start,
+            thresholds,
+            verified_flat_start,
+            planner_mask,
+        )
+        result["verified_flat_start"] = assessment
+        if candidate is not None:
+            overlay_applied = True
+            grid = candidate
+            planner_mask, known_cells, valid_cells = _valid_mask(
+                grid, thresholds
+            )
+            ground_mask, ground_cells = _continuous_ground_mask(
+                grid, planner_mask
+            )
+            start_result = _snap_endpoint(
+                grid,
+                planner_mask,
+                start,
+                thresholds,
+                start_snap_radius,
+            )
+            start_result["inferred"] = True
+            start_result["ordinary_snapped"] = False
+            result["start"] = start_result
     if not start_result["snapped"]:
         result["diagnosis"] = "start_has_no_valid_cell_in_snap_radius"
         return result
@@ -1071,7 +1599,11 @@ def analyze_planner_inputs(
     )
 
     if goal is None:
-        result["diagnosis"] = "start_ready_waiting_for_goal"
+        result["diagnosis"] = (
+            "start_ready_with_verified_flat_start_waiting_for_goal"
+            if overlay_applied
+            else "start_ready_waiting_for_goal"
+        )
         return result
     if goal.frame_id != grid.frame_id:
         result["diagnosis"] = "goal_frame_mismatch"
@@ -1378,6 +1910,7 @@ def collect_ros_inputs(
     str | None,
     PlannerThresholds | None,
     PlannerFreshnessSettings | None,
+    VerifiedFlatStartConfig | None,
 ]:
     try:
         import rclpy
@@ -1420,13 +1953,18 @@ def collect_ros_inputs(
         node = Node("inspect_planner_inputs")
         live_thresholds = None
         live_freshness = None
+        live_verified_flat_start = None
         if args.read_live_parameters:
             print(
                 "Reading live terrain mapper and planner parameters...",
                 file=sys.stderr,
                 flush=True,
             )
-            live_thresholds, live_freshness = _read_live_planner_thresholds(
+            (
+                live_thresholds,
+                live_freshness,
+                live_verified_flat_start,
+            ) = _read_live_planner_thresholds(
                 node,
                 GetParameters,
                 ParameterType,
@@ -1481,6 +2019,7 @@ def collect_ros_inputs(
             received.get("goal_capture_failure"),
             live_thresholds,
             live_freshness,
+            live_verified_flat_start,
         )
     finally:
         if node is not None:
@@ -1592,6 +2131,58 @@ def print_human(result: dict[str, object]) -> None:
         f"mapper_max_slope={thresholds['mapper_max_slope']:.3f} "
         f"max_roughness={thresholds['max_roughness']:.3f}"
     )
+    verified_flat_start = result["verified_flat_start"]
+    assert isinstance(verified_flat_start, dict)
+    verified_config = verified_flat_start["config"]
+    assert isinstance(verified_config, dict)
+    print(
+        "verified_flat_start: "
+        f"status={verified_flat_start['status']} "
+        f"enabled={verified_config['enabled']} "
+        f"reason={verified_flat_start['rejection_reason']}"
+    )
+    print(
+        "  config: "
+        f"support={verified_config['support_inner_radius']:.3f}-"
+        f"{verified_config['support_outer_radius']:.3f} m "
+        f"fill={verified_config['fill_radius']:.3f} m "
+        f"motion_step={verified_config['motion_step']:.3f} m "
+        f"sectors={verified_config['sector_count']} "
+        f"required={verified_config['min_supported_sectors']} "
+        f"cells_per_sector={verified_config['min_cells_per_sector']} "
+        f"support_cells={verified_config['min_support_cells']} "
+        f"observations={verified_config['min_observation_count']}"
+    )
+    print(
+        "  limits: "
+        f"plane_slope={verified_config['max_plane_slope']:.3f} "
+        f"rmse={verified_config['max_plane_rmse']:.3f} m "
+        f"residual={verified_config['max_plane_residual']:.3f} m "
+        f"elevation_range={verified_config['max_elevation_range']:.3f} m "
+        f"inferred_traversability="
+        f"{verified_config['inferred_traversability']:.3f}"
+    )
+    print(
+        "  evidence: "
+        f"cells={verified_flat_start['support_cells']} "
+        f"sectors={verified_flat_start['support_sectors']} "
+        f"per_sector={verified_flat_start['support_cells_per_sector']} "
+        f"filled={verified_flat_start['filled_cells']} "
+        f"valid_filled={verified_flat_start['planner_valid_filled_cells']} "
+        f"connected_support={verified_flat_start['connected_support_cells']} "
+        f"exact_start_inferred={verified_flat_start['exact_start_inferred']}"
+    )
+    verified_fit = verified_flat_start["fit"]
+    if isinstance(verified_fit, dict) and "slope_rad" in verified_fit:
+        print(
+            "  fit: "
+            f"plane_slope={verified_fit['slope_rad']:.6f} "
+            f"rmse={verified_fit['rmse_m']:.6f} m "
+            f"max_residual={verified_fit['max_residual_m']:.6f} m "
+            f"elevation_range={verified_fit['elevation_range_m']:.6f} m "
+            f"gradient=({verified_fit['gradient_x']:.6f}, "
+            f"{verified_fit['gradient_y']:.6f})"
+        )
     terrain_layers = map_result["terrain_layers"]
     assert isinstance(terrain_layers, dict)
     for line in _format_terrain_layers("all_map_layers", terrain_layers):
@@ -1718,6 +2309,7 @@ def _diagnosis_exit_code(diagnosis: object) -> int:
         if diagnosis
         in {
             "start_ready_waiting_for_goal",
+            "start_ready_with_verified_flat_start_waiting_for_goal",
             "same_continuous_ground_component_not_planner_approval",
         }
         else 2
@@ -1870,6 +2462,7 @@ def main() -> int:
             goal_capture_failure,
             live_thresholds,
             live_freshness,
+            live_verified_flat_start,
         ) = collect_ros_inputs(args)
         thresholds = live_thresholds or PlannerThresholds(
             min_traversability=args.min_traversability,
@@ -1907,6 +2500,9 @@ def main() -> int:
                 ),
             ),
             now_ns=now_ns,
+            verified_flat_start=(
+                live_verified_flat_start or VerifiedFlatStartConfig()
+            ),
         )
         if live_freshness is not None:
             result["runtime_parameters"] = {
