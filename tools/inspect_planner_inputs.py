@@ -61,6 +61,7 @@ class PlannerThresholds:
     max_step_height: float = 0.24
     snap_radius: float = 0.5
     min_observed_frames: int = 4
+    start_snap_radius: float | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +190,7 @@ def _read_live_planner_thresholds(
         "min_traversability",
         "max_slope",
         "max_step_height",
+        "start_snap_radius",
         "snap_radius",
     )
     planner_values = _request_parameter_batch(
@@ -262,11 +264,21 @@ def _read_live_planner_thresholds(
                 "a double",
             )
         ),
-        snap_radius=float(
+        start_snap_radius=float(
             _decode_live_parameter(
                 planner_service,
                 planner_names[3],
                 planner_values[3],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        snap_radius=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[4],
+                planner_values[4],
                 parameter_type.PARAMETER_DOUBLE,
                 "double_value",
                 "a double",
@@ -314,6 +326,11 @@ def _validate_thresholds(thresholds: PlannerThresholds) -> None:
     ):
         if not math.isfinite(value) or value < 0.0:
             raise ValueError(f"{name} must be finite and non-negative")
+    if thresholds.start_snap_radius is not None and (
+        not math.isfinite(thresholds.start_snap_radius)
+        or thresholds.start_snap_radius < 0.0
+    ):
+        raise ValueError("start_snap_radius must be finite and non-negative")
     if thresholds.min_observed_frames < 1:
         raise ValueError("min_observed_frames must be positive")
 
@@ -525,6 +542,7 @@ def _snap_endpoint(
     mask: bytearray,
     pose: Pose2D,
     thresholds: PlannerThresholds,
+    snap_radius: float,
 ) -> dict[str, object]:
     grid_x, grid_y = _world_to_grid(grid, pose.x, pose.y)
     result: dict[str, object] = {
@@ -534,6 +552,7 @@ def _snap_endpoint(
         "world_x": pose.x,
         "world_y": pose.y,
         "yaw_rad": pose.yaw,
+        "snap_radius_m": snap_radius,
         "grid_x": grid_x,
         "grid_y": grid_y,
         "inside_map": _inside(grid, grid_x, grid_y),
@@ -556,8 +575,8 @@ def _snap_endpoint(
 
     exact_valid = bool(mask[_address(grid, grid_x, grid_y)])
     result["exact_cell_valid"] = exact_valid
-    radius = max(1, math.ceil(thresholds.snap_radius / grid.resolution))
-    candidates: list[tuple[int, int, int]] = []
+    radius = max(1, math.ceil(snap_radius / grid.resolution))
+    candidates: list[tuple[float, int, int]] = []
     snap_square_indices: list[int] = []
     snap_radius_indices: list[int] = []
     for delta_y in range(-radius, radius + 1):
@@ -568,15 +587,18 @@ def _snap_endpoint(
                 continue
             address = _address(grid, x, y)
             snap_square_indices.append(address)
-            distance_m = (
-                math.hypot(delta_x, delta_y) * grid.resolution
+            candidate_world_x = grid.origin_x + (x + 0.5) * grid.resolution
+            candidate_world_y = grid.origin_y + (y + 0.5) * grid.resolution
+            distance_m = math.hypot(
+                candidate_world_x - pose.x,
+                candidate_world_y - pose.y,
             )
-            if distance_m > thresholds.snap_radius + 1.0e-6:
+            exact_cell = delta_x == 0 and delta_y == 0 and exact_valid
+            if distance_m > snap_radius + 1.0e-6 and not exact_cell:
                 continue
             snap_radius_indices.append(address)
             if mask[address]:
-                distance = delta_x * delta_x + delta_y * delta_y
-                candidates.append((distance, x, y))
+                candidates.append((distance_m, x, y))
     result["snap_square_terrain_layers"] = _terrain_layer_stats(
         grid,
         thresholds,
@@ -594,10 +616,13 @@ def _snap_endpoint(
     if not candidates:
         return result
 
-    _, snapped_x, snapped_y = min(
-        candidates,
-        key=lambda candidate: candidate[0],
-    )
+    if exact_valid:
+        snapped_x, snapped_y = grid_x, grid_y
+    else:
+        _, snapped_x, snapped_y = min(
+            candidates,
+            key=lambda candidate: candidate[0],
+        )
     snapped_world_x = grid.origin_x + (snapped_x + 0.5) * grid.resolution
     snapped_world_y = grid.origin_y + (snapped_y + 0.5) * grid.resolution
     grid_distance = (
@@ -617,7 +642,7 @@ def _snap_endpoint(
             "snap_grid_distance_m": grid_distance,
             "snap_world_to_center_distance_m": world_to_center_distance,
             "snap_grid_distance_outside_nominal_radius": (
-                grid_distance > thresholds.snap_radius + 1.0e-6
+                grid_distance > snap_radius + 1.0e-6
             ),
         }
     )
@@ -705,9 +730,28 @@ def analyze_planner_inputs(
     planner_mask, known_cells, valid_cells = _valid_mask(grid, thresholds)
     ground_mask, ground_cells = _continuous_ground_mask(grid, planner_mask)
     total_cells = grid.width * grid.height
-    start_result = _snap_endpoint(grid, planner_mask, start, thresholds)
+    start_snap_radius = (
+        thresholds.snap_radius
+        if thresholds.start_snap_radius is None
+        else thresholds.start_snap_radius
+    )
+    start_result = _snap_endpoint(
+        grid,
+        planner_mask,
+        start,
+        thresholds,
+        start_snap_radius,
+    )
     goal_result = (
-        _snap_endpoint(grid, planner_mask, goal, thresholds) if goal else None
+        _snap_endpoint(
+            grid,
+            planner_mask,
+            goal,
+            thresholds,
+            thresholds.snap_radius,
+        )
+        if goal
+        else None
     )
     map_age = _input_age(grid.stamp_ns, now_ns)
     odom_age = _input_age(start.stamp_ns, now_ns)
@@ -732,7 +776,10 @@ def analyze_planner_inputs(
             "continuous_ground_percent": 100.0 * ground_cells / total_cells,
             "terrain_layers": _terrain_layer_stats(grid, thresholds),
         },
-        "thresholds": asdict(thresholds),
+        "thresholds": {
+            **asdict(thresholds),
+            "start_snap_radius": start_snap_radius,
+        },
         "contract": asdict(contract),
         "freshness": {
             "evaluated": now_ns is not None,
@@ -1366,6 +1413,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mapper-max-slope", type=float, default=0.65)
     parser.add_argument("--max-roughness", type=float, default=0.08)
     parser.add_argument("--max-step-height", type=float, default=0.24)
+    parser.add_argument("--start-snap-radius", type=float)
     parser.add_argument("--snap-radius", type=float, default=0.5)
     parser.add_argument("--min-observed-frames", type=int, default=4)
     parser.add_argument("--expected-map-frame", default="world")
@@ -1394,13 +1442,17 @@ def parse_args() -> argparse.Namespace:
         "mapper_max_slope",
         "max_roughness",
         "max_step_height",
+        "start_snap_radius",
         "snap_radius",
         "max_map_age",
         "max_odom_age",
         "max_goal_age",
         "future_tolerance",
     ):
-        if not math.isfinite(getattr(args, name)) or getattr(args, name) < 0.0:
+        value = getattr(args, name)
+        if value is None:
+            continue
+        if not math.isfinite(value) or value < 0.0:
             option = name.replace("_", "-")
             parser.error(f"--{option} must be finite and non-negative")
     if args.min_observed_frames < 1:
@@ -1584,6 +1636,7 @@ def main() -> int:
             mapper_max_slope=args.mapper_max_slope,
             max_roughness=args.max_roughness,
             max_step_height=args.max_step_height,
+            start_snap_radius=args.start_snap_radius,
             snap_radius=args.snap_radius,
             min_observed_frames=args.min_observed_frames,
         )

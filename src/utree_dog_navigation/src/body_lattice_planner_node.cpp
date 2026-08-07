@@ -32,6 +32,7 @@ BodyLatticePlannerNode::BodyLatticePlannerNode() : Node("body_lattice_planner")
   config.lateral_cost_factor = declare_parameter("lateral_cost_factor", 1.25);
   config.max_expansions = declare_parameter("max_expansions", 250000);
   config.snap_radius = declare_parameter("snap_radius", 0.5);
+  config.start_snap_radius = declare_parameter("start_snap_radius", config.snap_radius);
   planner_ = std::make_unique<LatticePlanner>(config);
 
   const auto map_qos = rclcpp::QoS(1).reliable().transient_local();

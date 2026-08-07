@@ -218,8 +218,17 @@ The generated `analysis/report.md` lists the effective mode as
 `LIO dense cloud output`; verify it matches the arm being analyzed.
 
 The endpoint JSON keeps both square-context counts and the Euclidean-radius
-counts used by `LatticePlanner`. Snapping and readiness use only the radius
-counts. Older records without radius fields remain readable by the analyzer.
+counts used by `LatticePlanner`. Candidate distance is measured from the
+original endpoint world pose to each candidate cell center, so crossing a grid
+boundary cannot change the result through integer cell offsets alone. The XT-16
+profile uses `start_snap_radius=0.55 m` for the robot's near-field blind ring;
+goals remain bounded by `snap_radius=0.50 m`. Older records without these fields
+remain readable by the analyzer. `snap_grid_distance_m` is retained only for
+quantization diagnostics and may exceed the endpoint radius; acceptance uses
+`snap_world_to_center_distance_m`. Configurations that omit
+`start_snap_radius` retain the legacy behavior and use `snap_radius` for both
+endpoints. An endpoint already inside a planner-valid cell keeps that cell and
+does not require a separate snap-radius allowance.
 
 Only after both A/B arms are captured and the selected mode passes the full
 flat-ground gate, start the goal check:
@@ -249,8 +258,8 @@ synchronized pair.
 - observation, elevation, feature, threshold, and planner-valid counts for the
   full map and each endpoint's square snap area;
 - whether start and goal are inside the map;
-- the exact cell and the nearest cell selected by the planner's square snap
-  search;
+- the exact cell and the nearest cell selected by the planner's world-distance
+  snap search;
 - the number of valid cells in each endpoint's snap area; and
 - whether map, odometry, and goal frames and timestamps satisfy the configured
   input contract; and
@@ -269,7 +278,8 @@ only the current map and robot start, or `--json` for machine-readable output.
 Older sessions may contain the legacy `*_snap_square` diagnosis.
 The wrapper requires live values for `/terrain_mapper` `min_observed_frames`,
 `max_slope`, and `max_roughness`, and for `/body_lattice_planner`
-`min_traversability`, `max_slope`, `max_step_height`, and `snap_radius`. The two
+`min_traversability`, `max_slope`, `max_step_height`, `start_snap_radius`, and
+`snap_radius`. The two
 `max_slope` values are captured separately because mapper scoring and planner
 acceptance are independent gates. User-supplied threshold flags cannot override
 the values read from the running nodes.

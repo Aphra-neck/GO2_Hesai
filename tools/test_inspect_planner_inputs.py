@@ -260,7 +260,9 @@ class LiveParameterServiceTests(unittest.TestCase):
         planner_client = FakeParameterClient(
             [
                 FakeParameterFuture(
-                    response=parameter_response(None, 0.21, 0.61, 0.19, 0.45)
+                    response=parameter_response(
+                        None, 0.21, 0.61, 0.19, 0.55, 0.45
+                    )
                 )
             ]
         )
@@ -298,6 +300,7 @@ class LiveParameterServiceTests(unittest.TestCase):
                 mapper_max_slope=0.58,
                 max_roughness=0.07,
                 max_step_height=0.19,
+                start_snap_radius=0.55,
                 snap_radius=0.45,
                 min_observed_frames=6,
             ),
@@ -311,7 +314,13 @@ class LiveParameterServiceTests(unittest.TestCase):
         )
         self.assertEqual(
             planner_client.requests,
-            [["min_traversability", "max_slope", "max_step_height", "snap_radius"]],
+            [[
+                "min_traversability",
+                "max_slope",
+                "max_step_height",
+                "start_snap_radius",
+                "snap_radius",
+            ]],
         )
         self.assertEqual(response_timeouts, [0.5, 0.5, 0.5])
         self.assertEqual(
@@ -373,7 +382,7 @@ class LiveParameterServiceTests(unittest.TestCase):
                     [
                         FakeParameterFuture(
                             response=parameter_response(
-                                None, 0.21, 0.61, 0.19, 0.45
+                                None, 0.21, 0.61, 0.19, 0.55, 0.45
                             )
                         )
                     ]
@@ -410,7 +419,7 @@ class LiveParameterServiceTests(unittest.TestCase):
                     [
                         FakeParameterFuture(
                             response=parameter_response(
-                                None, 0.21, 0.61, 0.19, 0.45
+                                None, 0.21, 0.61, 0.19, 0.55, 0.45
                             )
                         )
                     ]
@@ -891,6 +900,102 @@ class PlannerInputInspectionTests(unittest.TestCase):
         self.assertAlmostEqual(result["start"]["snap_grid_distance_m"], 0.5)
         self.assertFalse(
             result["start"]["snap_grid_distance_outside_nominal_radius"]
+        )
+        self.assertEqual(result["diagnosis"], "start_ready_waiting_for_goal")
+
+    def test_snap_distance_is_continuous_across_source_cell_boundary(self) -> None:
+        grid = make_grid(width=8, height=8, resolution=0.2)
+        traversability = [UNKNOWN] * 64
+        slope = [UNKNOWN] * 64
+        traversability[4 * 8 + 1] = 1.0
+        slope[4 * 8 + 1] = 0.0
+        grid = replace(grid, slope=slope, traversability=traversability)
+        thresholds = PlannerThresholds(
+            start_snap_radius=0.55,
+            snap_radius=0.5,
+        )
+
+        below_boundary = analyze_planner_inputs(
+            grid, pose(0.3, 0.399), None, thresholds
+        )
+        above_boundary = analyze_planner_inputs(
+            grid, pose(0.3, 0.401), None, thresholds
+        )
+
+        self.assertTrue(below_boundary["start"]["snapped"])
+        self.assertTrue(above_boundary["start"]["snapped"])
+        self.assertEqual(
+            below_boundary["start"]["snapped_grid_y"],
+            above_boundary["start"]["snapped_grid_y"],
+        )
+        self.assertLess(
+            below_boundary["start"]["snap_world_to_center_distance_m"],
+            thresholds.start_snap_radius,
+        )
+
+    def test_goal_keeps_its_narrower_snap_radius(self) -> None:
+        grid = make_grid(width=8, height=8, resolution=0.2)
+        traversability = [UNKNOWN] * 64
+        slope = [UNKNOWN] * 64
+        traversability[4 * 8 + 1] = 1.0
+        slope[4 * 8 + 1] = 0.0
+        grid = replace(grid, slope=slope, traversability=traversability)
+        thresholds = PlannerThresholds(
+            start_snap_radius=0.55,
+            snap_radius=0.5,
+        )
+
+        result = analyze_planner_inputs(
+            grid,
+            pose(0.3, 0.9),
+            pose(0.3, 0.399),
+            thresholds,
+        )
+
+        self.assertTrue(result["start"]["snapped"])
+        self.assertFalse(result["goal"]["snapped"])
+        self.assertEqual(
+            result["diagnosis"], "goal_has_no_valid_cell_in_snap_radius"
+        )
+
+    def test_legacy_snap_radius_also_controls_start(self) -> None:
+        grid = make_grid(width=8, height=8, resolution=0.1)
+        traversability = [UNKNOWN] * 64
+        slope = [UNKNOWN] * 64
+        traversability[3 * 8 + 1] = 1.0
+        slope[3 * 8 + 1] = 0.0
+        grid = replace(grid, slope=slope, traversability=traversability)
+
+        # Preserve the original positional field order when the new field is omitted.
+        thresholds = PlannerThresholds(0.18, 0.65, 0.65, 0.08, 0.24, 0.1, 4)
+        result = analyze_planner_inputs(
+            grid,
+            pose(0.15, 0.251),
+            None,
+            thresholds,
+        )
+
+        self.assertIsNone(thresholds.start_snap_radius)
+        self.assertTrue(result["start"]["snapped"])
+        self.assertEqual(result["thresholds"]["start_snap_radius"], 0.1)
+        self.assertEqual(
+            result["diagnosis"], "start_ready_waiting_for_goal"
+        )
+
+    def test_exact_valid_cell_does_not_require_snapping(self) -> None:
+        result = analyze_planner_inputs(
+            make_grid(width=2, height=1),
+            pose(0.99, 0.5),
+            None,
+            PlannerThresholds(start_snap_radius=0.0, snap_radius=0.0),
+        )
+
+        self.assertTrue(result["start"]["exact_cell_valid"])
+        self.assertTrue(result["start"]["snapped"])
+        self.assertEqual(result["start"]["snapped_grid_x"], 0)
+        self.assertEqual(result["start"]["valid_cells_in_snap_radius"], 1)
+        self.assertAlmostEqual(
+            result["start"]["snap_world_to_center_distance_m"], 0.49
         )
         self.assertEqual(result["diagnosis"], "start_ready_waiting_for_goal")
 

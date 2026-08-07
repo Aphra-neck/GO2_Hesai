@@ -133,6 +133,7 @@ def endpoint(
         "world_x": 0.1 + seed,
         "world_y": 0.2 + seed,
         "yaw_rad": 0.0,
+        "snap_radius_m": 0.55 if scope == "start" else 0.5,
         "grid_x": 4 + seed,
         "grid_y": 5 + seed,
         "inside_map": inside,
@@ -189,6 +190,7 @@ def inspection_record() -> dict[str, object]:
                 "mapper_max_slope": 0.65,
                 "max_roughness": 0.08,
                 "max_step_height": 0.24,
+                "start_snap_radius": 0.55,
                 "snap_radius": 0.5,
             },
             "contract": {
@@ -311,7 +313,9 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
         self.assertEqual(summary["rows"][1]["observation_below_min"], 21)
         self.assertEqual(summary["rows"][1]["hard_reject_candidate"], 3)
         self.assertEqual(summary["rows"][0]["max_step_height"], 0.24)
+        self.assertEqual(summary["rows"][0]["start_snap_radius"], 0.55)
         self.assertEqual(summary["rows"][0]["snap_radius"], 0.5)
+        self.assertEqual(summary["rows"][1]["endpoint_snap_radius"], 0.55)
         self.assertEqual(summary["rows"][0]["mapper_max_slope"], 0.65)
         self.assertEqual(
             summary["rows"][0]["slope_at_or_above_mapper_limit"], 4
@@ -340,12 +344,109 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
         self.assertEqual(summary["rows"][1]["valid_cells_in_snap_square"], 1)
         self.assertEqual(summary["rows"][1]["valid_cells_in_snap_radius"], 0)
 
+    def test_previous_schema_without_endpoint_radii_remains_readable(self) -> None:
+        record = inspection_record()
+        inspection = record["inspection"]
+        inspection["thresholds"].pop("start_snap_radius")
+        for endpoint_data in (inspection["start"], inspection["goal"]):
+            endpoint_data.pop("snap_radius_m")
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 0)
+        self.assertEqual(len(summary["completed_records"]), 1)
+
     def test_legacy_endpoints_without_radius_fields_remain_readable(self) -> None:
         record = inspection_record()
         inspection = record["inspection"]
+        inspection["thresholds"].pop("start_snap_radius")
         for endpoint_data in (inspection["start"], inspection["goal"]):
+            endpoint_data.pop("snap_radius_m")
             endpoint_data.pop("valid_cells_in_snap_radius")
             endpoint_data.pop("snap_radius_terrain_layers")
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 0)
+        self.assertEqual(len(summary["completed_records"]), 1)
+
+    def test_world_distance_snap_may_cross_integer_grid_radius(self) -> None:
+        record = inspection_record()
+        goal = record["inspection"]["goal"]
+        goal["snap_grid_distance_m"] = 0.6
+        goal["snap_world_to_center_distance_m"] = 0.49
+        goal["snap_grid_distance_outside_nominal_radius"] = True
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 0)
+        self.assertEqual(len(summary["completed_records"]), 1)
+
+    def test_grid_radius_flag_must_match_snapped_distance(self) -> None:
+        record = inspection_record()
+        goal = record["inspection"]["goal"]
+        goal["snap_grid_distance_m"] = 0.6
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 1)
+        self.assertEqual(len(summary["completed_records"]), 0)
+
+    def test_unsnapped_endpoint_cannot_set_grid_radius_flag(self) -> None:
+        record = inspection_record()
+        start = record["inspection"]["start"]
+        start["snap_grid_distance_outside_nominal_radius"] = True
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 1)
+        self.assertEqual(len(summary["completed_records"]), 0)
+
+    def test_snap_outside_endpoint_world_radius_is_rejected(self) -> None:
+        record = inspection_record()
+        goal = record["inspection"]["goal"]
+        goal["snap_world_to_center_distance_m"] = 0.51
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 1)
+        self.assertEqual(len(summary["completed_records"]), 0)
+
+    def test_non_numeric_endpoint_snap_radius_is_rejected(self) -> None:
+        record = inspection_record()
+        record["inspection"]["goal"]["snap_radius_m"] = "0.55"
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 1)
+        self.assertEqual(len(summary["completed_records"]), 0)
+
+    def test_non_numeric_endpoint_world_distance_is_rejected(self) -> None:
+        record = inspection_record()
+        record["inspection"]["goal"][
+            "snap_world_to_center_distance_m"
+        ] = "0.1"
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 1)
+        self.assertEqual(len(summary["completed_records"]), 0)
+
+    def test_endpoint_radius_must_match_its_threshold(self) -> None:
+        record = inspection_record()
+        record["inspection"]["goal"]["snap_radius_m"] = 0.55
+
+        summary = summarize_planner_inspections([record])
+
+        self.assertEqual(summary["schema_invalid"], 1)
+        self.assertEqual(len(summary["completed_records"]), 0)
+
+    def test_exact_valid_cell_may_exceed_snap_radius(self) -> None:
+        record = inspection_record()
+        goal = record["inspection"]["goal"]
+        goal["exact_cell_valid"] = True
+        goal["snap_grid_distance_m"] = 0.0
+        goal["snap_world_to_center_distance_m"] = 0.51
 
         summary = summarize_planner_inspections([record])
 
@@ -663,6 +764,7 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
         self.assertEqual(len(products), 7)
         self.assertEqual(len(rows), 3)
         self.assertEqual(rows[0]["max_step_height"], "0.24")
+        self.assertEqual(rows[0]["start_snap_radius"], "0.55")
         self.assertEqual(rows[0]["snap_radius"], "0.5")
         self.assertEqual(rows[0]["mapper_max_slope"], "0.65")
         self.assertEqual(rows[0]["slope_at_or_above_mapper_limit"], "4")

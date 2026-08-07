@@ -26,6 +26,8 @@ struct LatticePlannerConfig
   double lateral_cost_factor{1.25};
   int max_expansions{250000};
   double snap_radius{0.5};
+  // A negative value preserves the legacy contract: use snap_radius for both endpoints.
+  double start_snap_radius{-1.0};
 };
 
 struct GridState
@@ -80,7 +82,8 @@ private:
   GridState decode(std::uint64_t value) const;
   int yawBin(double yaw) const;
   bool validCell(int x, int y) const;
-  bool nearestValid(int & x, int & y) const;
+  bool nearestValid(
+    double world_x, double world_y, double snap_radius, int & x, int & y) const;
   double heuristic(const GridState & state, const GridState & goal) const;
   bool transition(
     const GridState & current, const Motion & motion, GridState & next,

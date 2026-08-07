@@ -91,4 +91,80 @@ TEST(LatticePlanner, AcceptsSnapCandidateOnEuclideanRadiusBoundary)
   EXPECT_TRUE(result.success);
 }
 
+TEST(LatticePlanner, SnapDistanceIsContinuousAcrossSourceCellBoundary)
+{
+  auto map = makeSparseMap(0.2F);
+  makeCellValid(map, 1, 4);
+
+  LatticePlannerConfig config;
+  config.start_snap_radius = 0.55;
+  config.snap_radius = 0.5;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const WorldState goal{0.3, 0.9, 0.0};
+  const auto below_boundary = planner.plan({0.3, 0.399, 0.0}, goal);
+  const auto above_boundary = planner.plan({0.3, 0.401, 0.0}, goal);
+
+  EXPECT_TRUE(below_boundary.success);
+  EXPECT_TRUE(above_boundary.success);
+  ASSERT_FALSE(below_boundary.states.empty());
+  ASSERT_FALSE(above_boundary.states.empty());
+  EXPECT_EQ(below_boundary.states.front().x, above_boundary.states.front().x);
+  EXPECT_EQ(below_boundary.states.front().y, above_boundary.states.front().y);
+}
+
+TEST(LatticePlanner, GoalKeepsItsNarrowerSnapRadius)
+{
+  auto map = makeSparseMap(0.2F);
+  makeCellValid(map, 1, 4);
+
+  LatticePlannerConfig config;
+  config.start_snap_radius = 0.55;
+  config.snap_radius = 0.5;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const WorldState valid_start{0.3, 0.9, 0.0};
+  const auto result = planner.plan(valid_start, {0.3, 0.399, 0.0});
+
+  EXPECT_FALSE(result.success);
+}
+
+TEST(LatticePlanner, LegacySnapRadiusAlsoControlsStart)
+{
+  auto map = makeSparseMap(0.1F);
+  makeCellValid(map, 1, 3);
+
+  // Keep the original aggregate field order working when the new field is omitted.
+  LatticePlannerConfig config{
+    16, 0.20, 0.18, 0.24, 0.65, 0.08, 4.0, 1.5, 2.0, 0.15, 1.15, 1.25, 250000,
+    0.1};
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({0.15, 0.251, 0.0}, {0.15, 0.35, 0.0});
+
+  EXPECT_TRUE(result.success);
+}
+
+TEST(LatticePlanner, ExactValidCellDoesNotRequireSnapping)
+{
+  auto map = makeSparseMap(1.0F);
+  makeCellValid(map, 0, 0);
+
+  LatticePlannerConfig config;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({0.99, 0.5, 0.0}, {0.5, 0.5, 0.0});
+
+  ASSERT_TRUE(result.success);
+  ASSERT_FALSE(result.states.empty());
+  EXPECT_EQ(result.states.front().x, 0);
+  EXPECT_EQ(result.states.front().y, 0);
+}
+
 }  // namespace utree_dog_navigation

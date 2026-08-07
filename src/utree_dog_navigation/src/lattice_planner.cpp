@@ -43,6 +43,9 @@ struct QueueItem
 LatticePlanner::LatticePlanner(LatticePlannerConfig config) : config_(std::move(config))
 {
   config_.yaw_bins = std::max(8, config_.yaw_bins);
+  if (config_.start_snap_radius < 0.0) {
+    config_.start_snap_radius = config_.snap_radius;
+  }
 }
 
 void LatticePlanner::setMap(utree_dog_msgs::msg::TerrainGrid::SharedPtr map)
@@ -73,7 +76,12 @@ PlanningResult LatticePlanner::plan(const WorldState & start_world, const WorldS
     !toGrid(goal_world.x, goal_world.y, goal.x, goal.y)) {return result;}
   start.yaw = yawBin(start_world.yaw);
   goal.yaw = yawBin(goal_world.yaw);
-  if (!nearestValid(start.x, start.y) || !nearestValid(goal.x, goal.y)) {return result;}
+  if (!nearestValid(
+      start_world.x, start_world.y, config_.start_snap_radius, start.x, start.y) ||
+    !nearestValid(goal_world.x, goal_world.y, config_.snap_radius, goal.x, goal.y))
+  {
+    return result;
+  }
 
   const std::array<Motion, 10> motions{{
     {1.0, 0.0, 0, 1.0}, {-1.0, 0.0, 0, config_.reverse_cost_factor},
@@ -200,29 +208,35 @@ bool LatticePlanner::validCell(int x, int y) const
          map_->slope[i] != map_->unknown_value && map_->slope[i] <= config_.max_slope;
 }
 
-bool LatticePlanner::nearestValid(int & x, int & y) const
+bool LatticePlanner::nearestValid(
+  double world_x, double world_y, double snap_radius, int & x, int & y) const
 {
   if (validCell(x, y)) {return true;}
   const int radius = std::max(
-    1, static_cast<int>(std::ceil(config_.snap_radius / map_->resolution)));
+    1, static_cast<int>(std::ceil(snap_radius / map_->resolution)));
   int best_x = x;
   int best_y = y;
-  int best_distance = std::numeric_limits<int>::max();
+  double best_distance = std::numeric_limits<double>::infinity();
   for (int dy = -radius; dy <= radius; ++dy) {
     for (int dx = -radius; dx <= radius; ++dx) {
+      const int candidate_x = x + dx;
+      const int candidate_y = y + dy;
+      if (!validCell(candidate_x, candidate_y)) {continue;}
+      const double candidate_world_x =
+        map_->origin_x + (static_cast<double>(candidate_x) + 0.5) * map_->resolution;
+      const double candidate_world_y =
+        map_->origin_y + (static_cast<double>(candidate_y) + 0.5) * map_->resolution;
       const double distance_m = std::hypot(
-        static_cast<double>(dx) * map_->resolution,
-        static_cast<double>(dy) * map_->resolution);
-      if (distance_m > config_.snap_radius + kDistanceTolerance) {continue;}
-      const int distance = dx * dx + dy * dy;
-      if (distance < best_distance && validCell(x + dx, y + dy)) {
-        best_x = x + dx;
-        best_y = y + dy;
-        best_distance = distance;
+        candidate_world_x - world_x, candidate_world_y - world_y);
+      if (distance_m > snap_radius + kDistanceTolerance) {continue;}
+      if (distance_m < best_distance) {
+        best_x = candidate_x;
+        best_y = candidate_y;
+        best_distance = distance_m;
       }
     }
   }
-  if (best_distance == std::numeric_limits<int>::max()) {return false;}
+  if (!std::isfinite(best_distance)) {return false;}
   x = best_x;
   y = best_y;
   return true;

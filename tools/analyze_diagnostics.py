@@ -116,6 +116,7 @@ PLANNER_CSV_FIELDS = (
     "mapper_max_slope",
     "max_roughness",
     "max_step_height",
+    "start_snap_radius",
     "snap_radius",
     "map_age_sec",
     "odom_age_sec",
@@ -134,6 +135,7 @@ PLANNER_CSV_FIELDS = (
     "valid_cells_in_snap_square",
     "valid_cells_in_snap_radius",
     "snapped",
+    "endpoint_snap_radius",
     "snap_grid_distance_m",
     "snap_world_to_center_distance_m",
     "start_map_diagnosis",
@@ -387,6 +389,10 @@ def _valid_planner_endpoint(value: object) -> bool:
         or type(value.get("snap_grid_distance_outside_nominal_radius")) is not bool
     ):
         return False
+    if "snap_radius_m" in value and not _is_finite_number(
+        value.get("snap_radius_m"), minimum=0.0
+    ):
+        return False
 
     has_radius_count = "valid_cells_in_snap_radius" in value
     has_radius_layers = "snap_radius_terrain_layers" in value
@@ -456,6 +462,13 @@ def _valid_planner_endpoint(value: object) -> bool:
             for field in snapped_fields[2:]
         ):
             return False
+        if (
+            not value["exact_cell_valid"]
+            and "snap_radius_m" in value
+            and value["snap_world_to_center_distance_m"]
+            > value["snap_radius_m"] + 1.0e-6
+        ):
+            return False
     elif any(value.get(field) is not None for field in snapped_fields):
         return False
     if value["exact_cell_valid"] and not snapped:
@@ -466,7 +479,16 @@ def _valid_planner_endpoint(value: object) -> bool:
         or snapped
     ):
         return False
-    if has_radius_count and value["snap_grid_distance_outside_nominal_radius"]:
+    outside_grid_radius = value["snap_grid_distance_outside_nominal_radius"]
+    if "snap_radius_m" not in value:
+        if outside_grid_radius:
+            return False
+    elif not snapped:
+        if outside_grid_radius:
+            return False
+    elif outside_grid_radius != (
+        value["snap_grid_distance_m"] > value["snap_radius_m"] + 1.0e-6
+    ):
         return False
     return (valid_snap_cells > 0) == snapped
 
@@ -626,6 +648,12 @@ def _valid_planner_inspection(value: object) -> bool:
         or not contract_required.issubset(contract)
         or not freshness_required.issubset(freshness)
         or not _is_strict_int(thresholds.get("min_observed_frames"), minimum=1)
+        or (
+            "start_snap_radius" in thresholds
+            and not _is_finite_number(
+                thresholds.get("start_snap_radius"), minimum=0.0
+            )
+        )
         or any(
             not _is_finite_number(thresholds.get(field), minimum=0.0)
             for field in (
@@ -672,6 +700,23 @@ def _valid_planner_inspection(value: object) -> bool:
         )
         or not isinstance(value.get("limitations"), str)
         or not value["limitations"]
+    ):
+        return False
+    start_snap_radius = thresholds.get(
+        "start_snap_radius", thresholds["snap_radius"]
+    )
+    if "snap_radius_m" in start and not math.isclose(
+        float(start["snap_radius_m"]),
+        float(start_snap_radius),
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-9,
+    ):
+        return False
+    if goal is not None and "snap_radius_m" in goal and not math.isclose(
+        float(goal["snap_radius_m"]),
+        float(thresholds["snap_radius"]),
+        rel_tol=1.0e-9,
+        abs_tol=1.0e-9,
     ):
         return False
     if value["start_component_cells"] > map_data["continuous_ground_cells"]:
@@ -751,6 +796,9 @@ def _planner_layer_row(
             "mapper_max_slope": thresholds.get("mapper_max_slope", ""),
             "max_roughness": thresholds.get("max_roughness", ""),
             "max_step_height": thresholds.get("max_step_height", ""),
+            "start_snap_radius": thresholds.get(
+                "start_snap_radius", thresholds.get("snap_radius", "")
+            ),
             "snap_radius": thresholds.get("snap_radius", ""),
             "map_age_sec": freshness.get("map_age_sec", ""),
             "odom_age_sec": freshness.get("odom_age_sec", ""),
@@ -787,10 +835,14 @@ def _planner_layer_row(
             "valid_cells_in_snap_square",
             "valid_cells_in_snap_radius",
             "snapped",
+            "snap_radius_m",
             "snap_grid_distance_m",
             "snap_world_to_center_distance_m",
         ):
-            row[field] = endpoint.get(field, "")
+            output_field = (
+                "endpoint_snap_radius" if field == "snap_radius_m" else field
+            )
+            row[output_field] = endpoint.get(field, "")
     return row
 
 
@@ -1899,6 +1951,8 @@ def generate_report(
                 f"mapper_max_slope={latest_inspection['thresholds']['mapper_max_slope']}; "
                 f"max_roughness={latest_inspection['thresholds']['max_roughness']}; "
                 f"max_step_height={latest_inspection['thresholds']['max_step_height']}; "
+                "start_snap_radius="
+                f"{latest_inspection['thresholds'].get('start_snap_radius', latest_inspection['thresholds']['snap_radius'])}; "
                 f"snap_radius={latest_inspection['thresholds']['snap_radius']}.",
                 "Timing/topology: "
                 "map_minus_odom="

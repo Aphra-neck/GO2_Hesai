@@ -655,8 +655,10 @@ Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。检查器会�
 `start_and_goal_continuous_ground_disconnected` 分别用于区分起点无有效格、目标无有效格和
 连续地面不连通；`*_frame_mismatch`、`*_stale` 或 `*_stamp_from_future` 表示坐标契约或
 时间新鲜度不满足，`*_elevation_invalid_for_ground_topology` 表示吸附格缺少有效高程。
-旧日志可能保留名称 `*_snap_square`，但新检查器与 C++ 规划器均按同一个
-`snap_radius` 欧氏圆进行吸附。
+旧日志可能保留名称 `*_snap_square`。新检查器与 C++ 规划器均从原始端点世界坐标到候选
+格中心计算真实欧氏距离，避免机器人跨过栅格边界时仅因整数格偏移而改变结论。XT-16 平地
+配置只对当前机器人起点使用 `start_snap_radius=0.55 m`，RViz 目标仍使用
+`snap_radius=0.50 m`；该修改没有放宽坡度、粗糙度、通行度或台阶阈值。
 此操作只应让规划节点生成 `/body_path`，不会自动控制机器人，因为 SDK2 bridge 尚未启动。
 
 退出码 `0` 只表示起点检查通过，或起终点属于同一连续地面区域；其他诊断结论返回 `2`，

@@ -57,4 +57,7 @@ body_lattice_planner:
     reverse_cost_factor: 1.15
     lateral_cost_factor: 1.25
     max_expansions: 250000
+    # XT-16 has an unobserved near-field ring around the body. Keep this
+    # bounded start-only allowance separate from goal snapping.
+    start_snap_radius: 0.55
     snap_radius: 0.50
