@@ -23,6 +23,16 @@ SESSION_RECORD_MAX_BYTES = 1024 * 1024
 PARAMETER_SERVICE_TIMEOUT_SEC = 2.0
 PARAMETER_RESPONSE_TIMEOUT_SEC = 2.0
 PARAMETER_READ_ATTEMPTS = 3
+ENDPOINT_COVERAGE_RADIUS_M = 3.0
+ENDPOINT_COVERAGE_SECTORS = 8
+ENDPOINT_COVERAGE_MAX_RINGS = 64
+_COVERAGE_COUNT_KEYS = (
+    "observed",
+    "observation_ready",
+    "elevation_known",
+    "features_known",
+    "planner_valid",
+)
 
 
 @dataclass(frozen=True)
@@ -532,7 +542,8 @@ def _terrain_layer_stats(
                 "zero_traversability_with_slope_and_roughness_below_limits"
             ] += 1
         if (
-            traversability_known
+            elevation_known
+            and traversability_known
             and slope_known
             and traversability >= thresholds.min_traversability
             and slope <= thresholds.max_slope
@@ -564,6 +575,141 @@ def _terrain_layer_stats(
     return stats
 
 
+def _empty_coverage_counts() -> dict[str, int]:
+    return {"cell_count": 0, **{key: 0 for key in _COVERAGE_COUNT_KEYS}}
+
+
+def _empty_nearest_distances() -> dict[str, float | None]:
+    return {key: None for key in _COVERAGE_COUNT_KEYS}
+
+
+def _radial_coverage_profile(
+    grid: GridSnapshot,
+    planner_valid_mask: bytearray,
+    pose: Pose2D,
+    thresholds: PlannerThresholds,
+    max_radius_m: float = ENDPOINT_COVERAGE_RADIUS_M,
+    sector_count: int = ENDPOINT_COVERAGE_SECTORS,
+) -> dict[str, object]:
+    """Summarize observed terrain around an endpoint without retaining map payloads."""
+    ring_width_m = max(
+        grid.resolution,
+        max_radius_m / ENDPOINT_COVERAGE_MAX_RINGS,
+    )
+    ring_count = max(1, math.ceil(max_radius_m / ring_width_m))
+    rings: list[dict[str, object]] = []
+    for ring_index in range(ring_count):
+        rings.append(
+            {
+                "index": ring_index,
+                "inner_radius_m": ring_index * ring_width_m,
+                "outer_radius_m": min(
+                    max_radius_m, (ring_index + 1) * ring_width_m
+                ),
+                **_empty_coverage_counts(),
+            }
+        )
+
+    sector_width_rad = 2.0 * math.pi / sector_count
+    sectors: list[dict[str, object]] = []
+    for sector_index in range(sector_count):
+        center_angle = sector_index * sector_width_rad
+        if center_angle > math.pi:
+            center_angle -= 2.0 * math.pi
+        sectors.append(
+            {
+                "index": sector_index,
+                "center_angle_rad": center_angle,
+                **_empty_coverage_counts(),
+                "nearest_distance_m": _empty_nearest_distances(),
+            }
+        )
+
+    nearest = _empty_nearest_distances()
+    center_x, center_y = _world_to_grid(grid, pose.x, pose.y)
+    grid_radius = math.ceil(max_radius_m / grid.resolution) + 1
+    minimum_x = max(0, center_x - grid_radius)
+    maximum_x = min(grid.width - 1, center_x + grid_radius)
+    minimum_y = max(0, center_y - grid_radius)
+    maximum_y = min(grid.height - 1, center_y + grid_radius)
+
+    for y in range(minimum_y, maximum_y + 1):
+        for x in range(minimum_x, maximum_x + 1):
+            world_x = grid.origin_x + (x + 0.5) * grid.resolution
+            world_y = grid.origin_y + (y + 0.5) * grid.resolution
+            delta_x = world_x - pose.x
+            delta_y = world_y - pose.y
+            distance_m = math.hypot(delta_x, delta_y)
+            if distance_m > max_radius_m + 1.0e-6:
+                continue
+
+            index = _address(grid, x, y)
+            observations = int(grid.observation_count[index])
+            elevation_known = _known_layer_value(
+                grid.elevation[index], grid.unknown_value
+            )
+            slope_known = _known_layer_value(
+                grid.slope[index], grid.unknown_value
+            )
+            roughness_known = _known_layer_value(
+                grid.roughness[index], grid.unknown_value
+            )
+            traversability_known = _known_layer_value(
+                grid.traversability[index], grid.unknown_value
+            )
+            flags = {
+                "observed": observations > 0,
+                "observation_ready": (
+                    observations >= thresholds.min_observed_frames
+                ),
+                "elevation_known": elevation_known,
+                "features_known": (
+                    slope_known and roughness_known and traversability_known
+                ),
+                "planner_valid": bool(planner_valid_mask[index]),
+            }
+
+            ring_index = min(
+                ring_count - 1, math.floor(distance_m / ring_width_m)
+            )
+            angle = math.atan2(delta_y, delta_x) - pose.yaw
+            sector_index = math.floor(
+                ((angle + 0.5 * sector_width_rad) % (2.0 * math.pi))
+                / sector_width_rad
+            )
+            ring = rings[ring_index]
+            sector = sectors[sector_index]
+            ring["cell_count"] += 1
+            sector["cell_count"] += 1
+            sector_nearest = sector["nearest_distance_m"]
+            assert isinstance(sector_nearest, dict)
+            for key, present in flags.items():
+                if not present:
+                    continue
+                ring[key] += 1
+                sector[key] += 1
+                if nearest[key] is None or distance_m < nearest[key]:
+                    nearest[key] = distance_m
+                if (
+                    sector_nearest[key] is None
+                    or distance_m < sector_nearest[key]
+                ):
+                    sector_nearest[key] = distance_m
+
+    return {
+        "version": 1,
+        "max_radius_m": max_radius_m,
+        "ring_width_m": ring_width_m,
+        "sector_count": sector_count,
+        "distance_metric": "pose_to_cell_center",
+        "sector_zero_direction": "body_forward",
+        "sector_rotation": "counterclockwise_toward_body_left",
+        "nearest_distance_m": nearest,
+        "rings": rings,
+        "sectors": sectors,
+    }
+
+
 def _valid_mask(
     grid: GridSnapshot, thresholds: PlannerThresholds
 ) -> tuple[bytearray, int, int]:
@@ -572,11 +718,14 @@ def _valid_mask(
     known = 0
     valid = 0
     for index in range(total):
+        elevation = grid.elevation[index]
         traversability = grid.traversability[index]
         slope = grid.slope[index]
-        if not _known_layer_value(
-            traversability, grid.unknown_value
-        ) or not _known_layer_value(slope, grid.unknown_value):
+        if (
+            not _known_layer_value(elevation, grid.unknown_value)
+            or not _known_layer_value(traversability, grid.unknown_value)
+            or not _known_layer_value(slope, grid.unknown_value)
+        ):
             continue
         known += 1
         if (
@@ -637,9 +786,17 @@ def _snap_endpoint(
         "snap_grid_distance_outside_nominal_radius": False,
         "snap_square_terrain_layers": None,
         "snap_radius_terrain_layers": None,
+        "radial_coverage": None,
     }
     if not result["inside_map"]:
         return result
+
+    result["radial_coverage"] = _radial_coverage_profile(
+        grid,
+        mask,
+        pose,
+        thresholds,
+    )
 
     exact_valid = bool(mask[_address(grid, grid_x, grid_y)])
     result["exact_cell_valid"] = exact_valid
@@ -1388,6 +1545,18 @@ def _format_endpoint(
     if isinstance(local_stats, dict):
         lines.extend(
             _format_terrain_layers("snap_radius_layers", local_stats, "  ")
+        )
+    coverage = endpoint["radial_coverage"]
+    if isinstance(coverage, dict):
+        nearest = coverage["nearest_distance_m"]
+        assert isinstance(nearest, dict)
+        lines.append(
+            f"  radial_coverage radius={coverage['max_radius_m']:.2f} m "
+            f"nearest_observed={nearest['observed']} "
+            f"nearest_ready={nearest['observation_ready']} "
+            f"nearest_elevation={nearest['elevation_known']} "
+            f"nearest_features={nearest['features_known']} "
+            f"nearest_planner_valid={nearest['planner_valid']}"
         )
     return lines
 

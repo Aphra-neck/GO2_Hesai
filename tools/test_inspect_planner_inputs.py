@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 from io import StringIO
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -742,6 +743,86 @@ class PlannerInputInspectionTests(unittest.TestCase):
         self.assertEqual(start_radius_stats["cell_count"], 3)
         self.assertEqual(goal_radius_stats["cell_count"], 3)
 
+    def test_radial_coverage_reports_distance_rings_and_sectors(self) -> None:
+        grid = make_grid(width=9, height=9, resolution=1.0)
+        cells = grid.width * grid.height
+        elevation = [UNKNOWN] * cells
+        slope = [UNKNOWN] * cells
+        roughness = [UNKNOWN] * cells
+        traversability = [UNKNOWN] * cells
+        observations = [0] * cells
+
+        east_observed = 4 * grid.width + 5
+        east_elevation = 4 * grid.width + 6
+        north_planner_valid = 7 * grid.width + 4
+        observations[east_observed] = 1
+        observations[east_elevation] = 4
+        elevation[east_elevation] = 0.0
+        observations[north_planner_valid] = 4
+        elevation[north_planner_valid] = 0.0
+        slope[north_planner_valid] = 0.0
+        roughness[north_planner_valid] = 0.0
+        traversability[north_planner_valid] = 1.0
+        grid = replace(
+            grid,
+            elevation=elevation,
+            slope=slope,
+            roughness=roughness,
+            traversability=traversability,
+            observation_count=observations,
+        )
+
+        result = analyze_planner_inputs(
+            grid,
+            pose(4.5, 4.5),
+            None,
+            PlannerThresholds(start_snap_radius=0.5),
+        )
+        coverage = result["start"]["radial_coverage"]
+        nearest = coverage["nearest_distance_m"]
+        self.assertEqual(nearest["observed"], 1.0)
+        self.assertEqual(nearest["observation_ready"], 2.0)
+        self.assertEqual(nearest["elevation_known"], 2.0)
+        self.assertEqual(nearest["features_known"], 3.0)
+        self.assertEqual(nearest["planner_valid"], 3.0)
+
+        self.assertEqual(coverage["rings"][1]["observed"], 1)
+        self.assertEqual(coverage["rings"][2]["elevation_known"], 2)
+        self.assertEqual(coverage["rings"][2]["planner_valid"], 1)
+        self.assertEqual(coverage["sectors"][0]["observed"], 2)
+        self.assertEqual(coverage["sectors"][2]["planner_valid"], 1)
+        self.assertEqual(
+            coverage["sectors"][2]["nearest_distance_m"]["planner_valid"],
+            3.0,
+        )
+        self.assertEqual(
+            sum(ring["cell_count"] for ring in coverage["rings"]), 29
+        )
+        self.assertEqual(
+            sum(sector["cell_count"] for sector in coverage["sectors"]),
+            29,
+        )
+        for key in (
+            "observed",
+            "observation_ready",
+            "elevation_known",
+            "features_known",
+            "planner_valid",
+        ):
+            self.assertEqual(
+                sum(ring[key] for ring in coverage["rings"]),
+                sum(sector[key] for sector in coverage["sectors"]),
+            )
+
+        rotated_result = analyze_planner_inputs(
+            grid,
+            replace(pose(4.5, 4.5), yaw=math.pi / 2.0),
+            None,
+            PlannerThresholds(start_snap_radius=0.5),
+        )
+        rotated_coverage = rotated_result["start"]["radial_coverage"]
+        self.assertEqual(rotated_coverage["sectors"][0]["planner_valid"], 1)
+
     def test_grid_snapshot_captures_diagnostic_layers(self) -> None:
         message = SimpleNamespace(
             header=SimpleNamespace(
@@ -822,6 +903,34 @@ class PlannerInputInspectionTests(unittest.TestCase):
             make_grid(), pose(1.5, 1.5), pose(12.0, 1.5)
         )
         self.assertEqual(result["diagnosis"], "goal_outside_map")
+        self.assertIsNone(result["goal"]["radial_coverage"])
+
+    def test_radial_coverage_stays_bounded_at_dense_resolution(self) -> None:
+        grid = make_grid(width=121, height=121, resolution=0.05)
+        result = analyze_planner_inputs(grid, pose(3.025, 3.025), None)
+        coverage = result["start"]["radial_coverage"]
+        self.assertEqual(len(coverage["rings"]), 60)
+        self.assertEqual(len(coverage["sectors"]), 8)
+        encoded = json.dumps(
+            result,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertLess(len(encoded), 100_000)
+
+    def test_radial_coverage_caps_rings_for_tiny_resolution(self) -> None:
+        grid = make_grid(width=5, height=5, resolution=0.0001)
+        result = analyze_planner_inputs(grid, pose(0.00025, 0.00025), None)
+        coverage = result["start"]["radial_coverage"]
+        self.assertEqual(len(coverage["rings"]), 64)
+        self.assertAlmostEqual(coverage["ring_width_m"], 3.0 / 64.0)
+
+        encoded = json.dumps(
+            result,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertLess(len(encoded), 100_000)
 
     def test_disconnected_valid_regions_are_detected(self) -> None:
         grid = make_grid(width=8, height=3)
@@ -891,15 +1000,15 @@ class PlannerInputInspectionTests(unittest.TestCase):
             "start_and_goal_continuous_ground_disconnected",
         )
 
-    def test_unknown_endpoint_elevation_is_not_called_ground(self) -> None:
+    def test_unknown_endpoint_elevation_is_not_planner_valid(self) -> None:
         grid = replace(make_grid(width=1, height=1), elevation=[UNKNOWN])
         result = analyze_planner_inputs(grid, pose(0.5, 0.5), None)
-        self.assertTrue(result["start"]["exact_cell_valid"])
-        self.assertEqual(result["map"]["valid_cells"], 1)
+        self.assertFalse(result["start"]["exact_cell_valid"])
+        self.assertEqual(result["map"]["valid_cells"], 0)
         self.assertEqual(result["map"]["continuous_ground_cells"], 0)
         self.assertEqual(
             result["diagnosis"],
-            "start_elevation_invalid_for_ground_topology",
+            "start_has_no_valid_cell_in_snap_radius",
         )
 
     def test_snap_rejects_candidate_outside_euclidean_radius(self) -> None:

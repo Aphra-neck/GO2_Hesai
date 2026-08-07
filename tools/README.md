@@ -338,6 +338,9 @@ synchronized pair.
 - whether start and goal are inside the map;
 - the exact cell and the nearest cell selected by the planner's world-distance
   snap search;
+- a bounded 3 m `radial_coverage` profile for each in-map endpoint, including
+  nearest observed/elevation/feature/planner-valid distances, bounded
+  resolution-width rings, and eight body-yaw-relative directional sectors;
 - the number of valid cells in each endpoint's snap area; and
 - whether map, odometry, and goal frames and timestamps satisfy the configured
   input contract; and
@@ -354,6 +357,11 @@ missing, or future timestamps are reported before a topology claim. An
 cell has no finite elevation for this topology check. Use `--no-goal` to inspect
 only the current map and robot start, or `--json` for machine-readable output.
 Older sessions may contain the legacy `*_snap_square` diagnosis.
+`radial_coverage` uses cell-center distance and stores aggregate counts only;
+it never records the `TerrainGrid` payload. Sector zero points along body
+forward and subsequent sectors rotate counterclockwise toward body left. This
+distinguishes a symmetric LiDAR near-field hole from body-relative occlusion or
+an offset map/filter footprint without changing planner acceptance.
 The wrapper requires live values for `/terrain_mapper` `min_observed_frames`,
 `max_slope`, and `max_roughness`, and for `/body_lattice_planner`
 `min_traversability`, `max_slope`, `max_step_height`, `start_snap_radius`, and
