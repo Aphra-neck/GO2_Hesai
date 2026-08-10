@@ -38,6 +38,8 @@ terrain_mapper:
     publish_rate: 2.0
     # Diagnostic only: warn when cloud delivery or its source stamp stops advancing.
     cloud_stale_warning_age: 1.0
+    # Keep rebuild recovery aligned with body_lattice_planner.start_snap_radius.
+    confidence_rebuild.start_radius: 0.55
 
 body_lattice_planner:
   ros__parameters:

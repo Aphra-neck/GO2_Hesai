@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 
 #include "sensor_msgs/point_cloud2_iterator.hpp"
@@ -50,6 +51,24 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
   self_length_ = declare_parameter("self_filter.length", 0.9);
   self_width_ = declare_parameter("self_filter.width", 0.55);
   self_height_ = declare_parameter("self_filter.height", 0.7);
+  integration_window_ = config.integration_window;
+  min_observed_frames_ = config.min_observed_frames;
+  confidence_rebuild_start_radius_ =
+    declare_parameter("confidence_rebuild.start_radius", 0.55);
+  if (!std::isfinite(integration_window_) || integration_window_ <= 0.0) {
+    throw std::invalid_argument("integration_window must be finite and greater than zero");
+  }
+  if (min_observed_frames_ < 1 ||
+    min_observed_frames_ > static_cast<int>(std::numeric_limits<std::uint16_t>::max()))
+  {
+    throw std::invalid_argument("min_observed_frames must be in [1, 65535]");
+  }
+  if (!std::isfinite(confidence_rebuild_start_radius_) ||
+    confidence_rebuild_start_radius_ <= 0.0)
+  {
+    throw std::invalid_argument(
+            "confidence_rebuild.start_radius must be finite and greater than zero");
+  }
   publish_rate_ = declare_parameter("publish_rate", 2.0);
   cloud_stale_warning_age_ = declare_parameter("cloud_stale_warning_age", 1.0);
   if (!std::isfinite(cloud_stale_warning_age_) ||
@@ -152,11 +171,40 @@ void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Share
       std::abs(dz) < self_height_ * 0.5) {continue;}
     accepted_points.push_back({*x, *y, *z});
   }
+  const auto received_at = std::chrono::steady_clock::now();
   const double stamp_seconds = static_cast<double>(msg->header.stamp.sec) +
     static_cast<double>(msg->header.stamp.nanosec) * 1.0e-9;
-  map_builder_->integrateFrame(accepted_points, stamp_seconds);
+  if (last_cloud_received_ != std::chrono::steady_clock::time_point{} &&
+    validRosTimestamp(last_cloud_stamp_))
+  {
+    const double previous_stamp_seconds = static_cast<double>(last_cloud_stamp_.sec) +
+      static_cast<double>(last_cloud_stamp_.nanosec) * 1.0e-9;
+    last_cloud_source_delta_ = stamp_seconds - previous_stamp_seconds;
+    last_cloud_receive_gap_ =
+      std::chrono::duration<double>(received_at - last_cloud_received_).count();
+    have_cloud_interval_ = true;
+    if (!std::isfinite(last_cloud_source_delta_) || last_cloud_source_delta_ <= 0.0) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Rejected nonmonotonic terrain source cloud timestamp: source_delta=%.3f s, "
+        "receive_gap=%.3f s",
+        last_cloud_source_delta_, last_cloud_receive_gap_);
+      return;
+    }
+    const bool exceeds_integration_window =
+      last_cloud_source_delta_ > integration_window_;
+    if (exceeds_integration_window) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Terrain source cloud timestamp discontinuity: source_delta=%.3f s, "
+        "receive_gap=%.3f s, integration_window=%.3f s",
+        last_cloud_source_delta_, last_cloud_receive_gap_, integration_window_);
+    }
+  }
+  last_in_map_cell_count_ = map_builder_->integrateFrame(accepted_points, stamp_seconds);
+  last_accepted_point_count_ = accepted_points.size();
   last_cloud_stamp_ = msg->header.stamp;
-  last_cloud_received_ = std::chrono::steady_clock::now();
+  last_cloud_received_ = received_at;
 }
 
 void TerrainMapperNode::publishMap()
@@ -166,11 +214,13 @@ void TerrainMapperNode::publishMap()
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 3000,
       "Terrain map has not received an accepted world-frame point cloud");
+    return;
   } else if (!validRosTimestamp(last_cloud_stamp_)) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 3000,
       "Terrain source cloud state has an invalid timestamp sec=%d nanosec=%u",
       last_cloud_stamp_.sec, last_cloud_stamp_.nanosec);
+    return;
   } else {
     const rclcpp::Time cloud_time(last_cloud_stamp_, current_time.get_clock_type());
     const double header_age = (current_time - cloud_time).seconds();
@@ -196,6 +246,78 @@ void TerrainMapperNode::publishMap()
     }
   }
   const auto terrain = map_builder_->build(last_cloud_stamp_, map_frame_);
+  std::size_t observed_cells = 0;
+  std::size_t observation_ready_cells = 0;
+  std::size_t start_observation_ready_cells = 0;
+  std::size_t feature_ready_cells = 0;
+  std::size_t start_feature_ready_cells = 0;
+  std::uint16_t maximum_observation_count = 0U;
+  const auto minimum_observation_count = static_cast<std::size_t>(min_observed_frames_);
+  const auto layer_known = [&terrain](float value) {
+      return std::isfinite(value) && value != terrain.unknown_value;
+    };
+  for (std::size_t index = 0; index < terrain.observation_count.size(); ++index) {
+    const auto count = terrain.observation_count[index];
+    const std::size_t grid_x = index % terrain.width;
+    const std::size_t grid_y = index / terrain.width;
+    const double world_x =
+      terrain.origin_x + (static_cast<double>(grid_x) + 0.5) * terrain.resolution;
+    const double world_y =
+      terrain.origin_y + (static_cast<double>(grid_y) + 0.5) * terrain.resolution;
+    const bool in_start_radius =
+      std::hypot(world_x - robot_x_, world_y - robot_y_) <=
+      confidence_rebuild_start_radius_;
+    if (count > 0U) {++observed_cells;}
+    if (static_cast<std::size_t>(count) >= minimum_observation_count) {
+      ++observation_ready_cells;
+      if (in_start_radius) {++start_observation_ready_cells;}
+    }
+    if (layer_known(terrain.elevation[index]) && layer_known(terrain.slope[index]) &&
+      layer_known(terrain.roughness[index]) && layer_known(terrain.traversability[index]))
+    {
+      // Known unsafe terrain also ends the hold so new obstacles are published immediately.
+      ++feature_ready_cells;
+      if (in_start_radius) {++start_feature_ready_cells;}
+    }
+    maximum_observation_count = std::max(maximum_observation_count, count);
+  }
+  const bool current_scan_contributed = last_in_map_cell_count_ > 0U;
+  if (last_published_start_feature_ready_ && current_scan_contributed &&
+    start_feature_ready_cells == 0U)
+  {
+    confidence_rebuild_active_ = true;
+    ++suppressed_confidence_rebuild_maps_;
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Suppressing confidence-rebuild terrain map: observed_cells=%zu, "
+      "observation_ready_cells=%zu, start_observation_ready_cells=%zu, "
+      "feature_ready_cells=%zu, "
+      "start_feature_ready_cells=%zu, max_observation_count=%u, "
+      "min_observed_frames=%d, accepted_points=%zu, in_map_cells=%zu, "
+      "source_delta=%.3f s, receive_gap=%.3f s, suppressed_maps=%zu; "
+      "the last published map keeps its original source timestamp",
+      observed_cells, observation_ready_cells, start_observation_ready_cells,
+      feature_ready_cells, start_feature_ready_cells,
+      static_cast<unsigned int>(maximum_observation_count), min_observed_frames_,
+      last_accepted_point_count_, last_in_map_cell_count_,
+      have_cloud_interval_ ? last_cloud_source_delta_ : 0.0,
+      have_cloud_interval_ ? last_cloud_receive_gap_ : 0.0,
+      suppressed_confidence_rebuild_maps_);
+    return;
+  }
+  if (confidence_rebuild_active_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "Terrain confidence rebuild ended: observed_cells=%zu, observation_ready_cells=%zu, "
+      "start_observation_ready_cells=%zu, feature_ready_cells=%zu, "
+      "start_feature_ready_cells=%zu, in_map_cells=%zu, suppressed_maps=%zu",
+      observed_cells, observation_ready_cells, start_observation_ready_cells,
+      feature_ready_cells, start_feature_ready_cells, last_in_map_cell_count_,
+      suppressed_confidence_rebuild_maps_);
+    confidence_rebuild_active_ = false;
+    suppressed_confidence_rebuild_maps_ = 0U;
+  }
+  last_published_start_feature_ready_ = start_feature_ready_cells > 0U;
   terrain_pub_->publish(terrain);
   cost_pub_->publish(makeCostmap(terrain));
 }

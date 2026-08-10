@@ -43,7 +43,7 @@ bool TerrainMapBuilder::addPoint(double x, double y, double z)
   return true;
 }
 
-void TerrainMapBuilder::integrateFrame(
+std::size_t TerrainMapBuilder::integrateFrame(
   const std::vector<TerrainPoint> & points, double stamp_seconds)
 {
   latest_stamp_seconds_ = stamp_seconds;
@@ -74,6 +74,7 @@ void TerrainMapBuilder::integrateFrame(
     observation.max_z = heights.back();
     cells_[entry.first].frames.push_back(std::move(observation));
   }
+  return frame_cells.size();
 }
 
 utree_dog_msgs::msg::TerrainGrid TerrainMapBuilder::build(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -39,6 +40,9 @@ private:
   double self_length_{0.9};
   double self_width_{0.55};
   double self_height_{0.7};
+  double integration_window_{1.5};
+  double confidence_rebuild_start_radius_{0.55};
+  int min_observed_frames_{4};
   double publish_rate_{2.0};
   double cloud_stale_warning_age_{1.0};
   double robot_x_{0.0};
@@ -46,6 +50,14 @@ private:
   double robot_z_{0.0};
   double robot_yaw_{0.0};
   bool have_odom_{false};
+  bool have_cloud_interval_{false};
+  bool last_published_start_feature_ready_{false};
+  bool confidence_rebuild_active_{false};
+  std::size_t suppressed_confidence_rebuild_maps_{0};
+  double last_cloud_source_delta_{0.0};
+  double last_cloud_receive_gap_{0.0};
+  std::size_t last_accepted_point_count_{0};
+  std::size_t last_in_map_cell_count_{0};
   std::chrono::steady_clock::time_point last_cloud_received_{};
   builtin_interfaces::msg::Time last_cloud_stamp_;
   std::unique_ptr<TerrainMapBuilder> map_builder_;

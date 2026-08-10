@@ -49,14 +49,16 @@ TEST(TerrainMapBuilder, IntegratesSparseFramesAndExpiresOldObservations)
   TerrainMapBuilder builder(config);
 
   for (int frame = 0; frame < 3; ++frame) {
-    builder.integrateFrame({{0.15, 0.15, 0.20 + frame * 0.001}}, frame * 0.1);
+    EXPECT_EQ(
+      builder.integrateFrame({{0.15, 0.15, 0.20 + frame * 0.001}}, frame * 0.1), 1U);
   }
+  EXPECT_EQ(builder.integrateFrame({{1.0, 1.0, 0.0}}, 0.3), 0U);
   auto map = builder.build(builtin_interfaces::msg::Time{}, "map");
   EXPECT_EQ(map.observation_count[4], 3);
   EXPECT_NEAR(map.elevation[4], 0.201, 1.0e-4);
   EXPECT_GT(map.confidence[4], 0.7F);
 
-  builder.integrateFrame({}, 2.0);
+  EXPECT_EQ(builder.integrateFrame({}, 2.0), 0U);
   map = builder.build(builtin_interfaces::msg::Time{}, "map");
   EXPECT_EQ(map.observation_count[4], 0);
   EXPECT_FLOAT_EQ(map.elevation[4], TerrainMapBuilder::kUnknown);

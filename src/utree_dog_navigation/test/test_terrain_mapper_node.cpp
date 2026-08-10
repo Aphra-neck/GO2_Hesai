@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <functional>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -196,6 +198,12 @@ protected:
   std::vector<utree_dog_msgs::msg::TerrainGrid> terrain_maps_;
 };
 
+TEST_F(TerrainMapperNodeTest, DoesNotPublishBeforeReceivingAnAcceptedCloud)
+{
+  spinFor(100ms);
+  EXPECT_TRUE(terrain_maps_.empty());
+}
+
 TEST_F(TerrainMapperNodeTest, RejectsNegativeCloudTimestampWithoutThrowing)
 {
   builtin_interfaces::msg::Time stamp;
@@ -214,6 +222,48 @@ TEST_F(TerrainMapperNodeTest, RejectsOutOfRangeCloudNanosecondsWithoutThrowing)
 TEST_F(TerrainMapperNodeTest, RejectsZeroCloudTimestampWithoutThrowing)
 {
   expectCloudStampRejected(builtin_interfaces::msg::Time{});
+}
+
+TEST_F(TerrainMapperNodeTest, RejectsDuplicateAndBackwardCloudTimestamps)
+{
+  nav_msgs::msg::Odometry odom;
+  odom.header.stamp = harness_node_->now();
+  odom.header.frame_id = "world";
+  odom.child_frame_id = "base_link";
+  odom.pose.pose.orientation.w = 1.0;
+  odom_pub_->publish(odom);
+  spinFor(50ms);
+
+  const builtin_interfaces::msg::Time valid_stamp = harness_node_->now();
+  const std::vector<std::array<float, 3>> points{{{2.05F, 0.05F, 0.0F}}};
+  cloud_pub_->publish(makeCloud(valid_stamp, points));
+  ASSERT_TRUE(spinUntil(
+      [this, &valid_stamp]() {
+        return !terrain_maps_.empty() &&
+               terrain_maps_.back().header.stamp.sec == valid_stamp.sec &&
+               terrain_maps_.back().header.stamp.nanosec == valid_stamp.nanosec;
+      },
+      1s));
+  const std::size_t observed_cell = cellIndex(terrain_maps_.back(), 2.05, 0.05);
+  ASSERT_EQ(terrain_maps_.back().observation_count[observed_cell], 1U);
+
+  terrain_maps_.clear();
+  cloud_pub_->publish(makeCloud(valid_stamp, points));
+  spinFor(100ms);
+  ASSERT_FALSE(terrain_maps_.empty());
+  EXPECT_EQ(terrain_maps_.back().header.stamp.sec, valid_stamp.sec);
+  EXPECT_EQ(terrain_maps_.back().header.stamp.nanosec, valid_stamp.nanosec);
+  EXPECT_EQ(terrain_maps_.back().observation_count[observed_cell], 1U);
+
+  terrain_maps_.clear();
+  const builtin_interfaces::msg::Time earlier_stamp =
+    rclcpp::Time(valid_stamp) - rclcpp::Duration::from_seconds(0.1);
+  cloud_pub_->publish(makeCloud(earlier_stamp, points));
+  spinFor(100ms);
+  ASSERT_FALSE(terrain_maps_.empty());
+  EXPECT_EQ(terrain_maps_.back().header.stamp.sec, valid_stamp.sec);
+  EXPECT_EQ(terrain_maps_.back().header.stamp.nanosec, valid_stamp.nanosec);
+  EXPECT_EQ(terrain_maps_.back().observation_count[observed_cell], 1U);
 }
 
 TEST_F(TerrainMapperNodeTest, AppliesSelfFilterInBodyFrameAtNinetyDegreeYaw)
@@ -246,6 +296,222 @@ TEST_F(TerrainMapperNodeTest, AppliesSelfFilterInBodyFrameAtNinetyDegreeYaw)
   ASSERT_LT(outside_rotated_width, terrain.observation_count.size());
   EXPECT_EQ(terrain.observation_count[inside_rotated_length], 0U);
   EXPECT_EQ(terrain.observation_count[outside_rotated_width], 1U);
+}
+
+TEST_F(TerrainMapperNodeTest, DoesNotPublishFreshEmptyMapWhileConfidenceRebuilds)
+{
+  nav_msgs::msg::Odometry odom;
+  odom.header.stamp = harness_node_->now();
+  odom.header.frame_id = "world";
+  odom.child_frame_id = "base_link";
+  odom.pose.pose.orientation.w = 1.0;
+  odom_pub_->publish(odom);
+  spinFor(50ms);
+
+  const rclcpp::Time base_time = harness_node_->now();
+  const std::vector<std::array<float, 3>> start_patch{
+    {{-0.10F, 0.30F, 0.0F}}, {{0.10F, 0.30F, 0.0F}}, {{0.30F, 0.30F, 0.0F}},
+    {{-0.10F, 0.50F, 0.0F}}, {{0.10F, 0.50F, 0.0F}}, {{0.30F, 0.50F, 0.0F}},
+    {{-0.10F, 0.70F, 0.0F}}, {{0.10F, 0.70F, 0.0F}}, {{0.30F, 0.70F, 0.0F}},
+  };
+  const std::vector<std::array<float, 3>> remote_patch{
+    {{1.85F, -0.15F, 0.0F}}, {{2.05F, -0.15F, 0.0F}}, {{2.25F, -0.15F, 0.0F}},
+    {{1.85F, 0.05F, 0.0F}}, {{2.05F, 0.05F, 0.0F}}, {{2.25F, 0.05F, 0.0F}},
+    {{1.85F, 0.25F, 0.0F}}, {{2.05F, 0.25F, 0.0F}}, {{2.25F, 0.25F, 0.0F}},
+  };
+  auto combined_patch = start_patch;
+  combined_patch.insert(combined_patch.end(), remote_patch.begin(), remote_patch.end());
+  builtin_interfaces::msg::Time ready_stamp;
+  for (int frame = 0; frame < 4; ++frame) {
+    ready_stamp = base_time + rclcpp::Duration::from_seconds(frame * 0.1);
+    cloud_pub_->publish(makeCloud(ready_stamp, start_patch));
+    ASSERT_TRUE(spinUntil(
+        [this, &ready_stamp]() {
+          if (terrain_maps_.empty()) {return false;}
+          const auto & map = terrain_maps_.back();
+          return map.header.stamp.sec == ready_stamp.sec &&
+                 map.header.stamp.nanosec == ready_stamp.nanosec;
+        },
+        1s));
+  }
+
+  const std::size_t observed_cell = cellIndex(terrain_maps_.back(), 0.10, 0.50);
+  ASSERT_GE(terrain_maps_.back().observation_count[observed_cell], 4U);
+  ASSERT_NE(
+    terrain_maps_.back().traversability[observed_cell], terrain_maps_.back().unknown_value);
+
+  // These three 0.6 s gaps expire the original frames without a single 1.5 s discontinuity.
+  builtin_interfaces::msg::Time last_ready_stamp;
+  for (const double seconds : {0.9, 1.5}) {
+    last_ready_stamp = base_time + rclcpp::Duration::from_seconds(seconds);
+    cloud_pub_->publish(makeCloud(last_ready_stamp, start_patch));
+    ASSERT_TRUE(spinUntil(
+        [this, &last_ready_stamp]() {
+          if (terrain_maps_.empty()) {return false;}
+          const auto & map = terrain_maps_.back();
+          return map.header.stamp.sec == last_ready_stamp.sec &&
+                 map.header.stamp.nanosec == last_ready_stamp.nanosec;
+        },
+        1s));
+  }
+
+  terrain_maps_.clear();
+  const builtin_interfaces::msg::Time rebuilding_stamp =
+    base_time + rclcpp::Duration::from_seconds(2.1);
+  cloud_pub_->publish(makeCloud(rebuilding_stamp, start_patch));
+  spinFor(100ms);
+
+  EXPECT_FALSE(std::any_of(
+      terrain_maps_.begin(), terrain_maps_.end(),
+      [&rebuilding_stamp](const auto & map) {
+        return map.header.stamp.sec == rebuilding_stamp.sec &&
+               map.header.stamp.nanosec == rebuilding_stamp.nanosec;
+      }));
+
+  builtin_interfaces::msg::Time remote_ready_stamp;
+  for (int frame = 0; frame < 4; ++frame) {
+    remote_ready_stamp =
+      base_time + rclcpp::Duration::from_seconds(2.2 + frame * 0.1);
+    cloud_pub_->publish(makeCloud(remote_ready_stamp, remote_patch));
+    spinFor(30ms);
+  }
+  EXPECT_FALSE(std::any_of(
+      terrain_maps_.begin(), terrain_maps_.end(),
+      [&remote_ready_stamp](const auto & map) {
+        return map.header.stamp.sec == remote_ready_stamp.sec &&
+               map.header.stamp.nanosec == remote_ready_stamp.nanosec;
+      }));
+
+  builtin_interfaces::msg::Time recovered_stamp;
+  for (const double seconds : {2.6, 2.7}) {
+    recovered_stamp = base_time + rclcpp::Duration::from_seconds(seconds);
+    cloud_pub_->publish(makeCloud(recovered_stamp, start_patch));
+    spinFor(30ms);
+  }
+
+  ASSERT_TRUE(spinUntil(
+      [this, &recovered_stamp, observed_cell]() {
+        if (terrain_maps_.empty()) {return false;}
+        const auto & map = terrain_maps_.back();
+        return map.header.stamp.sec == recovered_stamp.sec &&
+               map.header.stamp.nanosec == recovered_stamp.nanosec &&
+               map.observation_count[observed_cell] >= 4U;
+      },
+      1s));
+
+  builtin_interfaces::msg::Time second_ready_stamp;
+  for (const double seconds : {3.3, 3.9}) {
+    second_ready_stamp = base_time + rclcpp::Duration::from_seconds(seconds);
+    cloud_pub_->publish(makeCloud(second_ready_stamp, combined_patch));
+    ASSERT_TRUE(spinUntil(
+        [this, &second_ready_stamp]() {
+          if (terrain_maps_.empty()) {return false;}
+          const auto & map = terrain_maps_.back();
+          return map.header.stamp.sec == second_ready_stamp.sec &&
+                 map.header.stamp.nanosec == second_ready_stamp.nanosec;
+        },
+        1s));
+  }
+
+  const builtin_interfaces::msg::Time remote_refresh_stamp =
+    base_time + rclcpp::Duration::from_seconds(4.1);
+  cloud_pub_->publish(makeCloud(remote_refresh_stamp, remote_patch));
+  ASSERT_TRUE(spinUntil(
+      [this, &remote_refresh_stamp]() {
+        if (terrain_maps_.empty()) {return false;}
+        const auto & map = terrain_maps_.back();
+        return map.header.stamp.sec == remote_refresh_stamp.sec &&
+               map.header.stamp.nanosec == remote_refresh_stamp.nanosec;
+      },
+      1s));
+
+  terrain_maps_.clear();
+  const builtin_interfaces::msg::Time second_rebuilding_stamp =
+    base_time + rclcpp::Duration::from_seconds(4.5);
+  cloud_pub_->publish(makeCloud(second_rebuilding_stamp, combined_patch));
+  spinFor(100ms);
+  EXPECT_FALSE(std::any_of(
+      terrain_maps_.begin(), terrain_maps_.end(),
+      [&second_rebuilding_stamp](const auto & map) {
+        return map.header.stamp.sec == second_rebuilding_stamp.sec &&
+               map.header.stamp.nanosec == second_rebuilding_stamp.nanosec;
+      }));
+
+  const builtin_interfaces::msg::Time current_empty_stamp =
+    base_time + rclcpp::Duration::from_seconds(4.6);
+  cloud_pub_->publish(makeCloud(current_empty_stamp, {}));
+  ASSERT_TRUE(spinUntil(
+      [this, &current_empty_stamp]() {
+        if (terrain_maps_.empty()) {return false;}
+        const auto & map = terrain_maps_.back();
+        return map.header.stamp.sec == current_empty_stamp.sec &&
+               map.header.stamp.nanosec == current_empty_stamp.nanosec;
+      },
+      1s));
+  EXPECT_EQ(terrain_maps_.back().observation_count[observed_cell], 3U);
+  EXPECT_EQ(
+    terrain_maps_.back().traversability[observed_cell], terrain_maps_.back().unknown_value);
+
+  terrain_maps_.clear();
+  const builtin_interfaces::msg::Time empty_stamp =
+    base_time + rclcpp::Duration::from_seconds(6.2);
+  cloud_pub_->publish(makeCloud(empty_stamp, {}));
+  ASSERT_TRUE(spinUntil(
+      [this, &empty_stamp]() {
+        if (terrain_maps_.empty()) {return false;}
+        const auto & map = terrain_maps_.back();
+        return map.header.stamp.sec == empty_stamp.sec &&
+               map.header.stamp.nanosec == empty_stamp.nanosec;
+      },
+      1s));
+  EXPECT_TRUE(std::all_of(
+      terrain_maps_.back().observation_count.begin(),
+      terrain_maps_.back().observation_count.end(),
+      [](std::uint16_t count) {return count == 0U;}));
+
+  terrain_maps_.clear();
+  const builtin_interfaces::msg::Time post_empty_stamp =
+    base_time + rclcpp::Duration::from_seconds(6.3);
+  cloud_pub_->publish(makeCloud(post_empty_stamp, start_patch));
+  ASSERT_TRUE(spinUntil(
+      [this, &post_empty_stamp]() {
+        if (terrain_maps_.empty()) {return false;}
+        const auto & map = terrain_maps_.back();
+        return map.header.stamp.sec == post_empty_stamp.sec &&
+               map.header.stamp.nanosec == post_empty_stamp.nanosec;
+      },
+      1s));
+  EXPECT_EQ(terrain_maps_.back().observation_count[observed_cell], 1U);
+}
+
+TEST_F(TerrainMapperNodeTest, RejectsInvalidConfidenceWindowParameters)
+{
+  rclcpp::NodeOptions invalid_window_options;
+  invalid_window_options.arguments(
+    {"--ros-args", "-r", "__node:=terrain_mapper_invalid_window"});
+  invalid_window_options.parameter_overrides({
+    rclcpp::Parameter("integration_window", 0.0),
+  });
+  EXPECT_THROW(
+    std::make_shared<TerrainMapperNode>(invalid_window_options), std::invalid_argument);
+
+  rclcpp::NodeOptions invalid_frame_count_options;
+  invalid_frame_count_options.arguments(
+    {"--ros-args", "-r", "__node:=terrain_mapper_invalid_frame_count"});
+  invalid_frame_count_options.parameter_overrides({
+    rclcpp::Parameter("min_observed_frames", 65536),
+  });
+  EXPECT_THROW(
+    std::make_shared<TerrainMapperNode>(invalid_frame_count_options), std::invalid_argument);
+
+  rclcpp::NodeOptions invalid_radius_options;
+  invalid_radius_options.arguments(
+    {"--ros-args", "-r", "__node:=terrain_mapper_invalid_rebuild_radius"});
+  invalid_radius_options.parameter_overrides({
+    rclcpp::Parameter("confidence_rebuild.start_radius", 0.0),
+  });
+  EXPECT_THROW(
+    std::make_shared<TerrainMapperNode>(invalid_radius_options), std::invalid_argument);
 }
 
 }  // namespace

@@ -48,7 +48,8 @@ public:
   explicit TerrainMapBuilder(TerrainMapConfig config);
 
   bool addPoint(double x, double y, double z);
-  void integrateFrame(const std::vector<TerrainPoint> & points, double stamp_seconds);
+  std::size_t integrateFrame(
+    const std::vector<TerrainPoint> & points, double stamp_seconds);
   utree_dog_msgs::msg::TerrainGrid build(
     const builtin_interfaces::msg::Time & stamp, const std::string & frame_id) const;
 
