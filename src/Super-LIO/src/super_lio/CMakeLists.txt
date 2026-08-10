@@ -46,6 +46,10 @@ find_package(Glog REQUIRED)
 find_package(TBB REQUIRED)
 find_package(basic REQUIRED)
 
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+endif()
+
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   msg/CloudPose.msg
@@ -111,6 +115,11 @@ target_link_libraries(relocation_node
   lio
   ${cpp_typesupport_target}
 )
+
+if(BUILD_TESTING)
+  ament_add_gtest(test_runtime_timing test/test_runtime_timing.cpp)
+  target_include_directories(test_runtime_timing PRIVATE include)
+endif()
 
 install(TARGETS
   lio

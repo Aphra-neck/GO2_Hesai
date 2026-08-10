@@ -61,6 +61,8 @@ protected:
       rclcpp::Parameter("body_frame", "base_link"),
       rclcpp::Parameter("max_map_age", 1.0),
       rclcpp::Parameter("max_odom_age", 1.0),
+      rclcpp::Parameter("max_goal_age", max_goal_age_),
+      rclcpp::Parameter("goal_retention_timeout", goal_retention_timeout_),
       rclcpp::Parameter("timestamp_future_tolerance", 0.05),
       rclcpp::Parameter("input_watchdog_rate", 50.0),
       rclcpp::Parameter("verified_flat_start.enabled", true),
@@ -226,6 +228,17 @@ protected:
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   std::vector<nav_msgs::msg::Path> paths_;
+  double max_goal_age_{2.0};
+  double goal_retention_timeout_{30.0};
+};
+
+class ShortGoalRetentionPlannerNodeTest : public BodyLatticePlannerNodeTest
+{
+public:
+  ShortGoalRetentionPlannerNodeTest()
+  {
+    goal_retention_timeout_ = 0.10;
+  }
 };
 
 TEST_F(BodyLatticePlannerNodeTest, ClearsAnActivePathWhenMapIsStale)
@@ -381,6 +394,58 @@ TEST_F(BodyLatticePlannerNodeTest, ClearsAnActivePathForInvalidGoalQuaternion)
       }, 1s));
 }
 
+TEST_F(BodyLatticePlannerNodeTest, ClearsAStaleIncomingGoalAndRequiresANewGoal)
+{
+  publishFreshPlan();
+  const std::size_t messages_before_rejection = paths_.size();
+  goal_pub_->publish(makeGoal(harness_node_->now() - 3s));
+
+  ASSERT_TRUE(spinUntil(
+      [this, messages_before_rejection]() {
+        return paths_.size() > messages_before_rejection && paths_.back().poses.empty();
+      }, 1s));
+  const std::size_t messages_after_rejection = paths_.size();
+
+  const auto current_time = harness_node_->now();
+  odom_pub_->publish(makeOdom(current_time));
+  map_pub_->publish(makeMap(current_time));
+  spinFor(200ms);
+  EXPECT_EQ(paths_.size(), messages_after_rejection);
+
+  goal_pub_->publish(makeGoal(harness_node_->now()));
+  ASSERT_TRUE(spinUntil(
+      [this, messages_after_rejection]() {
+        return paths_.size() > messages_after_rejection && !paths_.back().poses.empty();
+      }, 1s));
+}
+
+TEST_F(BodyLatticePlannerNodeTest, RejectsZeroTimestampGoalAndClearsTheActivePath)
+{
+  publishFreshPlan();
+  const std::size_t messages_before_rejection = paths_.size();
+  auto goal = makeGoal(harness_node_->now());
+  goal.header.stamp.sec = 0;
+  goal.header.stamp.nanosec = 0U;
+  goal_pub_->publish(goal);
+
+  ASSERT_TRUE(spinUntil(
+      [this, messages_before_rejection]() {
+        return paths_.size() > messages_before_rejection && paths_.back().poses.empty();
+      }, 1s));
+}
+
+TEST_F(BodyLatticePlannerNodeTest, RejectsFutureGoalAndClearsTheActivePath)
+{
+  publishFreshPlan();
+  const std::size_t messages_before_rejection = paths_.size();
+  goal_pub_->publish(makeGoal(harness_node_->now() + 1s));
+
+  ASSERT_TRUE(spinUntil(
+      [this, messages_before_rejection]() {
+        return paths_.size() > messages_before_rejection && paths_.back().poses.empty();
+      }, 1s));
+}
+
 TEST_F(BodyLatticePlannerNodeTest, RejectsMutuallyConsistentInputsOutsideConfiguredMapFrame)
 {
   const auto current_time = harness_node_->now();
@@ -441,6 +506,26 @@ TEST_F(BodyLatticePlannerNodeTest, RejectsWatchdogPeriodLongerThanFreshnessBudge
     std::invalid_argument);
 }
 
+TEST_F(BodyLatticePlannerNodeTest, RejectsInvalidGoalFreshnessBudgets)
+{
+  rclcpp::NodeOptions stale_header_options;
+  stale_header_options.parameter_overrides({
+    rclcpp::Parameter("max_goal_age", 0.0),
+  });
+  EXPECT_THROW(
+    std::make_shared<BodyLatticePlannerNode>(stale_header_options),
+    std::invalid_argument);
+
+  rclcpp::NodeOptions retention_options;
+  retention_options.parameter_overrides({
+    rclcpp::Parameter(
+      "goal_retention_timeout", std::numeric_limits<double>::quiet_NaN()),
+  });
+  EXPECT_THROW(
+    std::make_shared<BodyLatticePlannerNode>(retention_options),
+    std::invalid_argument);
+}
+
 TEST_F(BodyLatticePlannerNodeTest, RejectsNonFiniteNominalBodyHeight)
 {
   rclcpp::NodeOptions options;
@@ -461,6 +546,50 @@ TEST_F(BodyLatticePlannerNodeTest, WatchdogClearsAPathWhenInputsStop)
   ASSERT_TRUE(spinUntil(
       [this, messages_before_timeout]() {return paths_.size() > messages_before_timeout;}, 1500ms));
   EXPECT_TRUE(paths_.back().poses.empty());
+}
+
+TEST_F(
+  ShortGoalRetentionPlannerNodeTest,
+  ClearsExpiredGoalAndDoesNotRetryItOnFreshMap)
+{
+  publishFreshPlan();
+  const std::size_t messages_before_timeout = paths_.size();
+
+  ASSERT_TRUE(spinUntil(
+      [this, messages_before_timeout]() {
+        return paths_.size() > messages_before_timeout && paths_.back().poses.empty();
+      }, 400ms));
+  const std::size_t messages_after_timeout = paths_.size();
+
+  const auto current_time = harness_node_->now();
+  odom_pub_->publish(makeOdom(current_time));
+  map_pub_->publish(makeMap(current_time));
+  spinFor(200ms);
+  EXPECT_EQ(paths_.size(), messages_after_timeout);
+
+  goal_pub_->publish(makeGoal(harness_node_->now()));
+  ASSERT_TRUE(spinUntil(
+      [this, messages_after_timeout]() {
+        return paths_.size() > messages_after_timeout && !paths_.back().poses.empty();
+      }, 1s));
+}
+
+TEST_F(
+  ShortGoalRetentionPlannerNodeTest,
+  ExpiresACachedGoalBeforeAnyPathExists)
+{
+  goal_pub_->publish(makeGoal(harness_node_->now()));
+  spinFor(250ms);
+
+  const auto current_time = harness_node_->now();
+  odom_pub_->publish(makeOdom(current_time));
+  map_pub_->publish(makeMap(current_time));
+  spinFor(200ms);
+  EXPECT_TRUE(paths_.empty());
+
+  goal_pub_->publish(makeGoal(harness_node_->now()));
+  ASSERT_TRUE(spinUntil(
+      [this]() {return !paths_.empty() && !paths_.back().poses.empty();}, 1s));
 }
 
 TEST_F(BodyLatticePlannerNodeTest, PathTimestampPreservesOldestCausalInput)

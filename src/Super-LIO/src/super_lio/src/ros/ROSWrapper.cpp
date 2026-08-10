@@ -2,12 +2,46 @@
 #include "ros/ROSWrapper.h"
 #include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <stdexcept>
 
 
 using namespace BASIC;
 
 namespace LI2Sup{
+
+namespace {
+
+std::int64_t steadyNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::int64_t systemNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+double elapsedMs(std::int64_t start_ns, std::int64_t end_ns)
+{
+  if (start_ns <= 0 || end_ns < start_ns) {
+    return -1.0;
+  }
+  return static_cast<double>(end_ns - start_ns) * 1e-6;
+}
+
+void keepMaximum(double& current, double candidate)
+{
+  if (std::isfinite(candidate) && candidate >= 0.0 && candidate > current) {
+    current = candidate;
+  }
+}
+
+}  // namespace
 
 void LoadParamFromRos(rclcpp::Node& node)
 {
@@ -307,7 +341,9 @@ void ROSWrapper::setupIO(){
   sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
       g_imu_topic,
       imu_qos,
-      std::bind(&ROSWrapper::imuHandler, this, std::placeholders::_1),
+      std::bind(
+        &ROSWrapper::imuHandler, this,
+        std::placeholders::_1, std::placeholders::_2),
       sub_opt);
 
   if (g_lidar_type == LID_TYPE::LIVOX) {
@@ -316,7 +352,9 @@ void ROSWrapper::setupIO(){
         this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
             g_lidar_topic,
             lidar_qos,
-            std::bind(&ROSWrapper::livoxHandler, this, std::placeholders::_1),
+            std::bind(
+              &ROSWrapper::livoxHandler, this,
+              std::placeholders::_1, std::placeholders::_2),
             sub_opt);
 #else
     throw std::runtime_error(
@@ -327,7 +365,9 @@ void ROSWrapper::setupIO(){
         this->create_subscription<sensor_msgs::msg::PointCloud2>(
             g_lidar_topic,
             lidar_qos,
-            std::bind(&ROSWrapper::stdMsgHandler, this, std::placeholders::_1),
+            std::bind(
+              &ROSWrapper::stdMsgHandler, this,
+              std::placeholders::_1, std::placeholders::_2),
             sub_opt);
   }
 
@@ -356,9 +396,142 @@ void ROSWrapper::setupIO(){
 }
 
 
-void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
+void ROSWrapper::beginInputCallback(
+  InputCallbackTiming& timing,
+  const rclcpp::MessageInfo& message_info,
+  std::int64_t callback_steady_ns)
+{
+  const auto& rmw_info = message_info.get_rmw_message_info();
+  const std::int64_t received_ns = rmw_info.received_timestamp;
+  if (received_ns > 0) {
+    keepMaximum(
+      timing.rmw_gap_ms,
+      elapsedMs(timing.last_rmw_received_ns, received_ns));
+    keepMaximum(
+      timing.dispatch_delay_ms,
+      elapsedMs(received_ns, systemNowNs()));
+    timing.last_rmw_received_ns = received_ns;
+  }
+
+  keepMaximum(
+    timing.callback_gap_ms,
+    elapsedMs(timing.last_callback_steady_ns, callback_steady_ns));
+  timing.last_callback_steady_ns = callback_steady_ns;
+}
+
+
+void ROSWrapper::finishInputCallback(
+  InputCallbackTiming& timing, std::int64_t callback_steady_ns)
+{
+  keepMaximum(timing.callback_ms, elapsedMs(callback_steady_ns, steadyNowNs()));
+}
+
+
+RuntimeTimingSample ROSWrapper::takeRuntimeTimingSample()
+{
+  RuntimeTimingSample sample;
+  sample.lidar_rmw_gap_ms = lidar_callback_timing_.rmw_gap_ms;
+  sample.lidar_callback_gap_ms = lidar_callback_timing_.callback_gap_ms;
+  sample.lidar_dispatch_delay_ms = lidar_callback_timing_.dispatch_delay_ms;
+  sample.lidar_callback_ms = lidar_callback_timing_.callback_ms;
+  sample.imu_rmw_gap_ms = imu_callback_timing_.rmw_gap_ms;
+  sample.imu_callback_gap_ms = imu_callback_timing_.callback_gap_ms;
+  sample.imu_dispatch_delay_ms = imu_callback_timing_.dispatch_delay_ms;
+  sample.imu_callback_ms = imu_callback_timing_.callback_ms;
+  sample.lidar_source_stamp_sec = lidar_callback_timing_.source_stamp_sec;
+  if (sample.lidar_source_stamp_sec > 0.0) {
+    sample.lidar_source_age_ms =
+      static_cast<double>(systemNowNs()) * 1e-6 -
+      sample.lidar_source_stamp_sec * 1e3;
+  }
+  sample.lidar_queue_depth = lidar_buffer_.size();
+  sample.imu_queue_depth = imu_buffer_.size();
+
+  lidar_callback_timing_.rmw_gap_ms = -1.0;
+  lidar_callback_timing_.callback_gap_ms = -1.0;
+  lidar_callback_timing_.dispatch_delay_ms = -1.0;
+  lidar_callback_timing_.callback_ms = -1.0;
+  imu_callback_timing_.rmw_gap_ms = -1.0;
+  imu_callback_timing_.callback_gap_ms = -1.0;
+  imu_callback_timing_.dispatch_delay_ms = -1.0;
+  imu_callback_timing_.callback_ms = -1.0;
+  return sample;
+}
+
+
+void ROSWrapper::setSyncWait(SyncWaitReason reason)
+{
+  if (reason == SyncWaitReason::Ready) {
+    sync_wait_reason_ = reason;
+    sync_wait_start_ns_ = 0;
+    return;
+  }
+
+  if (sync_wait_start_ns_ == 0 || sync_wait_reason_ != reason) {
+    sync_wait_reason_ = reason;
+    sync_wait_start_ns_ = steadyNowNs();
+  }
+}
+
+
+void ROSWrapper::populateSyncTiming(RuntimeTimingSample& sample) const
+{
+  sample.sync_reason = sync_wait_reason_;
+  sample.sync_wait_ms = sync_wait_start_ns_ > 0 ?
+    elapsedMs(sync_wait_start_ns_, steadyNowNs()) : -1.0;
+}
+
+
+void ROSWrapper::reportRuntimeTiming(
+  const RuntimeTimingSample& sample, std::int64_t steady_now_ns)
+{
+  const auto report = runtime_timing_.observe(sample, steady_now_ns);
+  if (!report) {
+    return;
+  }
+
+  const RuntimeTimingSample& worst = report->worst_sample;
+  const std::string_view sync_reason = syncWaitReasonName(worst.sync_reason);
+  RCLCPP_WARN(
+    get_logger(),
+    "[super_lio_timing] cause=%.*s max=%.1fms samples=%llu anomalies=%llu "
+    "frame=%llu src_age=%.1fms points=%zu/%zu imu=%zu queue=%zu/%zu "
+    "sync=%.*s wait=%.1fms input={lrg:%.1f,lcg:%.1f,ldis:%.1f,lcb:%.1f,"
+    "irg:%.1f,icg:%.1f,idis:%.1f,icb:%.1f} "
+    "stage={timer:%.1f,und:%.1f,ds:%.1f,"
+    "obs:%.1f,map:%.1f,odom:%.1f,xform:%.1f,ros:%.1f,pub:%.1f,total:%.1f}",
+    static_cast<int>(report->dominant_cause.size()), report->dominant_cause.data(),
+    report->dominant_ms,
+    static_cast<unsigned long long>(report->sample_count),
+    static_cast<unsigned long long>(report->anomaly_count),
+    static_cast<unsigned long long>(worst.frame_sequence),
+    worst.lidar_source_age_ms,
+    worst.raw_point_count, worst.downsampled_point_count,
+    worst.imu_measurement_count,
+    worst.lidar_queue_depth, worst.imu_queue_depth,
+    static_cast<int>(sync_reason.size()), sync_reason.data(),
+    worst.sync_wait_ms,
+    worst.lidar_rmw_gap_ms, worst.lidar_callback_gap_ms,
+    worst.lidar_dispatch_delay_ms, worst.lidar_callback_ms,
+    worst.imu_rmw_gap_ms, worst.imu_callback_gap_ms,
+    worst.imu_dispatch_delay_ms,
+    worst.imu_callback_ms,
+    worst.process_timer_gap_ms, worst.undistort_ms,
+    worst.downsample_ms, worst.observe_ms, worst.update_map_ms,
+    worst.odom_publish_ms, worst.cloud_transform_ms,
+    worst.cloud_to_ros_ms, worst.cloud_publish_ms, worst.frame_total_ms);
+}
+
+
+void ROSWrapper::imuHandler(
+  const sensor_msgs::msg::Imu::SharedPtr msg,
+  const rclcpp::MessageInfo& message_info)
+{
+  const std::int64_t callback_steady_ns = steadyNowNs();
+  beginInputCallback(imu_callback_timing_, message_info, callback_steady_ns);
   IMUData data;
   data.secs = stampToSec(msg->header.stamp);
+  imu_callback_timing_.source_stamp_sec = data.secs;
   data.acc  = V3(msg->linear_acceleration.x,
                  msg->linear_acceleration.y,
                  msg->linear_acceleration.z);
@@ -372,6 +545,7 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
     imu_buffer_.push_back(data);
     last_timestamp_imu_ = data.secs;
     // eskf_->Reset();   // todo:
+    finishInputCallback(imu_callback_timing_, callback_steady_ns);
     return;
   }
 
@@ -425,12 +599,21 @@ void ROSWrapper::imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg){
     pub_imu_odom_->publish(odom_imu);
     pub_robo_odom_->publish(odom_robo);
   }
+  finishInputCallback(imu_callback_timing_, callback_steady_ns);
 }
 
 
 #ifdef SUPER_LIO_HAS_LIVOX
-void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg){
-  if(msg->point_num < 10) return;
+void ROSWrapper::livoxHandler(
+  const livox_ros_driver2::msg::CustomMsg::SharedPtr msg,
+  const rclcpp::MessageInfo& message_info)
+{
+  const std::int64_t callback_steady_ns = steadyNowNs();
+  beginInputCallback(lidar_callback_timing_, message_info, callback_steady_ns);
+  if(msg->point_num < 10) {
+    finishInputCallback(lidar_callback_timing_, callback_steady_ns);
+    return;
+  }
   LidarData lidar_data;
   std::size_t ptsize = msg->point_num;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
@@ -450,13 +633,23 @@ void ROSWrapper::livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr
   }
   lidar_data.start_time = stampToSec(msg->header.stamp);
   lidar_data.end_time   = lidar_data.start_time + offset_time;
+  lidar_callback_timing_.source_stamp_sec = lidar_data.start_time;
   lidar_buffer_.push_back(lidar_data);
+  finishInputCallback(lidar_callback_timing_, callback_steady_ns);
 }
 #endif
 
 
-void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr msg){
-  if(msg->data.size() < 10) return;
+void ROSWrapper::stdMsgHandler(
+  const sensor_msgs::msg::PointCloud2::SharedPtr msg,
+  const rclcpp::MessageInfo& message_info)
+{
+  const std::int64_t callback_steady_ns = steadyNowNs();
+  beginInputCallback(lidar_callback_timing_, message_info, callback_steady_ns);
+  if(msg->data.size() < 10) {
+    finishInputCallback(lidar_callback_timing_, callback_steady_ns);
+    return;
+  }
 
   LidarData lidar_data;
   lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
@@ -536,15 +729,27 @@ void ROSWrapper::stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr ms
     break;
   }
   default:
+    finishInputCallback(lidar_callback_timing_, callback_steady_ns);
     return;
   }
 
+  lidar_callback_timing_.source_stamp_sec = lidar_data.start_time;
   lidar_buffer_.push_back(lidar_data);
+  finishInputCallback(lidar_callback_timing_, callback_steady_ns);
 }
 
 
-bool ROSWrapper::sync_measure(MeasureGroup& meas){
-  if (lidar_buffer_.empty() || imu_buffer_.empty()) {
+bool ROSWrapper::sync_measure(
+  MeasureGroup& meas, RuntimeTimingSample& timing_sample)
+{
+  if (lidar_buffer_.empty()) {
+    setSyncWait(SyncWaitReason::NoLidar);
+    populateSyncTiming(timing_sample);
+    return false;
+  }
+  if (imu_buffer_.empty()) {
+    setSyncWait(SyncWaitReason::NoImu);
+    populateSyncTiming(timing_sample);
     return false;
   }
 
@@ -556,10 +761,14 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
   if(last_timestamp_lidar_ > meas.lidar.end_time){
     lidar_buffer_.pop_front();
     lidar_pushed_ = false;
+    setSyncWait(SyncWaitReason::NonmonotonicLidar);
+    populateSyncTiming(timing_sample);
     return false;
   }
 
   if (last_timestamp_imu_ < meas.lidar.end_time) {
+    setSyncWait(SyncWaitReason::ImuBehind);
+    populateSyncTiming(timing_sample);
     return false;
   }
 
@@ -575,6 +784,14 @@ bool ROSWrapper::sync_measure(MeasureGroup& meas){
   last_timestamp_lidar_ = meas.lidar.end_time;
   lidar_buffer_.pop_front();
   lidar_pushed_ = false;
+  setSyncWait(SyncWaitReason::Ready);
+  populateSyncTiming(timing_sample);
+  timing_sample.lidar_source_stamp_sec = meas.lidar.start_time;
+  timing_sample.lidar_source_age_ms =
+    static_cast<double>(systemNowNs()) * 1e-6 -
+    meas.lidar.start_time * 1e3;
+  timing_sample.raw_point_count = meas.lidar.pc->size();
+  timing_sample.imu_measurement_count = meas.imu.size();
   return true;
 }
 
@@ -655,12 +872,20 @@ void ROSWrapper::pub_odom(const NavState& state){
 }
 
 
-void ROSWrapper::pub_cloud_world(const CloudPtr& pc, double time){
+ROSWrapper::CloudPublishTiming ROSWrapper::pub_cloud_world(
+  const CloudPtr& pc, double time)
+{
+  CloudPublishTiming timing;
+  const std::int64_t to_ros_start_ns = steadyNowNs();
   sensor_msgs::msg::PointCloud2 cloud;
   pcl::toROSMsg(*pc, cloud);
+  const std::int64_t publish_start_ns = steadyNowNs();
+  timing.to_ros_ms = elapsedMs(to_ros_start_ns, publish_start_ns);
   cloud.header.frame_id = "world";
   cloud.header.stamp = toRosTime(time);
   pub_cloud_world_->publish(cloud);
+  timing.publish_ms = elapsedMs(publish_start_ns, steadyNowNs());
+  return timing;
 }
 
 

@@ -53,6 +53,10 @@ body_lattice_planner:
     # watchdog clears a previously published transient-local path on timeout.
     max_map_age: 1.0
     max_odom_age: 0.5
+    # Goal headers must be fresh when received. An accepted goal remains a
+    # bounded command for long enough to execute a short low-speed path.
+    max_goal_age: 2.0
+    goal_retention_timeout: 30.0
     timestamp_future_tolerance: 0.2
     input_watchdog_rate: 10.0
     yaw_bins: 16

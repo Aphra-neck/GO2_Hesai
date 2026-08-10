@@ -1,6 +1,9 @@
 
 #include "lio/super_lio.h"
 
+#include <chrono>
+#include <cstdint>
+#include <utility>
 #include <sys/resource.h>
 #include <tbb/parallel_for.h>
 #include <tbb/blocked_range.h>
@@ -11,6 +14,24 @@
 using namespace BASIC;
 
 namespace LI2Sup{
+
+namespace {
+
+std::int64_t timingNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+double timingElapsedMs(std::int64_t start_ns, std::int64_t end_ns)
+{
+  if (start_ns <= 0 || end_ns < start_ns) {
+    return -1.0;
+  }
+  return static_cast<double>(end_ns - start_ns) * 1e-6;
+}
+
+}  // namespace
 
 inline bool calc_plane_coeff(const int N, const std::array<V3, 5>& points, std::array<double, 4>& abcd)
 {
@@ -105,10 +126,27 @@ void SuperLIO::stateWaitMapInit()
 }
 
 void SuperLIO::process(){
-  if(!data_wrapper_->sync_measure(measures_)){
+  const std::int64_t process_start_ns = timingNowNs();
+  runtime_timing_sample_ = data_wrapper_->takeRuntimeTimingSample();
+  // Exclude the previous frame's own runtime from executor scheduling delay.
+  runtime_timing_sample_.process_timer_gap_ms =
+    timingElapsedMs(last_process_end_ns_, process_start_ns);
+
+  if(!data_wrapper_->sync_measure(measures_, runtime_timing_sample_)){
+    const std::int64_t process_end_ns = timingNowNs();
+    runtime_timing_sample_.frame_total_ms =
+      timingElapsedMs(process_start_ns, process_end_ns);
+    data_wrapper_->reportRuntimeTiming(runtime_timing_sample_, process_end_ns);
+    last_process_end_ns_ = timingNowNs();
     return;
   }
+  runtime_timing_sample_.frame_sequence = ++runtime_frame_sequence_;
   (this->*state_fn_)();
+  const std::int64_t process_end_ns = timingNowNs();
+  runtime_timing_sample_.frame_total_ms =
+    timingElapsedMs(process_start_ns, process_end_ns);
+  data_wrapper_->reportRuntimeTiming(runtime_timing_sample_, process_end_ns);
+  last_process_end_ns_ = timingNowNs();
 }
 
 
@@ -193,17 +231,30 @@ bool SuperLIO::map_init(){
 
 void SuperLIO::stateProcess(){
   frame_num_++;
-  if(g_time_eva){
-    time_record_.Evaluate([this](){Propagation_Undistort();}, "[Undistort]");
-    time_record_.Evaluate([this]() { DownSample(); }, "[DownSample]");
-    time_record_.Evaluate([this]() { Observe(); }, "[Observe]");
-    time_record_.Evaluate([this]() { UpdateMap(); }, "[UpdateMap]");
-  }else{
-    Propagation_Undistort();
-    DownSample();
-    Observe();
-    UpdateMap();
-  }
+  const auto evaluate_stage = [this](
+    auto&& function, const char* name, double& timing_ms) {
+      const std::int64_t start_ns = timingNowNs();
+      if (g_time_eva) {
+        time_record_.Evaluate(std::forward<decltype(function)>(function), name);
+      } else {
+        std::forward<decltype(function)>(function)();
+      }
+      timing_ms = timingElapsedMs(start_ns, timingNowNs());
+    };
+
+  evaluate_stage(
+    [this]() { Propagation_Undistort(); }, "[Undistort]",
+    runtime_timing_sample_.undistort_ms);
+  evaluate_stage(
+    [this]() { DownSample(); }, "[DownSample]",
+    runtime_timing_sample_.downsample_ms);
+  runtime_timing_sample_.downsampled_point_count = ds_undistort_->size();
+  evaluate_stage(
+    [this]() { Observe(); }, "[Observe]",
+    runtime_timing_sample_.observe_ms);
+  evaluate_stage(
+    [this]() { UpdateMap(); }, "[UpdateMap]",
+    runtime_timing_sample_.update_map_ms);
   Output();
   caceData();
 }
@@ -559,7 +610,10 @@ void SuperLIO::UpdateMap() {
 
 void SuperLIO::Output(){
   auto state = kf_->GetNavState();
-  data_wrapper_->pub_odom(state);  
+  std::int64_t stage_start_ns = timingNowNs();
+  data_wrapper_->pub_odom(state);
+  runtime_timing_sample_.odom_publish_ms =
+    timingElapsedMs(stage_start_ns, timingNowNs());
 
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
   transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
@@ -574,13 +628,18 @@ void SuperLIO::Output(){
       return;
     }
     count = 0;
+    stage_start_ns = timingNowNs();
     if(g_visual_dense){
       pcl::transformPointCloud(*scan_undistort_full_, *world_pc, transformation);
-      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
     }else{
       pcl::transformPointCloud(*ds_undistort_, *world_pc, transformation);
-      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
     }
+    runtime_timing_sample_.cloud_transform_ms =
+      timingElapsedMs(stage_start_ns, timingNowNs());
+    const auto cloud_timing =
+      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
+    runtime_timing_sample_.cloud_to_ros_ms = cloud_timing.to_ros_ms;
+    runtime_timing_sample_.cloud_publish_ms = cloud_timing.publish_ms;
   }
 }
 

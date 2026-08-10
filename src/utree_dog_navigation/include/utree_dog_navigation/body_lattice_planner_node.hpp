@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,6 +28,8 @@ private:
   void goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   void requestPlan();
   void watchdogTick();
+  bool expireGoalIfNeeded();
+  bool goalRetentionExpired() const;
   bool framesValid();
   bool posesValid();
   bool inputsFresh(const rclcpp::Time & current_time);
@@ -34,6 +37,7 @@ private:
     const builtin_interfaces::msg::Time & stamp, const rclcpp::Time & current_time,
     double maximum_age, const char * input_name);
   void clearPath(const char * reason);
+  void clearGoal(const char * reason);
   nav_msgs::msg::Path makePath(
     const PlanningResult & result, const WorldState & exact_start,
     const builtin_interfaces::msg::Time & source_stamp) const;
@@ -47,6 +51,8 @@ private:
   double nominal_body_height_{0.42};
   double max_map_age_{1.0};
   double max_odom_age_{0.5};
+  double max_goal_age_{2.0};
+  double goal_retention_timeout_{30.0};
   double timestamp_future_tolerance_{0.2};
   double input_watchdog_rate_{10.0};
   bool have_odom_{false};
@@ -56,6 +62,7 @@ private:
   std::unique_ptr<LatticePlanner> planner_;
   nav_msgs::msg::Odometry::SharedPtr odom_;
   geometry_msgs::msg::PoseStamped::SharedPtr goal_;
+  std::chrono::steady_clock::time_point goal_received_time_{};
   rclcpp::Subscription<utree_dog_msgs::msg::TerrainGrid>::SharedPtr map_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;

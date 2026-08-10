@@ -54,6 +54,8 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
   nominal_body_height_ = declare_parameter("nominal_body_height", 0.42);
   max_map_age_ = declare_parameter("max_map_age", 1.0);
   max_odom_age_ = declare_parameter("max_odom_age", 0.5);
+  max_goal_age_ = declare_parameter("max_goal_age", 2.0);
+  goal_retention_timeout_ = declare_parameter("goal_retention_timeout", 30.0);
   timestamp_future_tolerance_ = declare_parameter("timestamp_future_tolerance", 0.2);
   input_watchdog_rate_ = declare_parameter("input_watchdog_rate", 10.0);
   const auto finite_in_range = [](double value, double minimum, double maximum) {
@@ -68,6 +70,13 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
   if (!finite_in_range(max_odom_age_, 0.001, 60.0)) {
     throw std::invalid_argument("max_odom_age must be finite and in [0.001, 60] seconds");
   }
+  if (!finite_in_range(max_goal_age_, 0.001, 60.0)) {
+    throw std::invalid_argument("max_goal_age must be finite and in [0.001, 60] seconds");
+  }
+  if (!finite_in_range(goal_retention_timeout_, 0.001, 3600.0)) {
+    throw std::invalid_argument(
+            "goal_retention_timeout must be finite and in [0.001, 3600] seconds");
+  }
   if (!finite_in_range(timestamp_future_tolerance_, 0.0, 5.0)) {
     throw std::invalid_argument(
             "timestamp_future_tolerance must be finite and in [0, 5] seconds");
@@ -79,9 +88,11 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
     throw std::invalid_argument("map_frame and body_frame must not be empty");
   }
   const double watchdog_period_seconds = 1.0 / input_watchdog_rate_;
-  if (watchdog_period_seconds > std::min(max_map_age_, max_odom_age_)) {
+  if (watchdog_period_seconds >
+    std::min({max_map_age_, max_odom_age_, goal_retention_timeout_}))
+  {
     throw std::invalid_argument(
-            "input watchdog period must not exceed max_map_age or max_odom_age");
+            "input watchdog period must not exceed map, odometry, or goal retention budget");
   }
   LatticePlannerConfig config;
   config.yaw_bins = declare_parameter("yaw_bins", 16);
@@ -197,20 +208,35 @@ void BodyLatticePlannerNode::odomCallback(const nav_msgs::msg::Odometry::SharedP
 void BodyLatticePlannerNode::goalCallback(
   const geometry_msgs::msg::PoseStamped::SharedPtr msg)
 {
-  goal_ = msg;
-  have_goal_ = true;
-  if (!validPose(goal_->pose)) {
+  const rclcpp::Time current_time = now();
+  if (!validPose(msg->pose)) {
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), 3000,
       "Rejected goal with a non-finite position or invalid quaternion");
-    clearPath("goal pose is malformed");
+    clearGoal("goal pose is malformed");
     return;
   }
+  if (msg->header.frame_id != map_frame_) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Rejected goal frame '%s'; expected '%s'",
+      msg->header.frame_id.c_str(), map_frame_.c_str());
+    clearGoal("goal frame does not match configured map frame");
+    return;
+  }
+  if (!stampFresh(msg->header.stamp, current_time, max_goal_age_, "goal")) {
+    clearGoal("goal timestamp is stale or invalid");
+    return;
+  }
+  goal_ = msg;
+  have_goal_ = true;
+  goal_received_time_ = std::chrono::steady_clock::now();
   requestPlan();
 }
 
 void BodyLatticePlannerNode::requestPlan()
 {
+  if (expireGoalIfNeeded()) {return;}
   if (!planner_->hasMap() || !have_odom_ || !have_goal_) {
     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Waiting for map, odometry and goal");
     clearPath("required planning input is unavailable");
@@ -236,8 +262,9 @@ void BodyLatticePlannerNode::requestPlan()
   const WorldState goal{
     goal_->pose.position.x, goal_->pose.position.y, tf2::getYaw(goal_->pose.orientation)};
   const PlanningResult result = planner_->plan(
-    start, goal, [this]() {return !inputsFresh(now());});
+    start, goal, [this]() {return goalRetentionExpired() || !inputsFresh(now());});
   const rclcpp::Time completion_time = now();
+  if (expireGoalIfNeeded()) {return;}
   if (!framesValid() || !posesValid() || !inputsFresh(completion_time)) {
     clearPath("planning inputs became stale or invalid during search");
     return;
@@ -256,6 +283,7 @@ void BodyLatticePlannerNode::requestPlan()
   const auto & source_stamp = map_time <= odom_time ? map.header.stamp : odom_->header.stamp;
   const nav_msgs::msg::Path path = makePath(result, start, source_stamp);
   const rclcpp::Time publish_time = now();
+  if (expireGoalIfNeeded()) {return;}
   if (!framesValid() || !posesValid() || !inputsFresh(publish_time)) {
     clearPath("planning inputs became stale or invalid before path publication");
     return;
@@ -276,12 +304,33 @@ void BodyLatticePlannerNode::requestPlan()
 
 void BodyLatticePlannerNode::watchdogTick()
 {
+  if (expireGoalIfNeeded()) {return;}
   if (!path_active_) {return;}
   if (!planner_->hasMap() || !have_odom_ || !have_goal_ ||
     !framesValid() || !posesValid() || !inputsFresh(now()))
   {
     clearPath("planning inputs stopped or became stale");
   }
+}
+
+bool BodyLatticePlannerNode::expireGoalIfNeeded()
+{
+  if (!goalRetentionExpired()) {return false;}
+  const double retained_for = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - goal_received_time_).count();
+  RCLCPP_WARN(
+    get_logger(),
+    "Expired cached goal after %.3f s; retention limit is %.3f s and a new goal is required",
+    retained_for, goal_retention_timeout_);
+  clearGoal("cached goal exceeded its retention timeout");
+  return true;
+}
+
+bool BodyLatticePlannerNode::goalRetentionExpired() const
+{
+  if (!have_goal_ || !goal_) {return false;}
+  return std::chrono::steady_clock::now() - goal_received_time_ >
+         std::chrono::duration<double>(goal_retention_timeout_);
 }
 
 bool BodyLatticePlannerNode::framesValid()
@@ -357,6 +406,14 @@ void BodyLatticePlannerNode::clearPath(const char * reason)
   path_pub_->publish(path);
   path_active_ = false;
   RCLCPP_WARN(get_logger(), "Cleared body path: %s", reason);
+}
+
+void BodyLatticePlannerNode::clearGoal(const char * reason)
+{
+  clearPath(reason);
+  goal_.reset();
+  have_goal_ = false;
+  goal_received_time_ = std::chrono::steady_clock::time_point{};
 }
 
 nav_msgs::msg::Path BodyLatticePlannerNode::makePath(

@@ -21,6 +21,7 @@ from inspect_planner_inputs import (
     Pose2D,
     SubscriptionSpec,
     VerifiedFlatStartConfig,
+    _capture_goal_stage,
     _diagnosis_exit_code,
     _capture_runtime_messages,
     _capture_stage,
@@ -146,6 +147,7 @@ class FakeNode:
     ) -> None:
         self.fail_topic = fail_topic
         self.publisher_count = publisher_count
+        self.clock_ns = NOW_NS
         self.active: list[FakeSubscription] = []
         self.events: list[tuple[str, str, object]] = []
 
@@ -171,6 +173,11 @@ class FakeNode:
     def count_publishers(self, topic: str) -> int:
         del topic
         return self.publisher_count
+
+    def get_clock(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            now=lambda: SimpleNamespace(nanoseconds=self.clock_ns)
+        )
 
     def publish(self, topic: str, message: object) -> None:
         for subscription in list(self.active):
@@ -321,6 +328,12 @@ def full_planner_parameter_response() -> FakeParameterResponse:
             FakeParameterValue(FakeParameterType.PARAMETER_DOUBLE, double_value=0.20),
         ]
     )
+    values.extend(
+        FakeParameterValue(
+            FakeParameterType.PARAMETER_DOUBLE, double_value=value
+        )
+        for value in (2.0, 30.0)
+    )
     return FakeParameterResponse(values)
 
 
@@ -389,6 +402,8 @@ class LiveParameterServiceTests(unittest.TestCase):
                 max_odom_age=0.4,
                 future_tolerance=0.15,
                 input_watchdog_rate=12.0,
+                max_goal_age=2.0,
+                goal_retention_timeout=30.0,
             ),
         )
         self.assertEqual(
@@ -429,6 +444,8 @@ class LiveParameterServiceTests(unittest.TestCase):
                 "verified_flat_start.max_elevation_range",
                 "verified_flat_start.inferred_traversability",
                 "motion_step",
+                "max_goal_age",
+                "goal_retention_timeout",
             ]],
         )
         self.assertEqual(response_timeouts, [0.5, 0.5, 0.5])
@@ -438,6 +455,44 @@ class LiveParameterServiceTests(unittest.TestCase):
                 "/terrain_mapper/get_parameters",
                 "/body_lattice_planner/get_parameters",
             ],
+        )
+
+    def test_goal_freshness_parameters_are_requested_and_decoded(self) -> None:
+        planner_client = FakeParameterClient(
+            [
+                FakeParameterFuture(
+                    response=full_planner_parameter_response()
+                )
+            ]
+        )
+        node = FakeParameterNode(
+            {
+                "/terrain_mapper/get_parameters": FakeParameterClient(
+                    [
+                        FakeParameterFuture(
+                            response=parameter_response(6, 0.58, 0.07)
+                        )
+                    ]
+                ),
+                "/body_lattice_planner/get_parameters": planner_client,
+            }
+        )
+
+        _, freshness, _ = _read_live_planner_thresholds(
+            node,
+            FakeGetParameters,
+            FakeParameterType,
+            lambda unused_node, unused_future, timeout_sec: None,
+            service_timeout=0.25,
+            response_timeout=0.5,
+            max_attempts=1,
+        )
+
+        self.assertEqual(freshness.max_goal_age, 2.0)
+        self.assertEqual(freshness.goal_retention_timeout, 30.0)
+        self.assertEqual(
+            planner_client.requests[0][-2:],
+            ["max_goal_age", "goal_retention_timeout"],
         )
 
     def test_permanently_unavailable_service_fails_closed_after_limit(
@@ -1639,6 +1694,86 @@ class PlannerInputInspectionTests(unittest.TestCase):
         )
         self.assertEqual(result["diagnosis"], "goal_stale")
 
+    def test_goal_fresh_at_receipt_is_not_stale_after_capture_delay(self) -> None:
+        goal_stamp_ns = NOW_NS - 3_000_000_000
+        goal_received_ns = goal_stamp_ns + 100_000_000
+
+        result = analyze_planner_inputs(
+            make_grid(),
+            pose(1.5, 1.5),
+            pose(2.5, 1.5, stamp_ns=goal_stamp_ns),
+            now_ns=NOW_NS,
+            goal_received_ns=goal_received_ns,
+            goal_received_monotonic_ns=1_000_000_000,
+            inspection_monotonic_ns=3_900_000_000,
+        )
+
+        self.assertEqual(
+            result["diagnosis"],
+            "same_continuous_ground_component_not_planner_approval",
+        )
+        freshness = result["freshness"]
+        self.assertAlmostEqual(freshness["goal_age_sec"], 3.0)
+        self.assertAlmostEqual(
+            freshness["goal_age_at_inspection_sec"], 3.0
+        )
+        self.assertAlmostEqual(
+            freshness["goal_header_age_at_receipt_sec"], 0.1
+        )
+        self.assertAlmostEqual(freshness["goal_retention_age_sec"], 2.9)
+        self.assertEqual(freshness["goal_retention_clock"], "steady_monotonic")
+        self.assertEqual(
+            freshness["goal_receipt_scope"],
+            "inspector_subscription_callback",
+        )
+
+    def test_goal_retention_expiry_is_distinct_from_header_freshness(self) -> None:
+        goal_stamp_ns = NOW_NS - 3_000_000_000
+        goal_received_ns = goal_stamp_ns + 100_000_000
+
+        result = analyze_planner_inputs(
+            make_grid(),
+            pose(1.5, 1.5),
+            pose(2.5, 1.5, stamp_ns=goal_stamp_ns),
+            contract=InputContract(goal_retention_timeout=2.0),
+            now_ns=NOW_NS,
+            goal_received_ns=goal_received_ns,
+            goal_received_monotonic_ns=1_000_000_000,
+            inspection_monotonic_ns=3_900_000_000,
+        )
+
+        self.assertEqual(result["diagnosis"], "goal_retention_expired")
+        freshness = result["freshness"]
+        self.assertAlmostEqual(
+            freshness["goal_header_age_at_receipt_sec"], 0.1
+        )
+        self.assertAlmostEqual(freshness["goal_retention_age_sec"], 2.9)
+
+    def test_goal_retention_expiry_precedes_stale_map_diagnosis(self) -> None:
+        result = analyze_planner_inputs(
+            replace(make_grid(), stamp_ns=NOW_NS - 2_000_000_000),
+            pose(1.5, 1.5),
+            pose(2.5, 1.5),
+            contract=InputContract(goal_retention_timeout=2.0),
+            now_ns=NOW_NS,
+            goal_received_ns=NOW_NS,
+            goal_received_monotonic_ns=1_000_000_000,
+            inspection_monotonic_ns=3_100_000_000,
+        )
+
+        self.assertEqual(result["diagnosis"], "goal_retention_expired")
+
+    def test_invalid_goal_retention_contract_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "goal_retention_timeout must be finite"
+        ):
+            analyze_planner_inputs(
+                make_grid(),
+                pose(1.5, 1.5),
+                None,
+                contract=InputContract(goal_retention_timeout=0.0),
+            )
+
     def test_future_stamp_is_rejected(self) -> None:
         grid = replace(make_grid(), stamp_ns=NOW_NS + 300_000_000)
         result = analyze_planner_inputs(
@@ -1708,6 +1843,41 @@ class PlannerInputInspectionTests(unittest.TestCase):
 
 
 class SubscriptionLifecycleTests(unittest.TestCase):
+    def test_goal_callback_records_receipt_time(self) -> None:
+        node = FakeNode()
+        goal = stamped_message(1_200_000_000)
+        receipt_ns = 1_250_000_000
+
+        def wait_fn(
+            fake_node: object,
+            predicate: object,
+            timeout: float,
+        ) -> bool:
+            del fake_node, timeout
+            node.clock_ns = receipt_ns
+            node.publish("/goal_pose", goal)
+            node.clock_ns = receipt_ns + 500_000_000
+            return predicate()
+
+        with redirect_stderr(StringIO()):
+            captured, failure = _capture_goal_stage(
+                node,
+                make_specs()["goal"],
+                publisher_timeout=1.0,
+                goal_timeout=1.0,
+                wait_fn=wait_fn,
+                monotonic_now_ns=lambda: 9_000_000_000,
+            )
+
+        self.assertIsNone(failure)
+        self.assertIsNotNone(captured)
+        self.assertIs(captured["goal"], goal)
+        self.assertEqual(captured["goal_received_ns"], receipt_ns)
+        self.assertEqual(
+            captured["goal_received_monotonic_ns"], 9_000_000_000
+        )
+        self.assertEqual(node.active, [])
+
     def test_goal_wait_starts_after_publisher_discovery(self) -> None:
         class DelayedPublisherNode(FakeNode):
             def __init__(self) -> None:

@@ -102,6 +102,8 @@ class PlannerFreshnessSettings:
     max_odom_age: float = 0.5
     future_tolerance: float = 0.2
     input_watchdog_rate: float = 10.0
+    max_goal_age: float = 2.0
+    goal_retention_timeout: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,7 @@ class InputContract:
     max_odom_age: float = 0.5
     max_goal_age: float = 2.0
     future_tolerance: float = 0.2
+    goal_retention_timeout: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -255,6 +258,8 @@ def _read_live_planner_thresholds(
         "verified_flat_start.max_elevation_range",
         "verified_flat_start.inferred_traversability",
         "motion_step",
+        "max_goal_age",
+        "goal_retention_timeout",
     )
     planner_values = _request_parameter_batch(
         node,
@@ -385,6 +390,26 @@ def _read_live_planner_thresholds(
                 planner_service,
                 planner_names[8],
                 planner_values[8],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        max_goal_age=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[24],
+                planner_values[24],
+                parameter_type.PARAMETER_DOUBLE,
+                "double_value",
+                "a double",
+            )
+        ),
+        goal_retention_timeout=float(
+            _decode_live_parameter(
+                planner_service,
+                planner_names[25],
+                planner_values[25],
                 parameter_type.PARAMETER_DOUBLE,
                 "double_value",
                 "a double",
@@ -663,6 +688,34 @@ def _validate_freshness_settings(settings: PlannerFreshnessSettings) -> None:
         ("max_odom_age", settings.max_odom_age, 0.001, 60.0),
         ("future_tolerance", settings.future_tolerance, 0.0, 5.0),
         ("input_watchdog_rate", settings.input_watchdog_rate, 0.1, 100.0),
+        ("max_goal_age", settings.max_goal_age, 0.001, 60.0),
+        (
+            "goal_retention_timeout",
+            settings.goal_retention_timeout,
+            0.001,
+            3600.0,
+        ),
+    ):
+        if not math.isfinite(value) or not minimum <= value <= maximum:
+            raise ValueError(
+                f"{name} must be finite and in [{minimum}, {maximum}]"
+            )
+
+
+def _validate_input_contract(contract: InputContract) -> None:
+    if not contract.map_frame or not contract.body_frame:
+        raise ValueError("input contract frame names must not be empty")
+    for name, value, minimum, maximum in (
+        ("max_map_age", contract.max_map_age, 0.001, 60.0),
+        ("max_odom_age", contract.max_odom_age, 0.001, 60.0),
+        ("max_goal_age", contract.max_goal_age, 0.001, 60.0),
+        ("future_tolerance", contract.future_tolerance, 0.0, 5.0),
+        (
+            "goal_retention_timeout",
+            contract.goal_retention_timeout,
+            0.001,
+            3600.0,
+        ),
     ):
         if not math.isfinite(value) or not minimum <= value <= maximum:
             raise ValueError(
@@ -1570,11 +1623,15 @@ def analyze_planner_inputs(
     contract: InputContract = InputContract(),
     now_ns: int | None = None,
     verified_flat_start: VerifiedFlatStartConfig = VerifiedFlatStartConfig(),
+    goal_received_ns: int | None = None,
+    goal_received_monotonic_ns: int | None = None,
+    inspection_monotonic_ns: int | None = None,
 ) -> dict[str, object]:
     """Return input-contract, endpoint, and continuous-ground diagnostics."""
     _validate_grid(grid)
     _validate_thresholds(thresholds)
     _validate_verified_flat_start(verified_flat_start)
+    _validate_input_contract(contract)
     _validate_pose("start", start)
     if goal is not None:
         _validate_pose("goal", goal)
@@ -1607,6 +1664,23 @@ def analyze_planner_inputs(
     map_age = _input_age(grid.stamp_ns, now_ns)
     odom_age = _input_age(start.stamp_ns, now_ns)
     goal_age = _input_age(goal.stamp_ns, now_ns) if goal else None
+    goal_header_age_at_receipt = (
+        _input_age(goal.stamp_ns, goal_received_ns)
+        if goal is not None and goal_received_ns is not None
+        else None
+    )
+    monotonic_retention_available = (
+        goal is not None
+        and goal_received_monotonic_ns is not None
+        and inspection_monotonic_ns is not None
+    )
+    goal_retention_age = (
+        _input_age(goal_received_monotonic_ns, inspection_monotonic_ns)
+        if monotonic_retention_available
+        else _input_age(goal_received_ns, now_ns)
+        if goal is not None and goal_received_ns is not None
+        else None
+    )
 
     result: dict[str, object] = {
         "map": {
@@ -1637,6 +1711,22 @@ def analyze_planner_inputs(
             "map_age_sec": map_age,
             "odom_age_sec": odom_age,
             "goal_age_sec": goal_age,
+            "goal_age_at_inspection_sec": goal_age,
+            "goal_received_ns": goal_received_ns if goal is not None else None,
+            "goal_header_age_at_receipt_sec": goal_header_age_at_receipt,
+            "goal_retention_age_sec": goal_retention_age,
+            "goal_receipt_scope": (
+                "inspector_subscription_callback"
+                if goal_received_ns is not None
+                else None
+            ),
+            "goal_retention_clock": (
+                "steady_monotonic"
+                if monotonic_retention_available
+                else "ros_clock_fallback"
+                if goal_retention_age is not None
+                else None
+            ),
             "map_odom_stamp_delta_sec": (
                 (grid.stamp_ns - start.stamp_ns) / 1_000_000_000.0
                 if grid.stamp_ns > 0 and start.stamp_ns > 0
@@ -1670,6 +1760,30 @@ def analyze_planner_inputs(
     if start.child_frame_id != contract.body_frame:
         result["diagnosis"] = "start_child_frame_mismatch"
         return result
+    if goal is not None and goal.frame_id != grid.frame_id:
+        result["diagnosis"] = "goal_frame_mismatch"
+        return result
+    if goal is not None and now_ns is not None:
+        goal_header_age = (
+            goal_header_age_at_receipt
+            if goal_received_ns is not None
+            else goal_age
+        )
+        freshness_error = _freshness_diagnosis(
+            "goal",
+            goal_header_age,
+            contract.max_goal_age,
+            contract.future_tolerance,
+        )
+        if freshness_error:
+            result["diagnosis"] = freshness_error
+            return result
+        if (
+            goal_retention_age is not None
+            and goal_retention_age > contract.goal_retention_timeout
+        ):
+            result["diagnosis"] = "goal_retention_expired"
+            return result
     if now_ns is not None:
         freshness_error = _freshness_diagnosis(
             "map", map_age, contract.max_map_age, contract.future_tolerance
@@ -1741,16 +1855,6 @@ def analyze_planner_inputs(
             else "start_ready_waiting_for_goal"
         )
         return result
-    if goal.frame_id != grid.frame_id:
-        result["diagnosis"] = "goal_frame_mismatch"
-        return result
-    if now_ns is not None:
-        freshness_error = _freshness_diagnosis(
-            "goal", goal_age, contract.max_goal_age, contract.future_tolerance
-        )
-        if freshness_error:
-            result["diagnosis"] = freshness_error
-            return result
     assert goal_result is not None
     if not goal_result["inside_map"]:
         result["diagnosis"] = "goal_outside_map"
@@ -1839,10 +1943,15 @@ def _capture_goal_stage(
     publisher_timeout: float,
     goal_timeout: float,
     wait_fn: WaitFunction,
+    monotonic_now_ns: Callable[[], int] = time.monotonic_ns,
 ) -> tuple[dict[str, object] | None, str | None]:
     received: dict[str, object] = {}
 
     def callback(message: object) -> None:
+        received["goal_received_ns"] = int(
+            node.get_clock().now().nanoseconds
+        )
+        received["goal_received_monotonic_ns"] = monotonic_now_ns()
         received[spec.key] = message
 
     subscription = node.create_subscription(
@@ -2046,6 +2155,9 @@ def collect_ros_inputs(
     Pose2D,
     Pose2D | None,
     int,
+    int | None,
+    int | None,
+    int,
     str | None,
     PlannerThresholds | None,
     PlannerFreshnessSettings | None,
@@ -2138,8 +2250,11 @@ def collect_ros_inputs(
         grid = _grid_snapshot(received["map"])
         start = _odom_pose(received["odom"])
         now_ns = int(node.get_clock().now().nanoseconds)
+        inspection_monotonic_ns = time.monotonic_ns()
 
         goal: Pose2D | None = None
+        goal_received_ns: int | None = None
+        goal_received_monotonic_ns: int | None = None
         if args.goal_x is not None:
             goal = Pose2D(
                 x=args.goal_x,
@@ -2148,13 +2263,22 @@ def collect_ros_inputs(
                 frame_id=args.goal_frame or grid.frame_id,
                 stamp_ns=now_ns,
             )
+            goal_received_ns = now_ns
+            goal_received_monotonic_ns = inspection_monotonic_ns
         elif "goal" in received:
             goal = _goal_pose(received["goal"])
+            goal_received_ns = int(received["goal_received_ns"])
+            goal_received_monotonic_ns = int(
+                received["goal_received_monotonic_ns"]
+            )
         return (
             grid,
             start,
             goal,
             now_ns,
+            goal_received_ns,
+            goal_received_monotonic_ns,
+            inspection_monotonic_ns,
             received.get("goal_capture_failure"),
             live_thresholds,
             live_freshness,
@@ -2395,7 +2519,11 @@ def print_human(result: dict[str, object]) -> None:
         "freshness: "
         f"map_age={_format_age(freshness['map_age_sec'])} "
         f"odom_age={_format_age(freshness['odom_age_sec'])} "
-        f"goal_age={_format_age(freshness['goal_age_sec'])}"
+        f"goal_age={_format_age(freshness['goal_age_sec'])} "
+        "goal_header_age_at_receipt="
+        f"{_format_age(freshness['goal_header_age_at_receipt_sec'])} "
+        "goal_retention_age="
+        f"{_format_age(freshness['goal_retention_age_sec'])}"
     )
     print(
         "timestamps: "
@@ -2454,6 +2582,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-map-age", type=float, default=1.0)
     parser.add_argument("--max-odom-age", type=float, default=0.5)
     parser.add_argument("--max-goal-age", type=float, default=2.0)
+    parser.add_argument("--goal-retention-timeout", type=float, default=30.0)
     parser.add_argument("--future-tolerance", type=float, default=0.2)
     parser.add_argument(
         "--json",
@@ -2480,6 +2609,7 @@ def parse_args() -> argparse.Namespace:
         "max_map_age",
         "max_odom_age",
         "max_goal_age",
+        "goal_retention_timeout",
         "future_tolerance",
     ):
         value = getattr(args, name)
@@ -2488,6 +2618,19 @@ def parse_args() -> argparse.Namespace:
         if not math.isfinite(value) or value < 0.0:
             option = name.replace("_", "-")
             parser.error(f"--{option} must be finite and non-negative")
+    for name, minimum, maximum in (
+        ("max_map_age", 0.001, 60.0),
+        ("max_odom_age", 0.001, 60.0),
+        ("max_goal_age", 0.001, 60.0),
+        ("goal_retention_timeout", 0.001, 3600.0),
+        ("future_tolerance", 0.0, 5.0),
+    ):
+        value = getattr(args, name)
+        if not minimum <= value <= maximum:
+            option = name.replace("_", "-")
+            parser.error(
+                f"--{option} must be in [{minimum}, {maximum}]"
+            )
     if args.min_observed_frames < 1:
         parser.error("--min-observed-frames must be positive")
     for name in (
@@ -2661,6 +2804,9 @@ def main() -> int:
             start,
             goal,
             now_ns,
+            goal_received_ns,
+            goal_received_monotonic_ns,
+            inspection_monotonic_ns,
             goal_capture_failure,
             live_thresholds,
             live_freshness,
@@ -2694,17 +2840,29 @@ def main() -> int:
                     if live_freshness is not None
                     else args.max_odom_age
                 ),
-                max_goal_age=args.max_goal_age,
+                max_goal_age=(
+                    live_freshness.max_goal_age
+                    if live_freshness is not None
+                    else args.max_goal_age
+                ),
                 future_tolerance=(
                     live_freshness.future_tolerance
                     if live_freshness is not None
                     else args.future_tolerance
+                ),
+                goal_retention_timeout=(
+                    live_freshness.goal_retention_timeout
+                    if live_freshness is not None
+                    else args.goal_retention_timeout
                 ),
             ),
             now_ns=now_ns,
             verified_flat_start=(
                 live_verified_flat_start or VerifiedFlatStartConfig()
             ),
+            goal_received_ns=goal_received_ns,
+            goal_received_monotonic_ns=goal_received_monotonic_ns,
+            inspection_monotonic_ns=inspection_monotonic_ns,
         )
         if live_freshness is not None:
             result["runtime_parameters"] = {

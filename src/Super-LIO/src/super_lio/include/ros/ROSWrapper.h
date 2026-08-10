@@ -13,6 +13,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/callback_group.hpp>
+#include <rclcpp/message_info.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
@@ -39,6 +40,7 @@
 #include "basic/logs.h"
 #include "basic/Manifold.h"
 #include "common/ds.h"
+#include "common/runtime_timing.h"
 
 #include "lio/ESKF.h"
 #include "OctVoxMap/OctVoxMap.hpp"
@@ -56,10 +58,15 @@ void livox2pcl(
 
 class ROSWrapper : public rclcpp::Node {
 public:
+  struct CloudPublishTiming {
+    double to_ros_ms = -1.0;
+    double publish_ms = -1.0;
+  };
+
   explicit ROSWrapper(const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
   ~ROSWrapper(){};
   using Ptr = std::shared_ptr<ROSWrapper>;
-  bool sync_measure(MeasureGroup&);
+  bool sync_measure(MeasureGroup&, RuntimeTimingSample&);
 
   void setESKF(ESKF::Ptr& eskf) { eskf_ = eskf;}
 
@@ -72,7 +79,7 @@ public:
   }
 
   void pub_odom(const NavState&);
-  void pub_cloud_world(const BASIC::CloudPtr& pc, double time);
+  CloudPublishTiming pub_cloud_world(const BASIC::CloudPtr& pc, double time);
   void pub_cloud2planner(const BASIC::CloudPtr& pc, double time);
   void pub_cloud_world_pose(const BASIC::CloudPtr& pc,
                             const NavState& state);
@@ -90,12 +97,41 @@ public:
     return cb_sensor_;
   }
 
+  RuntimeTimingSample takeRuntimeTimingSample();
+  void reportRuntimeTiming(
+    const RuntimeTimingSample& sample, std::int64_t steady_now_ns);
+
 private:
-  void imuHandler(const sensor_msgs::msg::Imu::SharedPtr msg);
+  struct InputCallbackTiming {
+    std::int64_t last_rmw_received_ns = 0;
+    std::int64_t last_callback_steady_ns = 0;
+    double rmw_gap_ms = -1.0;
+    double callback_gap_ms = -1.0;
+    double dispatch_delay_ms = -1.0;
+    double callback_ms = -1.0;
+    double source_stamp_sec = -1.0;
+  };
+
+  void imuHandler(
+    const sensor_msgs::msg::Imu::SharedPtr msg,
+    const rclcpp::MessageInfo& message_info);
 #ifdef SUPER_LIO_HAS_LIVOX
-  void livoxHandler(const livox_ros_driver2::msg::CustomMsg::SharedPtr msg);
+  void livoxHandler(
+    const livox_ros_driver2::msg::CustomMsg::SharedPtr msg,
+    const rclcpp::MessageInfo& message_info);
 #endif
-  void stdMsgHandler(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
+  void stdMsgHandler(
+    const sensor_msgs::msg::PointCloud2::SharedPtr msg,
+    const rclcpp::MessageInfo& message_info);
+
+  void beginInputCallback(
+    InputCallbackTiming& timing,
+    const rclcpp::MessageInfo& message_info,
+    std::int64_t callback_steady_ns);
+  void finishInputCallback(
+    InputCallbackTiming& timing, std::int64_t callback_steady_ns);
+  void setSyncWait(SyncWaitReason reason);
+  void populateSyncTiming(RuntimeTimingSample& sample) const;
 
   void setupParams();
   void setupIO();
@@ -113,6 +149,12 @@ private:
   bool lidar_pushed_ = false;
   double last_timestamp_imu_ = -1.0;
   double last_timestamp_lidar_ = -1.0;
+
+  InputCallbackTiming imu_callback_timing_;
+  InputCallbackTiming lidar_callback_timing_;
+  SyncWaitReason sync_wait_reason_ = SyncWaitReason::Ready;
+  std::int64_t sync_wait_start_ns_ = 0;
+  BoundedRuntimeTiming runtime_timing_;
 
   ESKF::Ptr eskf_{nullptr};
 
