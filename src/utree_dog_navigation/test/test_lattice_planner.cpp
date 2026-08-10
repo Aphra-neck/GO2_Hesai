@@ -123,6 +123,28 @@ utree_dog_msgs::msg::TerrainGrid::SharedPtr makeObservedToInferredReentryMap()
   return map;
 }
 
+utree_dog_msgs::msg::TerrainGrid::SharedPtr makeFlatObstacleMap(
+  float resolution, std::uint32_t width, std::uint32_t height)
+{
+  auto map = std::make_shared<utree_dog_msgs::msg::TerrainGrid>();
+  map->resolution = resolution;
+  map->width = width;
+  map->height = height;
+  map->origin_x = 0.0F;
+  map->origin_y = 0.0F;
+  map->unknown_value = -1000.0F;
+  map->traversability.assign(
+    static_cast<std::size_t>(width) * height, map->unknown_value);
+  return map;
+}
+
+void markFlatObstacle(
+  const utree_dog_msgs::msg::TerrainGrid::SharedPtr & map,
+  std::size_t x, std::size_t y)
+{
+  map->traversability[y * map->width + x] = 0.0F;
+}
+
 }  // namespace
 
 TEST(LatticePlanner, FindsPathAcrossFlatTraversableMap)
@@ -150,6 +172,151 @@ TEST(LatticePlanner, FindsPathAcrossFlatTraversableMap)
   ASSERT_FALSE(result.states.empty());
   EXPECT_EQ(result.states.front().x, 1);
   EXPECT_EQ(result.states.back().x, 6);
+}
+
+TEST(LatticePlanner, FlatObstacleModeTreatsUnknownAsFreeAndUsesFixedElevation)
+{
+  auto map = makeFlatObstacleMap(0.1F, 50, 30);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.flat_obstacle.surface_elevation = 0.42;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  ASSERT_TRUE(planner.mapValid());
+  const auto result = planner.plan({1.05, 1.05, 0.0}, {2.05, 1.05, 0.0});
+
+  ASSERT_TRUE(result.success);
+  ASSERT_FALSE(result.states.empty());
+  EXPECT_EQ(result.start_status, VerifiedFlatStartStatus::kNotNeeded);
+  EXPECT_TRUE(result.include_exact_start);
+  EXPECT_DOUBLE_EQ(result.exact_start_elevation, 0.42);
+  for (const auto & state : result.states) {
+    EXPECT_FALSE(state.inferred);
+    EXPECT_DOUBLE_EQ(state.elevation, 0.42);
+    EXPECT_DOUBLE_EQ(state.dzdx, 0.0);
+    EXPECT_DOUBLE_EQ(state.dzdy, 0.0);
+  }
+}
+
+TEST(LatticePlanner, FlatObstacleModeAppliesFootprintClearanceAtEndpoints)
+{
+  auto map = makeFlatObstacleMap(0.05F, 80, 80);
+  markFlatObstacle(map, 40, 47);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.start_snap_radius = 1.0;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({2.025, 2.025, 0.0}, {2.025, 2.025, 0.0});
+
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.expansions, 0);
+}
+
+TEST(LatticePlanner, FlatObstacleModeValidatesExactStartPoseBeforeGridCenter)
+{
+  auto map = makeFlatObstacleMap(1.0F, 6, 6);
+  markFlatObstacle(map, 0, 1);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.flat_obstacle.footprint_length = 0.02;
+  config.flat_obstacle.footprint_width = 0.02;
+  config.flat_obstacle.obstacle_clearance = 0.0;
+  config.start_snap_radius = 2.0;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({1.001, 1.5, 0.0}, {1.5, 1.5, 0.0});
+
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.expansions, 0);
+  EXPECT_FALSE(result.include_exact_start);
+}
+
+TEST(LatticePlanner, FlatObstacleModeChecksCompleteLongitudinalSweep)
+{
+  auto clear_map = makeFlatObstacleMap(0.1F, 50, 9);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.motion_step = 2.0;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.max_expansions = 100;
+  LatticePlanner clear_planner(config);
+  clear_planner.setMap(clear_map);
+  ASSERT_TRUE(clear_planner.plan({1.05, 0.45, 0.0}, {3.05, 0.45, 0.0}).success);
+
+  auto blocked_map = makeFlatObstacleMap(0.1F, 50, 9);
+  markFlatObstacle(blocked_map, 20, 4);
+  LatticePlanner blocked_planner(config);
+  blocked_planner.setMap(blocked_map);
+
+  EXPECT_FALSE(blocked_planner.plan({1.05, 0.45, 0.0}, {3.05, 0.45, 0.0}).success);
+}
+
+TEST(LatticePlanner, FlatObstacleModeChecksCompleteLateralSweep)
+{
+  auto clear_map = makeFlatObstacleMap(0.1F, 13, 50);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.motion_step = 2.0;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.max_expansions = 100;
+  LatticePlanner clear_planner(config);
+  clear_planner.setMap(clear_map);
+  ASSERT_TRUE(clear_planner.plan({0.65, 1.05, 0.0}, {0.65, 3.05, 0.0}).success);
+
+  auto blocked_map = makeFlatObstacleMap(0.1F, 13, 50);
+  markFlatObstacle(blocked_map, 6, 20);
+  LatticePlanner blocked_planner(config);
+  blocked_planner.setMap(blocked_map);
+
+  EXPECT_FALSE(blocked_planner.plan({0.65, 1.05, 0.0}, {0.65, 3.05, 0.0}).success);
+}
+
+TEST(LatticePlanner, FlatObstacleModeChecksIntermediateRotationFootprint)
+{
+  constexpr double kQuarterTurn = 0.7853981633974483;
+  auto clear_map = makeFlatObstacleMap(0.02F, 200, 200);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 8;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.max_expansions = 2;
+  LatticePlanner clear_planner(config);
+  clear_planner.setMap(clear_map);
+  ASSERT_TRUE(clear_planner.plan({2.01, 2.01, 0.0}, {2.01, 2.01, kQuarterTurn}).success);
+
+  auto blocked_map = makeFlatObstacleMap(0.02F, 200, 200);
+  markFlatObstacle(blocked_map, 117, 126);
+  LatticePlanner blocked_planner(config);
+  blocked_planner.setMap(blocked_map);
+
+  EXPECT_FALSE(
+    blocked_planner.plan({2.01, 2.01, 0.0}, {2.01, 2.01, kQuarterTurn}).success);
+}
+
+TEST(LatticePlanner, TerrainModeStillRejectsUnknownTerrainCells)
+{
+  auto map = makeSparseMap(0.2F);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kTerrain;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  EXPECT_FALSE(planner.plan({0.3, 0.3, 0.0}, {0.3, 0.3, 0.0}).success);
 }
 
 TEST(LatticePlanner, RejectsNonFiniteMapMetadataAndLayers)

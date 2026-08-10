@@ -4,8 +4,10 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "builtin_interfaces/msg/time.hpp"
+#include "nav_msgs/msg/grid_cells.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -29,10 +31,16 @@ private:
   void publishMap();
   nav_msgs::msg::OccupancyGrid makeCostmap(
     const utree_dog_msgs::msg::TerrainGrid & terrain) const;
+  nav_msgs::msg::GridCells makeFlatCells(
+    const std::vector<std::uint8_t> & mask,
+    const builtin_interfaces::msg::Time & stamp, double z_offset) const;
 
   std::string map_frame_;
+  std::string body_frame_{"base_link"};
   std::string cloud_topic_;
   std::string odom_topic_;
+  std::string planning_mode_{"terrain"};
+  bool flat_obstacle_mode_{false};
   double min_range_{0.35};
   double max_range_{12.0};
   double min_z_relative_{-1.5};
@@ -45,11 +53,15 @@ private:
   int min_observed_frames_{4};
   double publish_rate_{2.0};
   double cloud_stale_warning_age_{1.0};
+  double flat_nominal_body_height_{0.42};
+  double flat_max_odom_age_{0.5};
+  double flat_ground_z_{0.0};
   double robot_x_{0.0};
   double robot_y_{0.0};
   double robot_z_{0.0};
   double robot_yaw_{0.0};
   bool have_odom_{false};
+  bool flat_ground_locked_{false};
   bool have_cloud_interval_{false};
   bool last_published_start_feature_ready_{false};
   bool confidence_rebuild_active_{false};
@@ -61,10 +73,13 @@ private:
   std::chrono::steady_clock::time_point last_cloud_received_{};
   builtin_interfaces::msg::Time last_cloud_stamp_;
   std::unique_ptr<TerrainMapBuilder> map_builder_;
+  std::unique_ptr<FlatObstacleMapBuilder> flat_map_builder_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<utree_dog_msgs::msg::TerrainGrid>::SharedPtr terrain_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr cost_pub_;
+  rclcpp::Publisher<nav_msgs::msg::GridCells>::SharedPtr flat_raw_pub_;
+  rclcpp::Publisher<nav_msgs::msg::GridCells>::SharedPtr flat_inflated_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

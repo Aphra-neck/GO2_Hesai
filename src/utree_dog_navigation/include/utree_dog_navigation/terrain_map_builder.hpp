@@ -38,6 +38,14 @@ struct TerrainPoint
   double z{0.0};
 };
 
+struct FlatObstacleLayerConfig
+{
+  double min_height{0.08};
+  double max_height{0.80};
+  double clear_after{1.0};
+  double clearance{0.10};
+};
+
 // Accumulates world-frame points and derives the terrain layers used by planning.
 // This class deliberately has no ROS subscriptions so the filter can be unit tested.
 class TerrainMapBuilder
@@ -89,6 +97,45 @@ private:
   std::size_t height_{0};
   std::vector<CellHistory> cells_;
   double latest_stamp_seconds_{0.0};
+};
+
+// Maintains a flat-floor obstacle layer independently of terrain confidence.
+// Every in-band return marks its cell immediately. A marked cell is cleared only
+// after a continuous interval of fresh, ground-like endpoints in that same cell.
+class FlatObstacleMapBuilder
+{
+public:
+  FlatObstacleMapBuilder(
+    TerrainMapConfig map_config, FlatObstacleLayerConfig obstacle_config);
+
+  std::size_t integrateFrame(
+    const std::vector<TerrainPoint> & points, double stamp_seconds,
+    double ground_z, bool accumulate_misses);
+  utree_dog_msgs::msg::TerrainGrid build(
+    const builtin_interfaces::msg::Time & stamp, const std::string & frame_id,
+    double ground_z) const;
+
+  std::vector<std::uint8_t> rawObstacleMask() const;
+  // This is the static extra-clearance layer for RViz. The yaw-dependent robot
+  // footprint and full primitive sweep remain planner collision checks.
+  std::vector<std::uint8_t> inflatedObstacleMask() const;
+  std::size_t width() const noexcept;
+  std::size_t height() const noexcept;
+  const TerrainMapConfig & mapConfig() const noexcept;
+  const FlatObstacleLayerConfig & obstacleConfig() const noexcept;
+
+private:
+  bool toGrid(double x, double y, std::size_t & gx, std::size_t & gy) const;
+  std::size_t address(std::size_t x, std::size_t y) const noexcept;
+
+  TerrainMapConfig map_config_;
+  FlatObstacleLayerConfig obstacle_config_;
+  std::size_t width_{0};
+  std::size_t height_{0};
+  std::vector<std::uint8_t> occupied_;
+  std::vector<double> miss_duration_;
+  double latest_stamp_seconds_{0.0};
+  bool have_stamp_{false};
 };
 
 }  // namespace utree_dog_navigation

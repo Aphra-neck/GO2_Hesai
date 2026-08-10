@@ -17,7 +17,8 @@ mkdir -p -- \
   "${fake_bin}" \
   "${workspace}/shell" \
   "${workspace}/tools" \
-  "${workspace}/src/utree_dog_navigation/config"
+  "${workspace}/src/utree_dog_navigation/config" \
+  "${workspace}/src/utree_dog_navigation/rviz"
 
 cp -- "${REPO_ROOT}/shell/start_navigation.sh" \
   "${workspace}/shell/start_navigation.sh"
@@ -79,6 +80,9 @@ body_lattice_planner:
   ros__parameters: {}
 YAML
 
+: > "${workspace}/src/utree_dog_navigation/rviz/hesai_navigation.rviz"
+: > "${workspace}/src/utree_dog_navigation/rviz/flat_obstacle_navigation.rviz"
+
 common_environment=(
   FAKE_BIN="${fake_bin}"
   FAKE_ROS2_TRACE="${trace_file}"
@@ -88,11 +92,45 @@ common_environment=(
 
 : > "${trace_file}"
 default_output="$(
-  env -u GO2_VERIFIED_FLAT_START "${common_environment[@]}" \
+  env -u GO2_VERIFIED_FLAT_START -u GO2_PLANNING_MODE \
+    -u GO2_FLAT_GROUND_CONFIRMED "${common_environment[@]}" \
     "${workspace}/shell/start_navigation.sh"
 )"
 grep -Fq ' Verified flat start: false' <<< "${default_output}"
+grep -Fq ' Planning mode: terrain' <<< "${default_output}"
+grep -Fq ' Flat ground confirmed: false' <<< "${default_output}"
 grep -Fq 'verified_flat_start:=false' "${trace_file}"
+grep -Fq 'planning_mode:=terrain' "${trace_file}"
+grep -Fq 'flat_ground_confirmed:=false' "${trace_file}"
+grep -Fq 'rviz_config:='"${workspace}"'/src/utree_dog_navigation/rviz/hesai_navigation.rviz' \
+  "${trace_file}"
+
+: > "${trace_file}"
+set +e
+unconfirmed_output="$(
+  env "${common_environment[@]}" GO2_PLANNING_MODE=flat_obstacle \
+    "${workspace}/shell/start_navigation.sh" 2>&1
+)"
+unconfirmed_status=$?
+set -e
+test "${unconfirmed_status}" -ne 0
+[[ "${unconfirmed_output}" == \
+  *"requires the robot to be standing and stationary before startup"* ]]
+test ! -s "${trace_file}"
+
+: > "${trace_file}"
+flat_output="$(
+  env "${common_environment[@]}" GO2_PLANNING_MODE=flat_obstacle \
+    GO2_FLAT_GROUND_CONFIRMED=true \
+    "${workspace}/shell/start_navigation.sh"
+)"
+grep -Fq ' Planning mode: flat_obstacle' <<< "${flat_output}"
+grep -Fq ' Flat ground confirmed: true' <<< "${flat_output}"
+grep -Fq ' Robot posture: STANDING and stationary required' <<< "${flat_output}"
+grep -Fq 'planning_mode:=flat_obstacle' "${trace_file}"
+grep -Fq 'flat_ground_confirmed:=true' "${trace_file}"
+grep -Fq 'rviz_config:='"${workspace}"'/src/utree_dog_navigation/rviz/flat_obstacle_navigation.rviz' \
+  "${trace_file}"
 
 : > "${trace_file}"
 enabled_output="$(
@@ -117,4 +155,34 @@ for invalid in TRUE False 1 yes; do
   test ! -s "${trace_file}"
 done
 
-echo "PASS: navigation startup strictly validates and forwards verified-flat-start"
+for invalid in flat FLAT_OBSTACLE 2d; do
+  : > "${trace_file}"
+  set +e
+  invalid_output="$(
+    env "${common_environment[@]}" GO2_PLANNING_MODE="${invalid}" \
+      "${workspace}/shell/start_navigation.sh" 2>&1
+  )"
+  invalid_status=$?
+  set -e
+  test "${invalid_status}" -ne 0
+  [[ "${invalid_output}" == \
+    *"GO2_PLANNING_MODE must be terrain or flat_obstacle, got: ${invalid}"* ]]
+  test ! -s "${trace_file}"
+done
+
+for invalid in TRUE False 1 yes; do
+  : > "${trace_file}"
+  set +e
+  invalid_output="$(
+    env "${common_environment[@]}" GO2_FLAT_GROUND_CONFIRMED="${invalid}" \
+      "${workspace}/shell/start_navigation.sh" 2>&1
+  )"
+  invalid_status=$?
+  set -e
+  test "${invalid_status}" -ne 0
+  [[ "${invalid_output}" == \
+    *"GO2_FLAT_GROUND_CONFIRMED must be true or false, got: ${invalid}"* ]]
+  test ! -s "${trace_file}"
+done
+
+echo "PASS: navigation startup validates and forwards planning mode and confirmations"

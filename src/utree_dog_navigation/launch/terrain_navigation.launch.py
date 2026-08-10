@@ -27,6 +27,8 @@ def generate_launch_description():
     rviz_config = LaunchConfiguration("rviz_config")
     body_yaw_offset = LaunchConfiguration("body_yaw_offset")
     body_frame = LaunchConfiguration("body_frame")
+    planning_mode = LaunchConfiguration("planning_mode")
+    flat_ground_confirmed = LaunchConfiguration("flat_ground_confirmed")
     verified_flat_start = LaunchConfiguration("verified_flat_start")
 
     body_odom_adapter = Node(
@@ -68,6 +70,8 @@ def generate_launch_description():
                 default_value="-1.5707963267948966",
             ),
             DeclareLaunchArgument("body_frame", default_value="base_link"),
+            DeclareLaunchArgument("planning_mode", default_value="terrain"),
+            DeclareLaunchArgument("flat_ground_confirmed", default_value="false"),
             DeclareLaunchArgument(
                 "verified_flat_start",
                 default_value="false",
@@ -114,7 +118,17 @@ def generate_launch_description():
                 executable="terrain_mapper_node",
                 name="terrain_mapper",
                 output="screen",
-                parameters=[config],
+                parameters=[
+                    config,
+                    {
+                        "planning_mode": planning_mode,
+                        "body_frame": body_frame,
+                        "flat_ground_confirmed": ParameterValue(
+                            flat_ground_confirmed,
+                            value_type=bool,
+                        ),
+                    },
+                ],
             ),
             Node(
                 package="utree_dog_navigation",
@@ -124,6 +138,12 @@ def generate_launch_description():
                 parameters=[
                     config,
                     {
+                        "planning_mode": planning_mode,
+                        "body_frame": body_frame,
+                        "flat_ground_confirmed": ParameterValue(
+                            flat_ground_confirmed,
+                            value_type=bool,
+                        ),
                         "verified_flat_start.enabled": ParameterValue(
                             verified_flat_start,
                             value_type=bool,

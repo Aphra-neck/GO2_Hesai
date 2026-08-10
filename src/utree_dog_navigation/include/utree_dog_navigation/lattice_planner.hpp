@@ -31,6 +31,21 @@ struct VerifiedFlatStartConfig
   double inferred_traversability{0.20};
 };
 
+enum class PlanningMode : std::uint8_t
+{
+  kTerrain,
+  kFlatObstacle,
+};
+
+struct FlatObstacleConfig
+{
+  double footprint_length{0.90};
+  double footprint_width{0.55};
+  double obstacle_clearance{0.10};
+  // Surface elevation used by PlannedGridState. The node may instead lock body Z directly.
+  double surface_elevation{0.0};
+};
+
 struct LatticePlannerConfig
 {
   int yaw_bins{16};
@@ -50,6 +65,8 @@ struct LatticePlannerConfig
   // A negative value preserves the legacy contract: use snap_radius for both endpoints.
   double start_snap_radius{-1.0};
   VerifiedFlatStartConfig verified_flat_start{};
+  PlanningMode planning_mode{PlanningMode::kTerrain};
+  FlatObstacleConfig flat_obstacle{};
 };
 
 struct GridState
@@ -99,6 +116,7 @@ struct PlanningResult
   bool success{false};
   int expansions{0};
   VerifiedFlatStartStatus start_status{VerifiedFlatStartStatus::kNotNeeded};
+  bool include_exact_start{false};
   bool exact_start_inferred{false};
   double exact_start_elevation{0.0};
   double exact_start_dzdx{0.0};
@@ -159,6 +177,12 @@ private:
     bool inferred{false};
   };
 
+  struct Point2D
+  {
+    double x{0.0};
+    double y{0.0};
+  };
+
   std::array<Motion, 10> motions() const;
   bool toGrid(double x, double y, int & gx, int & gy) const;
   bool inside(int x, int y) const;
@@ -167,6 +191,22 @@ private:
   SearchState decode(std::uint64_t value) const;
   int yawBin(double yaw) const;
   bool observedValidCell(int x, int y) const;
+  bool flatObstacleCell(int x, int y) const;
+  bool flatPoseCollisionFree(int x, int y, int yaw, double padding = 0.0) const;
+  bool flatWorldPoseCollisionFree(
+    double world_x, double world_y, double yaw, double padding = 0.0) const;
+  bool flatTransitionCollisionFree(
+    const GridState & current, const GridState & next) const;
+  bool flatTranslationCollisionFree(
+    double start_x, double start_y, double end_x, double end_y, double yaw) const;
+  bool flatRotationCollisionFree(
+    double world_x, double world_y, double start_yaw, double end_yaw) const;
+  bool flatPoseSweepCollisionFree(
+    double start_x, double start_y, double start_yaw,
+    double end_x, double end_y, double end_yaw) const;
+  bool flatPolygonCollisionFree(const std::vector<Point2D> & polygon) const;
+  bool nearestFlatValid(
+    double world_x, double world_y, double snap_radius, int yaw, int & x, int & y) const;
   bool nearestObservedValid(
     double world_x, double world_y, double snap_radius, int & x, int & y) const;
   bool verifiedFlatConfigurationValid() const;

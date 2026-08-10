@@ -57,7 +57,7 @@ target_include_directories(terrain_mapper_node_lib PUBLIC
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(terrain_mapper_node_lib terrain_mapping_core)
 ament_target_dependencies(terrain_mapper_node_lib
-  builtin_interfaces nav_msgs rclcpp sensor_msgs utree_dog_msgs)
+  builtin_interfaces geometry_msgs nav_msgs rclcpp sensor_msgs utree_dog_msgs)
 
 add_executable(terrain_mapper_node
   src/terrain_mapper_main.cpp)
@@ -115,7 +115,7 @@ if(BUILD_TESTING)
   ament_add_gtest(test_terrain_mapper_node test/test_terrain_mapper_node.cpp)
   target_link_libraries(test_terrain_mapper_node terrain_mapper_node_lib)
   ament_target_dependencies(test_terrain_mapper_node
-    builtin_interfaces nav_msgs rclcpp sensor_msgs utree_dog_msgs)
+    builtin_interfaces geometry_msgs nav_msgs rclcpp sensor_msgs utree_dog_msgs)
 
   ament_add_gtest(test_lattice_planner test/test_lattice_planner.cpp)
   target_link_libraries(test_lattice_planner body_planning_core)

@@ -45,6 +45,20 @@ bool validRosTimestamp(const builtin_interfaces::msg::Time & stamp) noexcept
 BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & options)
 : Node("body_lattice_planner", options)
 {
+  const std::string planning_mode = declare_parameter("planning_mode", "terrain");
+  flat_ground_confirmed_ = declare_parameter("flat_ground_confirmed", false);
+  if (planning_mode == "terrain") {
+    planning_mode_ = PlanningMode::kTerrain;
+  } else if (planning_mode == "flat_obstacle") {
+    planning_mode_ = PlanningMode::kFlatObstacle;
+  } else {
+    throw std::invalid_argument("planning_mode must be 'terrain' or 'flat_obstacle'");
+  }
+  if (planning_mode_ == PlanningMode::kFlatObstacle && !flat_ground_confirmed_) {
+    throw std::invalid_argument(
+            "flat_obstacle mode requires a standing, stationary robot and "
+            "flat_ground_confirmed=true");
+  }
   map_topic_ = declare_parameter("terrain_map_topic", "terrain_map");
   odom_topic_ = declare_parameter("odom_topic", "/lio/body_odom");
   goal_topic_ = declare_parameter("goal_topic", "/goal_pose");
@@ -95,6 +109,7 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
             "input watchdog period must not exceed map, odometry, or goal retention budget");
   }
   LatticePlannerConfig config;
+  config.planning_mode = planning_mode_;
   config.yaw_bins = declare_parameter("yaw_bins", 16);
   config.motion_step = declare_parameter("motion_step", 0.20);
   config.min_traversability = declare_parameter("min_traversability", 0.18);
@@ -110,6 +125,12 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
   config.max_expansions = declare_parameter("max_expansions", 250000);
   config.snap_radius = declare_parameter("snap_radius", 0.5);
   config.start_snap_radius = declare_parameter("start_snap_radius", config.snap_radius);
+  config.flat_obstacle.footprint_length =
+    declare_parameter("flat_obstacle.footprint_length", 0.90);
+  config.flat_obstacle.footprint_width =
+    declare_parameter("flat_obstacle.footprint_width", 0.55);
+  config.flat_obstacle.obstacle_clearance =
+    declare_parameter("flat_obstacle.obstacle_clearance", 0.10);
   config.verified_flat_start.enabled =
     declare_parameter("verified_flat_start.enabled", false);
   config.verified_flat_start.support_inner_radius =
@@ -198,10 +219,25 @@ void BodyLatticePlannerNode::odomCallback(const nav_msgs::msg::Odometry::SharedP
     clearPath("body odometry pose is malformed");
     return;
   }
-  if (path_active_ && !stampFresh(
-      odom_->header.stamp, now(), max_odom_age_, "body odometry"))
-  {
-    clearPath("body odometry timestamp became stale or invalid");
+  const bool odom_stamp_fresh =
+    planning_mode_ == PlanningMode::kFlatObstacle || path_active_ ?
+    stampFresh(odom_->header.stamp, now(), max_odom_age_, "body odometry") : true;
+  if (planning_mode_ == PlanningMode::kFlatObstacle && !odom_stamp_fresh) {
+    if (path_active_) {
+      clearForStaleInput("body odometry timestamp became stale or invalid");
+    }
+    return;
+  }
+  if (planning_mode_ == PlanningMode::kFlatObstacle && !flat_body_height_locked_) {
+    flat_body_height_z_ = odom_->pose.pose.position.z;
+    flat_body_height_locked_ = true;
+    RCLCPP_INFO(
+      get_logger(),
+      "Locked flat-obstacle body path height at world z=%.3f m for this run",
+      flat_body_height_z_);
+  }
+  if (path_active_ && !odom_stamp_fresh) {
+    clearForStaleInput("body odometry timestamp became stale or invalid");
   }
 }
 
@@ -253,7 +289,11 @@ void BodyLatticePlannerNode::requestPlan()
   const auto & map = planner_->map();
   const rclcpp::Time current_time = now();
   if (!inputsFresh(current_time)) {
-    clearPath("stale or invalid map/odometry timestamp");
+    clearForStaleInput("stale or invalid map/odometry timestamp");
+    return;
+  }
+  if (planning_mode_ == PlanningMode::kFlatObstacle && !flat_body_height_locked_) {
+    clearPath("flat-obstacle body height is not locked yet");
     return;
   }
   const WorldState start{
@@ -266,7 +306,7 @@ void BodyLatticePlannerNode::requestPlan()
   const rclcpp::Time completion_time = now();
   if (expireGoalIfNeeded()) {return;}
   if (!framesValid() || !posesValid() || !inputsFresh(completion_time)) {
-    clearPath("planning inputs became stale or invalid during search");
+    clearForStaleInput("planning inputs became stale or invalid during search");
     return;
   }
   if (!result.success) {
@@ -285,7 +325,7 @@ void BodyLatticePlannerNode::requestPlan()
   const rclcpp::Time publish_time = now();
   if (expireGoalIfNeeded()) {return;}
   if (!framesValid() || !posesValid() || !inputsFresh(publish_time)) {
-    clearPath("planning inputs became stale or invalid before path publication");
+    clearForStaleInput("planning inputs became stale or invalid before path publication");
     return;
   }
   path_pub_->publish(path);
@@ -305,11 +345,19 @@ void BodyLatticePlannerNode::requestPlan()
 void BodyLatticePlannerNode::watchdogTick()
 {
   if (expireGoalIfNeeded()) {return;}
+  if (planning_mode_ == PlanningMode::kFlatObstacle && have_goal_ &&
+    planner_->hasMap() && have_odom_)
+  {
+    if (!framesValid() || !posesValid() || !inputsFresh(now())) {
+      clearGoal("flat-obstacle planning inputs stopped or became stale");
+    }
+    return;
+  }
   if (!path_active_) {return;}
   if (!planner_->hasMap() || !have_odom_ || !have_goal_ ||
     !framesValid() || !posesValid() || !inputsFresh(now()))
   {
-    clearPath("planning inputs stopped or became stale");
+    clearForStaleInput("planning inputs stopped or became stale");
   }
 }
 
@@ -408,6 +456,15 @@ void BodyLatticePlannerNode::clearPath(const char * reason)
   RCLCPP_WARN(get_logger(), "Cleared body path: %s", reason);
 }
 
+void BodyLatticePlannerNode::clearForStaleInput(const char * reason)
+{
+  if (planning_mode_ == PlanningMode::kFlatObstacle) {
+    clearGoal(reason);
+  } else {
+    clearPath(reason);
+  }
+}
+
 void BodyLatticePlannerNode::clearGoal(const char * reason)
 {
   clearPath(reason);
@@ -424,32 +481,44 @@ nav_msgs::msg::Path BodyLatticePlannerNode::makePath(
   nav_msgs::msg::Path path;
   path.header.stamp = source_stamp;
   path.header.frame_id = map.header.frame_id;
-  path.poses.reserve(result.states.size() + static_cast<std::size_t>(result.exact_start_inferred));
+  const bool include_exact_start = result.include_exact_start || result.exact_start_inferred;
+  path.poses.reserve(result.states.size() + static_cast<std::size_t>(include_exact_start));
   const auto append_pose = [&path, this](
       double x, double y, double elevation, double dzdx, double dzdy, double yaw)
     {
     tf2::Quaternion orientation;
-    orientation.setRPY(
-      std::atan2(dzdy, std::sqrt(1.0 + dzdx * dzdx)),
-      -std::atan2(dzdx, 1.0), yaw);
+    if (planning_mode_ == PlanningMode::kFlatObstacle) {
+      orientation.setRPY(0.0, 0.0, yaw);
+    } else {
+      orientation.setRPY(
+        std::atan2(dzdy, std::sqrt(1.0 + dzdx * dzdx)),
+        -std::atan2(dzdx, 1.0), yaw);
+    }
     geometry_msgs::msg::PoseStamped pose;
     pose.header = path.header;
     pose.pose.position.x = x;
     pose.pose.position.y = y;
-    pose.pose.position.z = elevation + nominal_body_height_;
+    pose.pose.position.z = planning_mode_ == PlanningMode::kFlatObstacle ?
+      flat_body_height_z_ : elevation + nominal_body_height_;
     pose.pose.orientation = tf2::toMsg(orientation);
     path.poses.push_back(pose);
     };
 
   std::size_t first_grid_state = 0U;
-  if (result.exact_start_inferred) {
+  if (include_exact_start) {
     append_pose(
       exact_start.x, exact_start.y, result.exact_start_elevation,
       result.exact_start_dzdx, result.exact_start_dzdy, exact_start.yaw);
     if (!result.states.empty()) {
       const double first_x = map.origin_x + (result.states.front().x + 0.5) * map.resolution;
       const double first_y = map.origin_y + (result.states.front().y + 0.5) * map.resolution;
-      if (std::hypot(first_x - exact_start.x, first_y - exact_start.y) <= 1.0e-6) {
+      const double first_yaw = planner_->yawAngle(result.states.front().yaw);
+      const double yaw_difference = std::atan2(
+        std::sin(first_yaw - exact_start.yaw),
+        std::cos(first_yaw - exact_start.yaw));
+      if (std::hypot(first_x - exact_start.x, first_y - exact_start.y) <= 1.0e-6 &&
+        std::abs(yaw_difference) <= 1.0e-6)
+      {
         first_grid_state = 1U;
       }
     }

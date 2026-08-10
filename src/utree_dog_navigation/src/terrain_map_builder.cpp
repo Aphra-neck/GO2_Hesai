@@ -2,8 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
-#include <utility>
+#include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 namespace utree_dog_navigation
 {
@@ -260,6 +261,205 @@ void TerrainMapBuilder::computeTerrainFeatures(
       traversability[i] = static_cast<float>(slope_score * roughness_score);
     }
   }
+}
+
+FlatObstacleMapBuilder::FlatObstacleMapBuilder(
+  TerrainMapConfig map_config, FlatObstacleLayerConfig obstacle_config)
+: map_config_(std::move(map_config)),
+  obstacle_config_(std::move(obstacle_config))
+{
+  if (!std::isfinite(map_config_.resolution) || map_config_.resolution <= 0.0 ||
+    !std::isfinite(map_config_.size_x) || map_config_.size_x <= 0.0 ||
+    !std::isfinite(map_config_.size_y) || map_config_.size_y <= 0.0 ||
+    !std::isfinite(map_config_.origin_x) || !std::isfinite(map_config_.origin_y))
+  {
+    throw std::invalid_argument("flat obstacle map geometry is invalid");
+  }
+  if (!std::isfinite(obstacle_config_.min_height) || obstacle_config_.min_height < 0.0 ||
+    !std::isfinite(obstacle_config_.max_height) ||
+    obstacle_config_.max_height <= obstacle_config_.min_height ||
+    !std::isfinite(obstacle_config_.clear_after) || obstacle_config_.clear_after <= 0.0 ||
+    !std::isfinite(obstacle_config_.clearance) || obstacle_config_.clearance < 0.0)
+  {
+    throw std::invalid_argument("flat obstacle configuration is invalid");
+  }
+
+  width_ = static_cast<std::size_t>(std::ceil(map_config_.size_x / map_config_.resolution));
+  height_ = static_cast<std::size_t>(std::ceil(map_config_.size_y / map_config_.resolution));
+  occupied_.assign(width_ * height_, 0U);
+  miss_duration_.assign(width_ * height_, 0.0);
+}
+
+std::size_t FlatObstacleMapBuilder::integrateFrame(
+  const std::vector<TerrainPoint> & points, double stamp_seconds,
+  double ground_z, bool accumulate_misses)
+{
+  if (!std::isfinite(stamp_seconds) || !std::isfinite(ground_z)) {
+    return 0U;
+  }
+
+  std::vector<std::uint8_t> hits(occupied_.size(), 0U);
+  std::vector<std::uint8_t> free_endpoints(occupied_.size(), 0U);
+  std::size_t hit_cell_count = 0U;
+  for (const auto & point : points) {
+    const double height = point.z - ground_z;
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(height)) {
+      continue;
+    }
+    std::size_t gx = 0U;
+    std::size_t gy = 0U;
+    if (!toGrid(point.x, point.y, gx, gy)) {
+      continue;
+    }
+    const std::size_t index = address(gx, gy);
+    if (height >= obstacle_config_.min_height &&
+      height <= obstacle_config_.max_height)
+    {
+      if (hits[index] == 0U) {
+        hits[index] = 1U;
+        ++hit_cell_count;
+      }
+    } else if (std::abs(height) <= obstacle_config_.min_height) {
+      // Endpoint-only clearing is deliberately conservative for a 3D LiDAR: a
+      // high beam crossing a 2D cell is not evidence that a low obstacle is gone.
+      free_endpoints[index] = 1U;
+    }
+  }
+
+  const double frame_delta = have_stamp_ ? stamp_seconds - latest_stamp_seconds_ : 0.0;
+  const bool count_misses =
+    accumulate_misses && std::isfinite(frame_delta) && frame_delta > 0.0;
+  for (std::size_t index = 0; index < occupied_.size(); ++index) {
+    if (hits[index] != 0U) {
+      occupied_[index] = 1U;
+      miss_duration_[index] = 0.0;
+    } else if (occupied_[index] != 0U) {
+      if (count_misses && free_endpoints[index] != 0U) {
+        miss_duration_[index] += frame_delta;
+        if (miss_duration_[index] >= obstacle_config_.clear_after) {
+          occupied_[index] = 0U;
+          miss_duration_[index] = 0.0;
+        }
+      } else {
+        // Unobserved, occluded, high-beam, and stale intervals break the
+        // continuous evidence window and therefore cannot clear an obstacle.
+        miss_duration_[index] = 0.0;
+      }
+    }
+  }
+
+  latest_stamp_seconds_ = stamp_seconds;
+  have_stamp_ = true;
+  return hit_cell_count;
+}
+
+utree_dog_msgs::msg::TerrainGrid FlatObstacleMapBuilder::build(
+  const builtin_interfaces::msg::Time & stamp, const std::string & frame_id,
+  double ground_z) const
+{
+  const std::size_t cell_count = width_ * height_;
+  utree_dog_msgs::msg::TerrainGrid result;
+  result.header.stamp = stamp;
+  result.header.frame_id = frame_id;
+  result.resolution = map_config_.resolution;
+  result.width = static_cast<std::uint32_t>(width_);
+  result.height = static_cast<std::uint32_t>(height_);
+  result.origin_x = map_config_.origin_x;
+  result.origin_y = map_config_.origin_y;
+  result.unknown_value = TerrainMapBuilder::kUnknown;
+  result.elevation.assign(cell_count, static_cast<float>(ground_z));
+  result.variance.assign(cell_count, 0.0F);
+  result.slope.assign(cell_count, 0.0F);
+  result.roughness.assign(cell_count, 0.0F);
+  result.traversability.assign(cell_count, 1.0F);
+  result.observation_count.assign(cell_count, 1U);
+  result.confidence.assign(cell_count, 1.0F);
+  result.age.assign(cell_count, 0.0F);
+  for (std::size_t index = 0; index < cell_count; ++index) {
+    if (occupied_[index] != 0U) {
+      result.traversability[index] = 0.0F;
+    }
+  }
+  return result;
+}
+
+std::vector<std::uint8_t> FlatObstacleMapBuilder::rawObstacleMask() const
+{
+  return occupied_;
+}
+
+std::vector<std::uint8_t> FlatObstacleMapBuilder::inflatedObstacleMask() const
+{
+  std::vector<std::uint8_t> inflated = occupied_;
+  if (obstacle_config_.clearance <= 0.0) {
+    return inflated;
+  }
+
+  // Grid cells represent areas, not mathematical points. Include a neighboring
+  // cell when the minimum distance between the two cell areas is within clearance.
+  const int maximum_offset =
+    static_cast<int>(std::ceil(obstacle_config_.clearance / map_config_.resolution)) + 1;
+  constexpr double kDistanceEpsilon = 1.0e-12;
+  for (std::size_t y = 0; y < height_; ++y) {
+    for (std::size_t x = 0; x < width_; ++x) {
+      if (occupied_[address(x, y)] == 0U) {
+        continue;
+      }
+      for (int dy = -maximum_offset; dy <= maximum_offset; ++dy) {
+        for (int dx = -maximum_offset; dx <= maximum_offset; ++dx) {
+          const int candidate_x = static_cast<int>(x) + dx;
+          const int candidate_y = static_cast<int>(y) + dy;
+          if (candidate_x < 0 || candidate_y < 0 ||
+            candidate_x >= static_cast<int>(width_) ||
+            candidate_y >= static_cast<int>(height_))
+          {
+            continue;
+          }
+          const double gap_x =
+            std::max(0, std::abs(dx) - 1) * map_config_.resolution;
+          const double gap_y =
+            std::max(0, std::abs(dy) - 1) * map_config_.resolution;
+          if (std::hypot(gap_x, gap_y) <= obstacle_config_.clearance + kDistanceEpsilon) {
+            inflated[address(
+                static_cast<std::size_t>(candidate_x),
+                static_cast<std::size_t>(candidate_y))] = 1U;
+          }
+        }
+      }
+    }
+  }
+  return inflated;
+}
+
+std::size_t FlatObstacleMapBuilder::width() const noexcept {return width_;}
+std::size_t FlatObstacleMapBuilder::height() const noexcept {return height_;}
+const TerrainMapConfig & FlatObstacleMapBuilder::mapConfig() const noexcept
+{
+  return map_config_;
+}
+const FlatObstacleLayerConfig & FlatObstacleMapBuilder::obstacleConfig() const noexcept
+{
+  return obstacle_config_;
+}
+
+bool FlatObstacleMapBuilder::toGrid(
+  double x, double y, std::size_t & gx, std::size_t & gy) const
+{
+  const int ix = static_cast<int>(
+    std::floor((x - map_config_.origin_x) / map_config_.resolution));
+  const int iy = static_cast<int>(
+    std::floor((y - map_config_.origin_y) / map_config_.resolution));
+  if (ix < 0 || iy < 0 || ix >= static_cast<int>(width_) || iy >= static_cast<int>(height_)) {
+    return false;
+  }
+  gx = static_cast<std::size_t>(ix);
+  gy = static_cast<std::size_t>(iy);
+  return true;
+}
+
+std::size_t FlatObstacleMapBuilder::address(std::size_t x, std::size_t y) const noexcept
+{
+  return y * width_ + x;
 }
 
 }  // namespace utree_dog_navigation

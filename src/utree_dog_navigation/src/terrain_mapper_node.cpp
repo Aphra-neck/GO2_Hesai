@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 
+#include "geometry_msgs/msg/point.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 
 namespace utree_dog_navigation
@@ -27,8 +28,19 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
 : Node("terrain_mapper", options)
 {
   map_frame_ = declare_parameter("map_frame", "world");
+  body_frame_ = declare_parameter("body_frame", "base_link");
   cloud_topic_ = declare_parameter("cloud_topic", "/lio/cloud_world");
   odom_topic_ = declare_parameter("odom_topic", "/lio/body_odom");
+  planning_mode_ = declare_parameter("planning_mode", "terrain");
+  const bool flat_ground_confirmed = declare_parameter("flat_ground_confirmed", false);
+  if (planning_mode_ != "terrain" && planning_mode_ != "flat_obstacle") {
+    throw std::invalid_argument("planning_mode must be 'terrain' or 'flat_obstacle'");
+  }
+  flat_obstacle_mode_ = planning_mode_ == "flat_obstacle";
+  if (flat_obstacle_mode_ && !flat_ground_confirmed) {
+    throw std::invalid_argument(
+            "flat_obstacle mode requires flat_ground_confirmed=true after the robot is standing");
+  }
   TerrainMapConfig config;
   config.resolution = declare_parameter("resolution", 0.20);
   config.size_x = declare_parameter("size_x", 40.0);
@@ -77,11 +89,40 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
     throw std::invalid_argument(
             "cloud_stale_warning_age must be finite and in [0.001, 60] seconds");
   }
-  map_builder_ = std::make_unique<TerrainMapBuilder>(config);
+  FlatObstacleLayerConfig flat_config;
+  flat_config.min_height = declare_parameter("flat_obstacle.min_height", 0.08);
+  flat_config.max_height = declare_parameter("flat_obstacle.max_height", 0.80);
+  flat_config.clear_after = declare_parameter("flat_obstacle.clear_after", 1.0);
+  flat_config.clearance = declare_parameter("flat_obstacle.obstacle_clearance", 0.10);
+  flat_nominal_body_height_ =
+    declare_parameter("flat_obstacle.nominal_body_height", 0.42);
+  flat_max_odom_age_ = declare_parameter("flat_obstacle.max_odom_age", 0.5);
+  if (!std::isfinite(flat_nominal_body_height_) || flat_nominal_body_height_ <= 0.0 ||
+    flat_nominal_body_height_ > 2.0)
+  {
+    throw std::invalid_argument(
+            "flat_obstacle.nominal_body_height must be finite and in (0, 2] metres");
+  }
+  if (!std::isfinite(flat_max_odom_age_) || flat_max_odom_age_ < 0.001 ||
+    flat_max_odom_age_ > 60.0)
+  {
+    throw std::invalid_argument(
+            "flat_obstacle.max_odom_age must be finite and in [0.001, 60] seconds");
+  }
+  if (flat_obstacle_mode_) {
+    flat_map_builder_ = std::make_unique<FlatObstacleMapBuilder>(config, flat_config);
+  } else {
+    map_builder_ = std::make_unique<TerrainMapBuilder>(config);
+  }
 
   const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
   terrain_pub_ = create_publisher<utree_dog_msgs::msg::TerrainGrid>("terrain_map", map_qos);
   cost_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>("terrain_costmap", map_qos);
+  if (flat_obstacle_mode_) {
+    flat_raw_pub_ = create_publisher<nav_msgs::msg::GridCells>("flat_obstacle_raw", map_qos);
+    flat_inflated_pub_ =
+      create_publisher<nav_msgs::msg::GridCells>("flat_obstacle_inflated", map_qos);
+  }
   cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
     cloud_topic_, rclcpp::SensorDataQoS(),
     std::bind(&TerrainMapperNode::cloudCallback, this, std::placeholders::_1));
@@ -94,13 +135,17 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
     std::bind(&TerrainMapperNode::publishMap, this));
 
   RCLCPP_INFO(
-    get_logger(), "Terrain map: %.1f x %.1f m, %.3f m/cell, %zu x %zu cells",
-    config.size_x, config.size_y, config.resolution, map_builder_->width(), map_builder_->height());
+    get_logger(), "%s map: %.1f x %.1f m, %.3f m/cell, %zu x %zu cells",
+    flat_obstacle_mode_ ? "Flat obstacle" : "Terrain",
+    config.size_x, config.size_y, config.resolution,
+    flat_obstacle_mode_ ? flat_map_builder_->width() : map_builder_->width(),
+    flat_obstacle_mode_ ? flat_map_builder_->height() : map_builder_->height());
 }
 
 void TerrainMapperNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
   const auto & orientation = msg->pose.pose.orientation;
+  const auto & position = msg->pose.pose.position;
   const double norm_squared =
     orientation.x * orientation.x + orientation.y * orientation.y +
     orientation.z * orientation.z + orientation.w * orientation.w;
@@ -113,6 +158,27 @@ void TerrainMapperNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr ms
       "Rejected odometry with a non-finite or zero-norm orientation");
     return;
   }
+  if (flat_obstacle_mode_) {
+    if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+      !std::isfinite(position.z) || msg->header.frame_id != map_frame_ ||
+      msg->child_frame_id != body_frame_ || !validRosTimestamp(msg->header.stamp))
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Rejected flat-ground lock odometry with invalid position, frame, or timestamp");
+      return;
+    }
+    const rclcpp::Time current_time = now();
+    const rclcpp::Time odom_time(msg->header.stamp, current_time.get_clock_type());
+    const double odom_age = (current_time - odom_time).seconds();
+    if (!std::isfinite(odom_age) || odom_age > flat_max_odom_age_ || odom_age < -0.2) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Rejected flat-ground lock odometry with age %.3f s; accepted range is [-0.200, %.3f] s",
+        odom_age, flat_max_odom_age_);
+      return;
+    }
+  }
 
   const double inverse_norm = 1.0 / std::sqrt(norm_squared);
   const double x = orientation.x * inverse_norm;
@@ -124,6 +190,15 @@ void TerrainMapperNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr ms
   robot_z_ = msg->pose.pose.position.z;
   robot_yaw_ = std::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
   have_odom_ = true;
+  if (flat_obstacle_mode_ && !flat_ground_locked_) {
+    flat_ground_z_ = robot_z_ - flat_nominal_body_height_;
+    flat_ground_locked_ = true;
+    RCLCPP_INFO(
+      get_logger(),
+      "Flat obstacle ground locked at z=%.3f m from standing body z=%.3f m; "
+      "keep the robot standing while this mode is active",
+      flat_ground_z_, robot_z_);
+  }
 }
 
 void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
@@ -147,6 +222,27 @@ void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Share
       "Rejected point cloud with invalid timestamp sec=%d nanosec=%u",
       msg->header.stamp.sec, msg->header.stamp.nanosec);
     return;
+  }
+  if (flat_obstacle_mode_ && !flat_ground_locked_) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Waiting to lock the flat ground plane from standing body odometry");
+    return;
+  }
+
+  if (flat_obstacle_mode_) {
+    const rclcpp::Time current_time = now();
+    const rclcpp::Time cloud_time(msg->header.stamp, current_time.get_clock_type());
+    const double header_age = (current_time - cloud_time).seconds();
+    if (!std::isfinite(header_age) || header_age > cloud_stale_warning_age_ ||
+      header_age < -0.2)
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Freezing flat obstacle layer for stale cloud: header_age=%.3f s, threshold=%.3f s",
+        header_age, cloud_stale_warning_age_);
+      return;
+    }
   }
 
   sensor_msgs::PointCloud2ConstIterator<float> x(*msg, "x");
@@ -201,7 +297,18 @@ void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Share
         last_cloud_source_delta_, last_cloud_receive_gap_, integration_window_);
     }
   }
-  last_in_map_cell_count_ = map_builder_->integrateFrame(accepted_points, stamp_seconds);
+  bool accumulate_flat_misses = false;
+  if (flat_obstacle_mode_ && have_cloud_interval_) {
+    accumulate_flat_misses =
+      last_cloud_source_delta_ <= cloud_stale_warning_age_ &&
+      last_cloud_receive_gap_ <= cloud_stale_warning_age_;
+  }
+  if (flat_obstacle_mode_) {
+    last_in_map_cell_count_ = flat_map_builder_->integrateFrame(
+      accepted_points, stamp_seconds, flat_ground_z_, accumulate_flat_misses);
+  } else {
+    last_in_map_cell_count_ = map_builder_->integrateFrame(accepted_points, stamp_seconds);
+  }
   last_accepted_point_count_ = accepted_points.size();
   last_cloud_stamp_ = msg->header.stamp;
   last_cloud_received_ = received_at;
@@ -210,6 +317,7 @@ void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::Share
 void TerrainMapperNode::publishMap()
 {
   const rclcpp::Time current_time = now();
+  bool source_is_fresh = true;
   if (last_cloud_received_ == std::chrono::steady_clock::time_point{}) {
     RCLCPP_WARN_THROTTLE(
       get_logger(), *get_clock(), 3000,
@@ -230,6 +338,7 @@ void TerrainMapperNode::publishMap()
       header_age > cloud_stale_warning_age_ || receive_gap > cloud_stale_warning_age_ ||
       header_age < -0.2)
     {
+      source_is_fresh = false;
       const char * classification = "invalid_timing";
       if (receive_gap > cloud_stale_warning_age_) {
         classification = "accepted_cloud_callbacks_stopped";
@@ -245,7 +354,21 @@ void TerrainMapperNode::publishMap()
         classification, header_age, receive_gap, cloud_stale_warning_age_);
     }
   }
-  const auto terrain = map_builder_->build(last_cloud_stamp_, map_frame_);
+  if (flat_obstacle_mode_ && !source_is_fresh) {
+    return;
+  }
+  const auto terrain = flat_obstacle_mode_ ?
+    flat_map_builder_->build(last_cloud_stamp_, map_frame_, flat_ground_z_) :
+    map_builder_->build(last_cloud_stamp_, map_frame_);
+  if (flat_obstacle_mode_) {
+    terrain_pub_->publish(terrain);
+    cost_pub_->publish(makeCostmap(terrain));
+    const auto raw = flat_map_builder_->rawObstacleMask();
+    const auto inflated = flat_map_builder_->inflatedObstacleMask();
+    flat_inflated_pub_->publish(makeFlatCells(inflated, last_cloud_stamp_, 0.01));
+    flat_raw_pub_->publish(makeFlatCells(raw, last_cloud_stamp_, 0.02));
+    return;
+  }
   std::size_t observed_cells = 0;
   std::size_t observation_ready_cells = 0;
   std::size_t start_observation_ready_cells = 0;
@@ -333,12 +456,49 @@ nav_msgs::msg::OccupancyGrid TerrainMapperNode::makeCostmap(
   result.info.origin.position.x = terrain.origin_x;
   result.info.origin.position.y = terrain.origin_y;
   result.info.origin.orientation.w = 1.0;
+  if (flat_obstacle_mode_) {
+    const auto inflated = flat_map_builder_->inflatedObstacleMask();
+    result.data.resize(inflated.size(), 0);
+    std::transform(
+      inflated.begin(), inflated.end(), result.data.begin(),
+      [](std::uint8_t occupied) {
+        return static_cast<std::int8_t>(occupied != 0U ? 100 : 0);
+      });
+    return result;
+  }
   result.data.resize(terrain.traversability.size(), -1);
   for (std::size_t i = 0; i < terrain.traversability.size(); ++i) {
     if (terrain.traversability[i] != terrain.unknown_value) {
       result.data[i] = static_cast<std::int8_t>(std::lround(
         100.0 * (1.0 - std::clamp(terrain.traversability[i], 0.0F, 1.0F))));
     }
+  }
+  return result;
+}
+
+nav_msgs::msg::GridCells TerrainMapperNode::makeFlatCells(
+  const std::vector<std::uint8_t> & mask,
+  const builtin_interfaces::msg::Time & stamp, double z_offset) const
+{
+  nav_msgs::msg::GridCells result;
+  result.header.stamp = stamp;
+  result.header.frame_id = map_frame_;
+  const auto & config = flat_map_builder_->mapConfig();
+  result.cell_width = config.resolution;
+  result.cell_height = config.resolution;
+  result.cells.reserve(static_cast<std::size_t>(std::count_if(
+      mask.begin(), mask.end(), [](std::uint8_t value) {return value != 0U;})));
+  for (std::size_t index = 0; index < mask.size(); ++index) {
+    if (mask[index] == 0U) {
+      continue;
+    }
+    geometry_msgs::msg::Point point;
+    point.x = config.origin_x +
+      (static_cast<double>(index % flat_map_builder_->width()) + 0.5) * config.resolution;
+    point.y = config.origin_y +
+      (static_cast<double>(index / flat_map_builder_->width()) + 0.5) * config.resolution;
+    point.z = flat_ground_z_ + z_offset;
+    result.cells.push_back(point);
   }
   return result;
 }

@@ -103,8 +103,26 @@ def _load_launch_description():
 
 
 class TerrainNavigationLaunchTest(unittest.TestCase):
-    def test_verified_flat_start_defaults_off_and_only_overrides_planner(self):
+    def test_planning_mode_defaults_to_terrain_and_is_forwarded_to_map_and_planner(self):
         description = _load_launch_description()
+        planning_mode_declarations = [
+            entity
+            for entity in description.entities
+            if entity.args and entity.args[0] == "planning_mode"
+        ]
+        self.assertEqual(len(planning_mode_declarations), 1)
+        self.assertEqual(
+            planning_mode_declarations[0].kwargs.get("default_value"), "terrain"
+        )
+        confirmation_declarations = [
+            entity
+            for entity in description.entities
+            if entity.args and entity.args[0] == "flat_ground_confirmed"
+        ]
+        self.assertEqual(len(confirmation_declarations), 1)
+        self.assertEqual(
+            confirmation_declarations[0].kwargs.get("default_value"), "false"
+        )
         declarations = [
             entity
             for entity in description.entities
@@ -114,11 +132,30 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
         self.assertEqual(declarations[0].kwargs.get("default_value"), "false")
 
         nodes = [entity for entity in description.entities if "name" in entity.kwargs]
+        mapper = next(
+            node for node in nodes if node.kwargs.get("name") == "terrain_mapper"
+        )
         planner = next(
             node
             for node in nodes
             if node.kwargs.get("name") == "body_lattice_planner"
         )
+        mapper_overrides = [
+            value
+            for value in mapper.kwargs.get("parameters", [])
+            if isinstance(value, dict) and "planning_mode" in value
+        ]
+        self.assertEqual(len(mapper_overrides), 1)
+        self.assertEqual(
+            set(mapper_overrides[0]),
+            {"planning_mode", "body_frame", "flat_ground_confirmed"},
+        )
+        self.assertEqual(mapper_overrides[0]["planning_mode"].name, "planning_mode")
+        self.assertEqual(mapper_overrides[0]["body_frame"].name, "body_frame")
+        mapper_confirmation = mapper_overrides[0]["flat_ground_confirmed"]
+        self.assertIs(mapper_confirmation.value_type, bool)
+        self.assertEqual(mapper_confirmation.value.name, "flat_ground_confirmed")
+
         planner_overrides = [
             value
             for value in planner.kwargs.get("parameters", [])
@@ -126,7 +163,20 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             and "verified_flat_start.enabled" in value
         ]
         self.assertEqual(len(planner_overrides), 1)
-        self.assertEqual(set(planner_overrides[0]), {"verified_flat_start.enabled"})
+        self.assertEqual(
+            set(planner_overrides[0]),
+            {
+                "planning_mode",
+                "body_frame",
+                "flat_ground_confirmed",
+                "verified_flat_start.enabled",
+            },
+        )
+        self.assertEqual(planner_overrides[0]["planning_mode"].name, "planning_mode")
+        self.assertEqual(planner_overrides[0]["body_frame"].name, "body_frame")
+        planner_confirmation = planner_overrides[0]["flat_ground_confirmed"]
+        self.assertIs(planner_confirmation.value_type, bool)
+        self.assertEqual(planner_confirmation.value.name, "flat_ground_confirmed")
         enabled = planner_overrides[0]["verified_flat_start.enabled"]
         self.assertIs(enabled.value_type, bool)
         self.assertEqual(enabled.value.name, "verified_flat_start")
@@ -191,6 +241,96 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             "verified_flat_start.min_observation_count",
         }:
             self.assertIs(type(parameters[key]), float)
+
+    def test_flat_obstacle_yaml_defaults_are_explicit_and_consistent(self):
+        config_file = os.path.join(
+            REPO_ROOT,
+            "src",
+            "utree_dog_navigation",
+            "config",
+            "terrain_navigation.yaml",
+        )
+        with open(config_file, "r", encoding="utf-8") as stream:
+            document = yaml.safe_load(stream)
+
+        mapper = document["terrain_mapper"]["ros__parameters"]
+        planner = document["body_lattice_planner"]["ros__parameters"]
+        self.assertEqual(mapper["planning_mode"], "terrain")
+        self.assertEqual(mapper["body_frame"], "base_link")
+        self.assertIs(mapper["flat_ground_confirmed"], False)
+        self.assertEqual(planner["planning_mode"], "terrain")
+        self.assertIs(planner["flat_ground_confirmed"], False)
+        self.assertEqual(
+            {
+                "flat_obstacle.min_height": mapper["flat_obstacle.min_height"],
+                "flat_obstacle.max_height": mapper["flat_obstacle.max_height"],
+                "flat_obstacle.clear_after": mapper["flat_obstacle.clear_after"],
+                "flat_obstacle.obstacle_clearance": mapper[
+                    "flat_obstacle.obstacle_clearance"
+                ],
+                "flat_obstacle.nominal_body_height": mapper[
+                    "flat_obstacle.nominal_body_height"
+                ],
+                "flat_obstacle.max_odom_age": mapper[
+                    "flat_obstacle.max_odom_age"
+                ],
+            },
+            {
+                "flat_obstacle.min_height": 0.08,
+                "flat_obstacle.max_height": 0.80,
+                "flat_obstacle.clear_after": 1.0,
+                "flat_obstacle.obstacle_clearance": 0.10,
+                "flat_obstacle.nominal_body_height": 0.42,
+                "flat_obstacle.max_odom_age": 0.5,
+            },
+        )
+        self.assertEqual(
+            {
+                "flat_obstacle.footprint_length": planner[
+                    "flat_obstacle.footprint_length"
+                ],
+                "flat_obstacle.footprint_width": planner[
+                    "flat_obstacle.footprint_width"
+                ],
+                "flat_obstacle.obstacle_clearance": planner[
+                    "flat_obstacle.obstacle_clearance"
+                ],
+            },
+            {
+                "flat_obstacle.footprint_length": 0.90,
+                "flat_obstacle.footprint_width": 0.55,
+                "flat_obstacle.obstacle_clearance": 0.10,
+            },
+        )
+        self.assertEqual(
+            mapper["flat_obstacle.obstacle_clearance"],
+            planner["flat_obstacle.obstacle_clearance"],
+        )
+
+    def test_flat_obstacle_rviz_shows_raw_and_inflated_cells(self):
+        rviz_file = os.path.join(
+            REPO_ROOT,
+            "src",
+            "utree_dog_navigation",
+            "rviz",
+            "flat_obstacle_navigation.rviz",
+        )
+        with open(rviz_file, "r", encoding="utf-8") as stream:
+            document = yaml.safe_load(stream)
+        displays = document["Visualization Manager"]["Displays"]
+        by_name = {display["Name"]: display for display in displays}
+        raw = by_name["Raw Obstacle Cells"]
+        inflated = by_name["Inflated Clearance Cells"]
+        self.assertEqual(raw["Class"], "rviz_default_plugins/GridCells")
+        self.assertIs(raw["Enabled"], True)
+        self.assertEqual(raw["Topic"]["Value"], "/flat_obstacle_raw")
+        self.assertEqual(raw["Color"], "255; 35; 35")
+        self.assertEqual(inflated["Class"], "rviz_default_plugins/GridCells")
+        self.assertIs(inflated["Enabled"], True)
+        self.assertEqual(
+            inflated["Topic"]["Value"], "/flat_obstacle_inflated"
+        )
+        self.assertEqual(inflated["Color"], "210; 40; 210")
 
 
 if __name__ == "__main__":

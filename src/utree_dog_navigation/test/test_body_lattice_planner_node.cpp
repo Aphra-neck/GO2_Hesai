@@ -59,6 +59,8 @@ protected:
       rclcpp::Parameter("path_topic", path_topic_),
       rclcpp::Parameter("map_frame", "world"),
       rclcpp::Parameter("body_frame", "base_link"),
+      rclcpp::Parameter("planning_mode", planning_mode_),
+      rclcpp::Parameter("flat_ground_confirmed", flat_ground_confirmed_),
       rclcpp::Parameter("max_map_age", 1.0),
       rclcpp::Parameter("max_odom_age", 1.0),
       rclcpp::Parameter("max_goal_age", max_goal_age_),
@@ -230,6 +232,8 @@ protected:
   std::vector<nav_msgs::msg::Path> paths_;
   double max_goal_age_{2.0};
   double goal_retention_timeout_{30.0};
+  std::string planning_mode_{"terrain"};
+  bool flat_ground_confirmed_{false};
 };
 
 class ShortGoalRetentionPlannerNodeTest : public BodyLatticePlannerNodeTest
@@ -240,6 +244,70 @@ public:
     goal_retention_timeout_ = 0.10;
   }
 };
+
+class FlatObstaclePlannerNodeTest : public BodyLatticePlannerNodeTest
+{
+public:
+  FlatObstaclePlannerNodeTest()
+  {
+    planning_mode_ = "flat_obstacle";
+    flat_ground_confirmed_ = true;
+  }
+
+protected:
+  utree_dog_msgs::msg::TerrainGrid makeFlatMap(const rclcpp::Time & stamp) const
+  {
+    auto map = makeMap(stamp);
+    map.width = 40;
+    map.height = 40;
+    map.origin_x = -4.0F;
+    map.origin_y = -4.0F;
+    const std::size_t cell_count = map.width * map.height;
+    map.elevation.assign(cell_count, 0.0F);
+    map.slope.assign(cell_count, 0.0F);
+    map.traversability.assign(cell_count, 1.0F);
+    return map;
+  }
+
+  builtin_interfaces::msg::Time publishFlatPlan(double body_z)
+  {
+    const auto current_time = harness_node_->now();
+    const auto map_time = current_time - 50ms;
+    auto odom = makeOdom(current_time - 20ms);
+    odom.pose.pose.position.z = body_z;
+    map_pub_->publish(makeFlatMap(map_time));
+    odom_pub_->publish(odom);
+    goal_pub_->publish(makeGoal(current_time));
+    EXPECT_TRUE(spinUntil(
+        [this]() {return !paths_.empty() && !paths_.back().poses.empty();}, 2s));
+    return map_time;
+  }
+};
+
+TEST_F(BodyLatticePlannerNodeTest, RejectsUnconfirmedFlatObstacleMode)
+{
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat_obstacle"),
+    rclcpp::Parameter("flat_ground_confirmed", false),
+  });
+
+  EXPECT_THROW(
+    std::make_shared<BodyLatticePlannerNode>(options),
+    std::invalid_argument);
+}
+
+TEST_F(BodyLatticePlannerNodeTest, RejectsUnknownPlanningMode)
+{
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat"),
+  });
+
+  EXPECT_THROW(
+    std::make_shared<BodyLatticePlannerNode>(options),
+    std::invalid_argument);
+}
 
 TEST_F(BodyLatticePlannerNodeTest, ClearsAnActivePathWhenMapIsStale)
 {
@@ -683,6 +751,86 @@ TEST_F(BodyLatticePlannerNodeTest, PlanningFailureReplacesTransientLocalPathWith
     [&late_paths](const nav_msgs::msg::Path::SharedPtr msg) {late_paths.push_back(*msg);});
   ASSERT_TRUE(spinUntil([&late_paths]() {return !late_paths.empty();}, 1s));
   EXPECT_TRUE(late_paths.back().poses.empty());
+}
+
+TEST_F(FlatObstaclePlannerNodeTest, LocksEveryPathPoseToInitialStandingBodyHeight)
+{
+  constexpr double kInitialBodyZ = 0.037;
+  publishFlatPlan(kInitialBodyZ);
+
+  ASSERT_FALSE(paths_.back().poses.empty());
+  for (const auto & pose : paths_.back().poses) {
+    EXPECT_NEAR(pose.pose.position.z, kInitialBodyZ, 1.0e-9);
+    EXPECT_NEAR(pose.pose.orientation.x, 0.0, 1.0e-9);
+    EXPECT_NEAR(pose.pose.orientation.y, 0.0, 1.0e-9);
+  }
+
+  const std::size_t paths_before_drift = paths_.size();
+  auto drifted_odom = makeOdom(harness_node_->now());
+  drifted_odom.pose.pose.position.z = 0.41;
+  odom_pub_->publish(drifted_odom);
+  spinFor(50ms);
+  map_pub_->publish(makeFlatMap(harness_node_->now()));
+  ASSERT_TRUE(spinUntil(
+      [this, paths_before_drift]() {return paths_.size() > paths_before_drift;}, 1s));
+  ASSERT_FALSE(paths_.back().poses.empty());
+  for (const auto & pose : paths_.back().poses) {
+    EXPECT_NEAR(pose.pose.position.z, kInitialBodyZ, 1.0e-9);
+  }
+}
+
+TEST_F(FlatObstaclePlannerNodeTest, RetainsQuantizedStartPoseWhenExactYawDiffers)
+{
+  constexpr double kExactYaw = 0.10;
+  const auto current_time = harness_node_->now();
+  auto odom = makeOdom(current_time - 20ms);
+  odom.pose.pose.orientation.z = std::sin(kExactYaw * 0.5);
+  odom.pose.pose.orientation.w = std::cos(kExactYaw * 0.5);
+
+  map_pub_->publish(makeFlatMap(current_time - 50ms));
+  odom_pub_->publish(odom);
+  goal_pub_->publish(makeGoal(current_time));
+
+  ASSERT_TRUE(spinUntil(
+      [this]() {return !paths_.empty() && !paths_.back().poses.empty();}, 2s));
+  const auto & poses = paths_.back().poses;
+  ASSERT_GE(poses.size(), 2U);
+  EXPECT_NEAR(poses[0].pose.position.x, odom.pose.pose.position.x, 1.0e-9);
+  EXPECT_NEAR(poses[0].pose.position.y, odom.pose.pose.position.y, 1.0e-9);
+  EXPECT_NEAR(poses[1].pose.position.x, odom.pose.pose.position.x, 1.0e-6);
+  EXPECT_NEAR(poses[1].pose.position.y, odom.pose.pose.position.y, 1.0e-6);
+  EXPECT_NEAR(
+    2.0 * std::atan2(poses[0].pose.orientation.z, poses[0].pose.orientation.w),
+    kExactYaw, 1.0e-9);
+  EXPECT_NEAR(
+    2.0 * std::atan2(poses[1].pose.orientation.z, poses[1].pose.orientation.w),
+    0.0, 1.0e-9);
+}
+
+TEST_F(FlatObstaclePlannerNodeTest, StaleInputClearsCachedGoalAndRequiresNewGoal)
+{
+  publishFlatPlan(0.01);
+  const std::size_t messages_before_stale = paths_.size();
+  const auto current_time = harness_node_->now();
+  odom_pub_->publish(makeOdom(current_time));
+  map_pub_->publish(makeFlatMap(current_time - 2s));
+
+  ASSERT_TRUE(spinUntil(
+      [this, messages_before_stale]() {
+        return paths_.size() > messages_before_stale && paths_.back().poses.empty();
+      }, 1s));
+  const std::size_t messages_after_stale = paths_.size();
+
+  odom_pub_->publish(makeOdom(harness_node_->now()));
+  map_pub_->publish(makeFlatMap(harness_node_->now()));
+  spinFor(200ms);
+  EXPECT_EQ(paths_.size(), messages_after_stale);
+
+  goal_pub_->publish(makeGoal(harness_node_->now()));
+  ASSERT_TRUE(spinUntil(
+      [this, messages_after_stale]() {
+        return paths_.size() > messages_after_stale && !paths_.back().poses.empty();
+      }, 1s));
 }
 
 }  // namespace

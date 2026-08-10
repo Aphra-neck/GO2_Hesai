@@ -4,8 +4,17 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PLANNING_RVIZ="${PLANNING_RVIZ:-false}"
+PLANNING_MODE="${GO2_PLANNING_MODE:-terrain}"
+FLAT_GROUND_CONFIRMED="${GO2_FLAT_GROUND_CONFIRMED:-false}"
 BODY_YAW_OFFSET="${GO2_BODY_YAW_OFFSET_RAD:--1.5707963267948966}"
 NAVIGATION_CONFIG="${GO2_NAVIGATION_CONFIG:-${WORKSPACE_DIR}/src/utree_dog_navigation/config/terrain_navigation.yaml}"
+if [[ -n "${GO2_NAVIGATION_RVIZ_CONFIG:-}" ]]; then
+  NAVIGATION_RVIZ_CONFIG="${GO2_NAVIGATION_RVIZ_CONFIG}"
+elif [[ "${PLANNING_MODE}" == "flat_obstacle" ]]; then
+  NAVIGATION_RVIZ_CONFIG="${WORKSPACE_DIR}/src/utree_dog_navigation/rviz/flat_obstacle_navigation.rviz"
+else
+  NAVIGATION_RVIZ_CONFIG="${WORKSPACE_DIR}/src/utree_dog_navigation/rviz/hesai_navigation.rviz"
+fi
 VERIFIED_FLAT_START="${GO2_VERIFIED_FLAT_START:-false}"
 GO2_BODY_YAW_OFFSET_RAD="${BODY_YAW_OFFSET}"
 export GO2_BODY_YAW_OFFSET_RAD
@@ -17,6 +26,28 @@ case "${PLANNING_RVIZ}" in
     exit 1
     ;;
 esac
+
+case "${PLANNING_MODE}" in
+  terrain|flat_obstacle) ;;
+  *)
+    echo "GO2_PLANNING_MODE must be terrain or flat_obstacle, got: ${PLANNING_MODE}" >&2
+    exit 1
+    ;;
+esac
+
+case "${FLAT_GROUND_CONFIRMED}" in
+  true|false) ;;
+  *)
+    echo "GO2_FLAT_GROUND_CONFIRMED must be true or false, got: ${FLAT_GROUND_CONFIRMED}" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${PLANNING_MODE}" == "flat_obstacle" && "${FLAT_GROUND_CONFIRMED}" != "true" ]]; then
+  echo "Flat-obstacle navigation requires the robot to be standing and stationary before startup." >&2
+  echo "Stand the robot, keep it still, then set GO2_FLAT_GROUND_CONFIRMED=true." >&2
+  exit 1
+fi
 
 case "${VERIFIED_FLAT_START}" in
   true|false) ;;
@@ -36,6 +67,11 @@ fi
 
 if [[ ! -r "${NAVIGATION_CONFIG}" ]]; then
   echo "Navigation configuration is not readable: ${NAVIGATION_CONFIG}" >&2
+  exit 1
+fi
+
+if [[ ! -r "${NAVIGATION_RVIZ_CONFIG}" ]]; then
+  echo "Navigation RViz configuration is not readable: ${NAVIGATION_RVIZ_CONFIG}" >&2
   exit 1
 fi
 
@@ -69,15 +105,21 @@ wait_for_topic() {
 }
 
 echo "======================================"
-echo " Go2 terrain navigation (ROS 2)"
+echo " Go2 navigation (ROS 2)"
 echo " ROS domain: ${ROS_DOMAIN_ID}"
 echo " ROS RMW: ${RMW_IMPLEMENTATION}"
 echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Planning RViz: ${PLANNING_RVIZ}"
+echo " Planning mode: ${PLANNING_MODE}"
+echo " Flat ground confirmed: ${FLAT_GROUND_CONFIRMED}"
 echo " Verified flat start: ${VERIFIED_FLAT_START}"
 echo " Body yaw offset: ${BODY_YAW_OFFSET} rad"
 echo " Navigation config: ${NAVIGATION_CONFIG}"
+echo " RViz config: ${NAVIGATION_RVIZ_CONFIG}"
+if [[ "${PLANNING_MODE}" == "flat_obstacle" ]]; then
+  echo " Robot posture: STANDING and stationary required; never start this mode while prone."
+fi
 echo "======================================"
 
 echo "Checking Super-LIO inputs..."
@@ -90,10 +132,13 @@ if [[ ! -x "${WORKSPACE_DIR}/tools/go2-log" ]]; then
 fi
 "${WORKSPACE_DIR}/tools/go2-log" start
 
-echo "Starting terrain mapper and body lattice planner..."
+echo "Starting ${PLANNING_MODE} mapper and body lattice planner..."
 echo "Set a goal with RViz or publish geometry_msgs/msg/PoseStamped to /goal_pose."
 ros2 launch utree_dog_navigation terrain_navigation.launch.py \
   "config:=${NAVIGATION_CONFIG}" \
   "rviz:=${PLANNING_RVIZ}" \
+  "rviz_config:=${NAVIGATION_RVIZ_CONFIG}" \
   "body_yaw_offset:=${BODY_YAW_OFFSET}" \
+  "planning_mode:=${PLANNING_MODE}" \
+  "flat_ground_confirmed:=${FLAT_GROUND_CONFIRMED}" \
   "verified_flat_start:=${VERIFIED_FLAT_START}"

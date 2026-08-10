@@ -127,6 +127,17 @@ LatticePlanner::LatticePlanner(LatticePlannerConfig config) : config_(std::move(
   if (config_.verified_flat_start.enabled && !verifiedFlatConfigurationValid()) {
     throw std::invalid_argument("verified flat start configuration is invalid");
   }
+  if (config_.planning_mode == PlanningMode::kFlatObstacle) {
+    const auto & flat = config_.flat_obstacle;
+    const bool valid_flat_config =
+      std::isfinite(flat.footprint_length) && flat.footprint_length > 0.0 &&
+      std::isfinite(flat.footprint_width) && flat.footprint_width > 0.0 &&
+      std::isfinite(flat.obstacle_clearance) && flat.obstacle_clearance >= 0.0 &&
+      std::isfinite(flat.surface_elevation);
+    if (!valid_flat_config) {
+      throw std::invalid_argument("flat obstacle planner configuration is invalid");
+    }
+  }
 }
 
 void LatticePlanner::setMap(utree_dog_msgs::msg::TerrainGrid::SharedPtr map)
@@ -147,26 +158,28 @@ bool LatticePlanner::mapValid() const
     return false;
   }
   const std::size_t expected = static_cast<std::size_t>(map_->width) * map_->height;
-  if (map_->elevation.size() != expected || map_->slope.size() != expected ||
-    map_->traversability.size() != expected)
+  if (map_->traversability.size() != expected)
+  {
+    return false;
+  }
+  if (config_.planning_mode == PlanningMode::kTerrain &&
+    (map_->elevation.size() != expected || map_->slope.size() != expected))
   {
     return false;
   }
   for (std::size_t index = 0; index < expected; ++index) {
-    const float elevation = map_->elevation[index];
-    const float slope = map_->slope[index];
     const float traversability = map_->traversability[index];
-    if (!std::isfinite(elevation) || !std::isfinite(slope) ||
-      !std::isfinite(traversability))
-    {
-      return false;
-    }
-    if (slope != map_->unknown_value && slope < 0.0F) {return false;}
+    if (!std::isfinite(traversability)) {return false;}
     if (traversability != map_->unknown_value &&
       (traversability < 0.0F || traversability > 1.0F))
     {
       return false;
     }
+    if (config_.planning_mode == PlanningMode::kFlatObstacle) {continue;}
+    const float elevation = map_->elevation[index];
+    const float slope = map_->slope[index];
+    if (!std::isfinite(elevation) || !std::isfinite(slope)) {return false;}
+    if (slope != map_->unknown_value && slope < 0.0F) {return false;}
   }
   return true;
 }
@@ -188,32 +201,51 @@ PlanningResult LatticePlanner::plan(
   goal.yaw = yawBin(goal_world.yaw);
 
   PlanningOverlay overlay;
-  if (!nearestObservedValid(
-      start_world.x, start_world.y, config_.start_snap_radius,
-      start.grid.x, start.grid.y))
-  {
-    if (!config_.verified_flat_start.enabled) {
-      result.start_status = VerifiedFlatStartStatus::kDisabled;
+  if (config_.planning_mode == PlanningMode::kFlatObstacle) {
+    const double grid_start_x =
+      map_->origin_x + (static_cast<double>(start.grid.x) + 0.5) * map_->resolution;
+    const double grid_start_y =
+      map_->origin_y + (static_cast<double>(start.grid.y) + 0.5) * map_->resolution;
+    const double grid_start_yaw = yawAngle(start.grid.yaw);
+    if (!flatWorldPoseCollisionFree(start_world.x, start_world.y, start_world.yaw) ||
+      !flatPoseSweepCollisionFree(
+        start_world.x, start_world.y, start_world.yaw,
+        grid_start_x, grid_start_y, grid_start_yaw) ||
+      !nearestFlatValid(
+        goal_world.x, goal_world.y, config_.snap_radius, goal.yaw, goal.x, goal.y))
+    {
       return result;
     }
-    result.start_status = buildVerifiedFlatOverlay(start_world.x, start_world.y, overlay);
-    if (result.start_status != VerifiedFlatStartStatus::kApplied) {return result;}
-    if (!overlayCell(start.grid.x, start.grid.y, overlay)) {
-      result.start_status = VerifiedFlatStartStatus::kNoInferredStartCell;
-      return result;
+    result.include_exact_start = true;
+    result.exact_start_elevation = config_.flat_obstacle.surface_elevation;
+  } else {
+    if (!nearestObservedValid(
+        start_world.x, start_world.y, config_.start_snap_radius,
+        start.grid.x, start.grid.y))
+    {
+      if (!config_.verified_flat_start.enabled) {
+        result.start_status = VerifiedFlatStartStatus::kDisabled;
+        return result;
+      }
+      result.start_status = buildVerifiedFlatOverlay(start_world.x, start_world.y, overlay);
+      if (result.start_status != VerifiedFlatStartStatus::kApplied) {return result;}
+      if (!overlayCell(start.grid.x, start.grid.y, overlay)) {
+        result.start_status = VerifiedFlatStartStatus::kNoInferredStartCell;
+        return result;
+      }
+      start.inferred_prefix = true;
+      if (!inferredStartConnectsToObserved(start, overlay)) {
+        result.start_status = VerifiedFlatStartStatus::kNoObservedConnection;
+        return result;
+      }
+      result.exact_start_inferred = true;
+      result.exact_start_elevation = overlay.plane_z;
+      result.exact_start_dzdx = overlay.plane_x;
+      result.exact_start_dzdy = overlay.plane_y;
     }
-    start.inferred_prefix = true;
-    if (!inferredStartConnectsToObserved(start, overlay)) {
-      result.start_status = VerifiedFlatStartStatus::kNoObservedConnection;
-      return result;
-    }
-    result.exact_start_inferred = true;
-    result.exact_start_elevation = overlay.plane_z;
-    result.exact_start_dzdx = overlay.plane_x;
-    result.exact_start_dzdy = overlay.plane_y;
+    if (!nearestObservedValid(
+        goal_world.x, goal_world.y, config_.snap_radius, goal.x, goal.y)) {return result;}
   }
-  if (!nearestObservedValid(
-      goal_world.x, goal_world.y, config_.snap_radius, goal.x, goal.y)) {return result;}
 
   const auto planner_motions = motions();
 
@@ -277,6 +309,9 @@ double LatticePlanner::yawAngle(int bin) const
 
 double LatticePlanner::elevationAt(int x, int y, double fallback) const
 {
+  if (config_.planning_mode == PlanningMode::kFlatObstacle) {
+    return inside(x, y) ? config_.flat_obstacle.surface_elevation : fallback;
+  }
   if (!inside(x, y)) {return fallback;}
   const float value = map_->elevation[cellAddress(x, y)];
   return value == map_->unknown_value ? fallback : value;
@@ -359,6 +394,301 @@ bool LatticePlanner::observedValidCell(int x, int y) const
          map_->traversability[i] != map_->unknown_value &&
          map_->traversability[i] >= config_.min_traversability &&
          map_->slope[i] != map_->unknown_value && map_->slope[i] <= config_.max_slope;
+}
+
+bool LatticePlanner::flatObstacleCell(int x, int y) const
+{
+  if (!inside(x, y)) {return true;}
+  const float traversability = map_->traversability[cellAddress(x, y)];
+  return traversability != map_->unknown_value && traversability <= 0.0F;
+}
+
+bool LatticePlanner::flatPoseCollisionFree(int x, int y, int yaw, double padding) const
+{
+  if (!inside(x, y)) {return false;}
+  const double world_x = map_->origin_x + (static_cast<double>(x) + 0.5) * map_->resolution;
+  const double world_y = map_->origin_y + (static_cast<double>(y) + 0.5) * map_->resolution;
+  return flatWorldPoseCollisionFree(world_x, world_y, yawAngle(yaw), padding);
+}
+
+bool LatticePlanner::flatWorldPoseCollisionFree(
+  double world_x, double world_y, double yaw, double padding) const
+{
+  const double half_length = 0.5 * config_.flat_obstacle.footprint_length +
+    config_.flat_obstacle.obstacle_clearance + padding;
+  const double half_width = 0.5 * config_.flat_obstacle.footprint_width +
+    config_.flat_obstacle.obstacle_clearance + padding;
+  const double cosine = std::cos(yaw);
+  const double sine = std::sin(yaw);
+  std::vector<Point2D> polygon;
+  polygon.reserve(4);
+  for (const auto & local : std::array<Point2D, 4>{{
+      {-half_length, -half_width}, {half_length, -half_width},
+      {half_length, half_width}, {-half_length, half_width}}})
+  {
+    polygon.push_back({
+      world_x + cosine * local.x - sine * local.y,
+      world_y + sine * local.x + cosine * local.y});
+  }
+  return flatPolygonCollisionFree(polygon);
+}
+
+bool LatticePlanner::flatPolygonCollisionFree(const std::vector<Point2D> & polygon) const
+{
+  if (polygon.size() < 3) {return false;}
+
+  double minimum_x = std::numeric_limits<double>::infinity();
+  double maximum_x = -std::numeric_limits<double>::infinity();
+  double minimum_y = std::numeric_limits<double>::infinity();
+  double maximum_y = -std::numeric_limits<double>::infinity();
+  for (const auto & point : polygon) {
+    minimum_x = std::min(minimum_x, point.x);
+    maximum_x = std::max(maximum_x, point.x);
+    minimum_y = std::min(minimum_y, point.y);
+    maximum_y = std::max(maximum_y, point.y);
+  }
+
+  const double map_minimum_x = map_->origin_x;
+  const double map_minimum_y = map_->origin_y;
+  const double map_maximum_x = map_->origin_x + map_->width * map_->resolution;
+  const double map_maximum_y = map_->origin_y + map_->height * map_->resolution;
+  if (minimum_x < map_minimum_x - kDistanceTolerance ||
+    minimum_y < map_minimum_y - kDistanceTolerance ||
+    maximum_x > map_maximum_x + kDistanceTolerance ||
+    maximum_y > map_maximum_y + kDistanceTolerance)
+  {
+    return false;
+  }
+
+  const int first_x = std::clamp(
+    static_cast<int>(std::floor((minimum_x - map_->origin_x) / map_->resolution)),
+    0, static_cast<int>(map_->width) - 1);
+  const int last_x = std::clamp(
+    static_cast<int>(std::floor((maximum_x - map_->origin_x) / map_->resolution)),
+    0, static_cast<int>(map_->width) - 1);
+  const int first_y = std::clamp(
+    static_cast<int>(std::floor((minimum_y - map_->origin_y) / map_->resolution)),
+    0, static_cast<int>(map_->height) - 1);
+  const int last_y = std::clamp(
+    static_cast<int>(std::floor((maximum_y - map_->origin_y) / map_->resolution)),
+    0, static_cast<int>(map_->height) - 1);
+
+  const auto separated_on_axis = [&polygon](
+    const Point2D & axis, double cell_minimum_x, double cell_maximum_x,
+    double cell_minimum_y, double cell_maximum_y)
+    {
+      if (std::abs(axis.x) + std::abs(axis.y) < kDistanceTolerance) {return false;}
+      double polygon_minimum = std::numeric_limits<double>::infinity();
+      double polygon_maximum = -std::numeric_limits<double>::infinity();
+      for (const auto & point : polygon) {
+        const double projection = axis.x * point.x + axis.y * point.y;
+        polygon_minimum = std::min(polygon_minimum, projection);
+        polygon_maximum = std::max(polygon_maximum, projection);
+      }
+      const std::array<Point2D, 4> cell{{
+        {cell_minimum_x, cell_minimum_y}, {cell_maximum_x, cell_minimum_y},
+        {cell_maximum_x, cell_maximum_y}, {cell_minimum_x, cell_maximum_y}}};
+      double cell_minimum = std::numeric_limits<double>::infinity();
+      double cell_maximum = -std::numeric_limits<double>::infinity();
+      for (const auto & point : cell) {
+        const double projection = axis.x * point.x + axis.y * point.y;
+        cell_minimum = std::min(cell_minimum, projection);
+        cell_maximum = std::max(cell_maximum, projection);
+      }
+      return polygon_maximum < cell_minimum - kDistanceTolerance ||
+             cell_maximum < polygon_minimum - kDistanceTolerance;
+    };
+
+  for (int y = first_y; y <= last_y; ++y) {
+    for (int x = first_x; x <= last_x; ++x) {
+      if (!flatObstacleCell(x, y)) {continue;}
+      const double cell_minimum_x = map_->origin_x + x * map_->resolution;
+      const double cell_minimum_y = map_->origin_y + y * map_->resolution;
+      const double cell_maximum_x = cell_minimum_x + map_->resolution;
+      const double cell_maximum_y = cell_minimum_y + map_->resolution;
+      bool separated = separated_on_axis(
+        {1.0, 0.0}, cell_minimum_x, cell_maximum_x, cell_minimum_y, cell_maximum_y) ||
+        separated_on_axis(
+        {0.0, 1.0}, cell_minimum_x, cell_maximum_x, cell_minimum_y, cell_maximum_y);
+      for (std::size_t index = 0; !separated && index < polygon.size(); ++index) {
+        const Point2D & first = polygon[index];
+        const Point2D & second = polygon[(index + 1) % polygon.size()];
+        separated = separated_on_axis(
+          {-(second.y - first.y), second.x - first.x},
+          cell_minimum_x, cell_maximum_x, cell_minimum_y, cell_maximum_y);
+      }
+      if (!separated) {return false;}
+    }
+  }
+  return true;
+}
+
+bool LatticePlanner::flatTransitionCollisionFree(
+  const GridState & current, const GridState & next) const
+{
+  const double current_x =
+    map_->origin_x + (static_cast<double>(current.x) + 0.5) * map_->resolution;
+  const double current_y =
+    map_->origin_y + (static_cast<double>(current.y) + 0.5) * map_->resolution;
+  const double next_x =
+    map_->origin_x + (static_cast<double>(next.x) + 0.5) * map_->resolution;
+  const double next_y =
+    map_->origin_y + (static_cast<double>(next.y) + 0.5) * map_->resolution;
+  const double current_yaw = yawAngle(current.yaw);
+  const double next_yaw = yawAngle(next.yaw);
+
+  if (current.x != next.x || current.y != next.y) {
+    return flatTranslationCollisionFree(current_x, current_y, next_x, next_y, current_yaw);
+  }
+
+  return flatRotationCollisionFree(current_x, current_y, current_yaw, next_yaw);
+}
+
+bool LatticePlanner::flatTranslationCollisionFree(
+  double start_x, double start_y, double end_x, double end_y, double yaw) const
+{
+  const double half_length = 0.5 * config_.flat_obstacle.footprint_length +
+    config_.flat_obstacle.obstacle_clearance;
+  const double half_width = 0.5 * config_.flat_obstacle.footprint_width +
+    config_.flat_obstacle.obstacle_clearance;
+  const double cosine = std::cos(yaw);
+  const double sine = std::sin(yaw);
+  std::vector<Point2D> points;
+  points.reserve(8);
+  for (const auto & center : std::array<Point2D, 2>{{
+      {start_x, start_y}, {end_x, end_y}}})
+  {
+    for (const auto & local : std::array<Point2D, 4>{{
+        {-half_length, -half_width}, {half_length, -half_width},
+        {half_length, half_width}, {-half_length, half_width}}})
+    {
+      points.push_back({
+        center.x + cosine * local.x - sine * local.y,
+        center.y + sine * local.x + cosine * local.y});
+    }
+  }
+
+  std::sort(points.begin(), points.end(), [](const Point2D & lhs, const Point2D & rhs) {
+    return lhs.x < rhs.x || (lhs.x == rhs.x && lhs.y < rhs.y);
+  });
+  const auto cross = [](const Point2D & origin, const Point2D & first, const Point2D & second) {
+    return (first.x - origin.x) * (second.y - origin.y) -
+           (first.y - origin.y) * (second.x - origin.x);
+  };
+  std::vector<Point2D> hull;
+  hull.reserve(points.size() * 2);
+  for (const auto & point : points) {
+    while (hull.size() >= 2 &&
+      cross(hull[hull.size() - 2], hull.back(), point) <= kDistanceTolerance)
+    {
+      hull.pop_back();
+    }
+    hull.push_back(point);
+  }
+  const std::size_t lower_size = hull.size();
+  for (auto iterator = points.rbegin() + 1; iterator != points.rend(); ++iterator) {
+    while (hull.size() > lower_size &&
+      cross(hull[hull.size() - 2], hull.back(), *iterator) <= kDistanceTolerance)
+    {
+      hull.pop_back();
+    }
+    hull.push_back(*iterator);
+  }
+  if (!hull.empty()) {hull.pop_back();}
+  return flatPolygonCollisionFree(hull);
+}
+
+bool LatticePlanner::flatRotationCollisionFree(
+  double world_x, double world_y, double start_yaw, double end_yaw) const
+{
+  const double yaw_delta = normalizeAngle(end_yaw - start_yaw);
+  const double radius = std::hypot(
+    0.5 * config_.flat_obstacle.footprint_length + config_.flat_obstacle.obstacle_clearance,
+    0.5 * config_.flat_obstacle.footprint_width + config_.flat_obstacle.obstacle_clearance);
+  const double sample_spacing = std::max(
+    0.01, std::min(0.05, 0.5 * static_cast<double>(map_->resolution)));
+  const int intervals = std::max(
+    1, static_cast<int>(std::ceil(radius * std::abs(yaw_delta) / sample_spacing)));
+  // Padding contains the corner arc between adjacent samples, making this conservative.
+  const double padding = radius * std::abs(yaw_delta) / (2.0 * intervals);
+  for (int sample = 0; sample <= intervals; ++sample) {
+    const double fraction = static_cast<double>(sample) / intervals;
+    if (!flatWorldPoseCollisionFree(
+        world_x, world_y, start_yaw + fraction * yaw_delta, padding))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool LatticePlanner::flatPoseSweepCollisionFree(
+  double start_x, double start_y, double start_yaw,
+  double end_x, double end_y, double end_yaw) const
+{
+  const double yaw_delta = normalizeAngle(end_yaw - start_yaw);
+  const double radius = std::hypot(
+    0.5 * config_.flat_obstacle.footprint_length + config_.flat_obstacle.obstacle_clearance,
+    0.5 * config_.flat_obstacle.footprint_width + config_.flat_obstacle.obstacle_clearance);
+  const double maximum_point_travel =
+    std::hypot(end_x - start_x, end_y - start_y) + radius * std::abs(yaw_delta);
+  const double sample_spacing = std::max(
+    0.01, std::min(0.05, 0.5 * static_cast<double>(map_->resolution)));
+  const int intervals = std::max(
+    1, static_cast<int>(std::ceil(maximum_point_travel / sample_spacing)));
+  const double padding = maximum_point_travel / (2.0 * intervals);
+  for (int sample = 0; sample <= intervals; ++sample) {
+    const double fraction = static_cast<double>(sample) / intervals;
+    if (!flatWorldPoseCollisionFree(
+        start_x + fraction * (end_x - start_x),
+        start_y + fraction * (end_y - start_y),
+        start_yaw + fraction * yaw_delta, padding))
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool LatticePlanner::nearestFlatValid(
+  double world_x, double world_y, double snap_radius, int yaw, int & x, int & y) const
+{
+  if (flatPoseCollisionFree(x, y, yaw)) {return true;}
+  const double radius_cells = std::ceil(snap_radius / map_->resolution);
+  const int map_max_x = static_cast<int>(map_->width) - 1;
+  const int map_max_y = static_cast<int>(map_->height) - 1;
+  const int radius = std::max(1, static_cast<int>(std::min(
+      radius_cells, static_cast<double>(std::max(map_->width, map_->height)))));
+  const int minimum_x = static_cast<int>(std::max<std::int64_t>(
+      0, static_cast<std::int64_t>(x) - radius));
+  const int maximum_x = static_cast<int>(std::min<std::int64_t>(
+      map_max_x, static_cast<std::int64_t>(x) + radius));
+  const int minimum_y = static_cast<int>(std::max<std::int64_t>(
+      0, static_cast<std::int64_t>(y) - radius));
+  const int maximum_y = static_cast<int>(std::min<std::int64_t>(
+      map_max_y, static_cast<std::int64_t>(y) + radius));
+  int best_x = x;
+  int best_y = y;
+  double best_distance = std::numeric_limits<double>::infinity();
+  for (int candidate_y = minimum_y; candidate_y <= maximum_y; ++candidate_y) {
+    for (int candidate_x = minimum_x; candidate_x <= maximum_x; ++candidate_x) {
+      if (!flatPoseCollisionFree(candidate_x, candidate_y, yaw)) {continue;}
+      const double candidate_world_x =
+        map_->origin_x + (static_cast<double>(candidate_x) + 0.5) * map_->resolution;
+      const double candidate_world_y =
+        map_->origin_y + (static_cast<double>(candidate_y) + 0.5) * map_->resolution;
+      const double distance = std::hypot(
+        candidate_world_x - world_x, candidate_world_y - world_y);
+      if (distance > snap_radius + kDistanceTolerance || distance >= best_distance) {continue;}
+      best_x = candidate_x;
+      best_y = candidate_y;
+      best_distance = distance;
+    }
+  }
+  if (!std::isfinite(best_distance)) {return false;}
+  x = best_x;
+  y = best_y;
+  return true;
 }
 
 bool LatticePlanner::nearestObservedValid(
@@ -607,6 +937,14 @@ bool LatticePlanner::cellProperties(
   int x, int y, const PlanningOverlay & overlay, bool allow_inferred,
   CellProperties & properties) const
 {
+  if (config_.planning_mode == PlanningMode::kFlatObstacle) {
+    if (flatObstacleCell(x, y)) {return false;}
+    properties.elevation = config_.flat_obstacle.surface_elevation;
+    properties.slope = 0.0;
+    properties.traversability = 1.0;
+    properties.inferred = false;
+    return true;
+  }
   if (observedValidCell(x, y)) {
     const std::size_t index = cellAddress(x, y);
     properties.elevation = map_->elevation[index];
@@ -629,6 +967,9 @@ bool LatticePlanner::cellProperties(
 double LatticePlanner::surfaceElevation(
   int x, int y, const PlanningOverlay & overlay, double fallback) const
 {
+  if (config_.planning_mode == PlanningMode::kFlatObstacle) {
+    return inside(x, y) ? config_.flat_obstacle.surface_elevation : fallback;
+  }
   if (!inside(x, y)) {return fallback;}
   const std::size_t index = cellAddress(x, y);
   if (map_->elevation[index] != map_->unknown_value) {return map_->elevation[index];}
@@ -651,6 +992,11 @@ bool LatticePlanner::transition(
   if (motion.yaw_delta != 0) {
     next.grid.yaw =
       (current.grid.yaw + motion.yaw_delta + config_.yaw_bins) % config_.yaw_bins;
+    if (config_.planning_mode == PlanningMode::kFlatObstacle &&
+      !flatTransitionCollisionFree(current.grid, next.grid))
+    {
+      return false;
+    }
     transition_cost = config_.yaw_change_cost;
     return true;
   }
@@ -680,6 +1026,13 @@ bool LatticePlanner::transition(
   next.grid.y = static_cast<int>(candidate_y);
   if (next.grid.x == current.grid.x && next.grid.y == current.grid.y) {
     return false;
+  }
+
+  if (config_.planning_mode == PlanningMode::kFlatObstacle) {
+    if (!flatTransitionCollisionFree(current.grid, next.grid)) {return false;}
+    next.inferred_prefix = false;
+    transition_cost = std::hypot(dx, dy) * map_->resolution * motion.factor;
+    return true;
   }
 
   CellProperties current_properties;
@@ -734,7 +1087,10 @@ PlannedGridState LatticePlanner::plannedState(
   planned.yaw = state.grid.yaw;
   planned.inferred = properties.inferred;
   planned.elevation = properties.elevation;
-  if (properties.inferred) {
+  if (config_.planning_mode == PlanningMode::kFlatObstacle) {
+    planned.dzdx = 0.0;
+    planned.dzdy = 0.0;
+  } else if (properties.inferred) {
     planned.dzdx = overlay.plane_x;
     planned.dzdy = overlay.plane_y;
   } else {

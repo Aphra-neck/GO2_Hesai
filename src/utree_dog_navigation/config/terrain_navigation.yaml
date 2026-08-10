@@ -9,7 +9,10 @@ body_odom_adapter:
 
 terrain_mapper:
   ros__parameters:
+    planning_mode: terrain
+    flat_ground_confirmed: false
     map_frame: world
+    body_frame: base_link
     cloud_topic: /lio/cloud_world
     odom_topic: /lio/body_odom
     resolution: 0.20
@@ -40,9 +43,19 @@ terrain_mapper:
     cloud_stale_warning_age: 1.0
     # Keep rebuild recovery aligned with body_lattice_planner.start_snap_radius.
     confidence_rebuild.start_radius: 0.55
+    # flat_obstacle is an explicitly confirmed, standing-robot mode. It locks
+    # the floor once and treats every non-obstacle cell inside this existing map as free.
+    flat_obstacle.min_height: 0.08
+    flat_obstacle.max_height: 0.80
+    flat_obstacle.clear_after: 1.0
+    flat_obstacle.obstacle_clearance: 0.10
+    flat_obstacle.nominal_body_height: 0.42
+    flat_obstacle.max_odom_age: 0.5
 
 body_lattice_planner:
   ros__parameters:
+    planning_mode: terrain
+    flat_ground_confirmed: false
     terrain_map_topic: terrain_map
     odom_topic: /lio/body_odom
     goal_topic: /goal_pose
@@ -77,6 +90,9 @@ body_lattice_planner:
     # bounded start-only allowance separate from goal snapping.
     start_snap_radius: 0.55
     snap_radius: 0.50
+    flat_obstacle.footprint_length: 0.90
+    flat_obstacle.footprint_width: 0.55
+    flat_obstacle.obstacle_clearance: 0.10
     verified_flat_start.enabled: false
     verified_flat_start.support_inner_radius: 1.0
     verified_flat_start.support_outer_radius: 2.5

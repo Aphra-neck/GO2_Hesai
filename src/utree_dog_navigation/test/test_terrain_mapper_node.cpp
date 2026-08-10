@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "builtin_interfaces/msg/time.hpp"
+#include "nav_msgs/msg/grid_cells.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/executors/single_threaded_executor.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -512,6 +513,140 @@ TEST_F(TerrainMapperNodeTest, RejectsInvalidConfidenceWindowParameters)
   });
   EXPECT_THROW(
     std::make_shared<TerrainMapperNode>(invalid_radius_options), std::invalid_argument);
+}
+
+TEST_F(TerrainMapperNodeTest, FlatObstacleModeRequiresExplicitGroundConfirmation)
+{
+  rclcpp::NodeOptions options;
+  options.arguments(
+    {"--ros-args", "-r", "__node:=terrain_mapper_unconfirmed_flat"});
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat_obstacle"),
+    rclcpp::Parameter("flat_ground_confirmed", false),
+  });
+  EXPECT_THROW(std::make_shared<TerrainMapperNode>(options), std::invalid_argument);
+}
+
+TEST_F(TerrainMapperNodeTest, FlatObstacleModeAdvertisesRawAndInflatedVisualizationLayers)
+{
+  const std::string namespace_name =
+    "/flat_mapper_interface_" + std::to_string(instance_count_);
+  rclcpp::NodeOptions options;
+  options.arguments({
+    "--ros-args", "-r", "__ns:=" + namespace_name,
+    "-r", "__node:=terrain_mapper",
+  });
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat_obstacle"),
+    rclcpp::Parameter("flat_ground_confirmed", true),
+  });
+  auto flat_mapper = std::make_shared<TerrainMapperNode>(options);
+  executor_.add_node(flat_mapper);
+
+  EXPECT_TRUE(spinUntil(
+      [this, &namespace_name]() {
+        return harness_node_->count_publishers(
+          namespace_name + "/flat_obstacle_raw") == 1U &&
+               harness_node_->count_publishers(
+          namespace_name + "/flat_obstacle_inflated") == 1U;
+      },
+      1s));
+
+  executor_.remove_node(flat_mapper);
+}
+
+TEST_F(TerrainMapperNodeTest, FlatObstacleModeLocksOnlyFreshWorldOdometryAndPublishesLayers)
+{
+  const std::string namespace_name =
+    "/flat_mapper_data_" + std::to_string(instance_count_);
+  const std::string cloud_topic = namespace_name + "/cloud";
+  const std::string odom_topic = namespace_name + "/odom";
+  rclcpp::NodeOptions options;
+  options.arguments({
+    "--ros-args", "-r", "__ns:=" + namespace_name,
+    "-r", "__node:=terrain_mapper",
+  });
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat_obstacle"),
+    rclcpp::Parameter("flat_ground_confirmed", true),
+    rclcpp::Parameter("cloud_topic", cloud_topic),
+    rclcpp::Parameter("odom_topic", odom_topic),
+    rclcpp::Parameter("resolution", 0.2),
+    rclcpp::Parameter("size_x", 2.0),
+    rclcpp::Parameter("size_y", 2.0),
+    rclcpp::Parameter("origin_x", -1.0),
+    rclcpp::Parameter("origin_y", -1.0),
+    rclcpp::Parameter("publish_rate", 50.0),
+  });
+  auto flat_mapper = std::make_shared<TerrainMapperNode>(options);
+  auto flat_cloud_pub = harness_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+    cloud_topic, rclcpp::SensorDataQoS());
+  auto flat_odom_pub = harness_node_->create_publisher<nav_msgs::msg::Odometry>(
+    odom_topic, rclcpp::SensorDataQoS());
+  std::vector<utree_dog_msgs::msg::TerrainGrid> maps;
+  std::vector<nav_msgs::msg::GridCells> raw_layers;
+  std::vector<nav_msgs::msg::GridCells> inflated_layers;
+  const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
+  auto map_sub = harness_node_->create_subscription<utree_dog_msgs::msg::TerrainGrid>(
+    namespace_name + "/terrain_map", map_qos,
+    [&maps](const utree_dog_msgs::msg::TerrainGrid::SharedPtr msg) {maps.push_back(*msg);});
+  auto raw_sub = harness_node_->create_subscription<nav_msgs::msg::GridCells>(
+    namespace_name + "/flat_obstacle_raw", map_qos,
+    [&raw_layers](const nav_msgs::msg::GridCells::SharedPtr msg) {raw_layers.push_back(*msg);});
+  auto inflated_sub = harness_node_->create_subscription<nav_msgs::msg::GridCells>(
+    namespace_name + "/flat_obstacle_inflated", map_qos,
+    [&inflated_layers](const nav_msgs::msg::GridCells::SharedPtr msg) {
+      inflated_layers.push_back(*msg);
+    });
+  executor_.add_node(flat_mapper);
+  ASSERT_TRUE(spinUntil(
+      [&flat_cloud_pub, &flat_odom_pub, &map_sub, &raw_sub, &inflated_sub]() {
+        return flat_cloud_pub->get_subscription_count() == 1U &&
+               flat_odom_pub->get_subscription_count() == 1U &&
+               map_sub->get_publisher_count() == 1U && raw_sub->get_publisher_count() == 1U &&
+               inflated_sub->get_publisher_count() == 1U;
+      },
+      1s));
+
+  nav_msgs::msg::Odometry odom;
+  odom.header.stamp = harness_node_->now();
+  odom.header.frame_id = "wrong_frame";
+  odom.child_frame_id = "base_link";
+  odom.pose.pose.position.z = 0.42;
+  odom.pose.pose.orientation.w = 1.0;
+  flat_odom_pub->publish(odom);
+  spinFor(30ms);
+  odom.header.stamp = harness_node_->now();
+  odom.header.frame_id = "world";
+  odom.child_frame_id = "wrong_child";
+  flat_odom_pub->publish(odom);
+  spinFor(30ms);
+  flat_cloud_pub->publish(makeCloud(harness_node_->now(), {{{0.5F, 0.1F, 0.10F}}}));
+  spinFor(100ms);
+  EXPECT_TRUE(maps.empty());
+
+  odom.header.stamp = harness_node_->now();
+  odom.header.frame_id = "world";
+  odom.child_frame_id = "base_link";
+  flat_odom_pub->publish(odom);
+  spinFor(30ms);
+  const builtin_interfaces::msg::Time cloud_stamp = harness_node_->now();
+  flat_cloud_pub->publish(makeCloud(cloud_stamp, {{{0.5F, 0.1F, 0.10F}}}));
+  ASSERT_TRUE(spinUntil(
+      [&maps, &raw_layers, &inflated_layers, &cloud_stamp]() {
+        return !maps.empty() && !raw_layers.empty() && !inflated_layers.empty() &&
+               maps.back().header.stamp.sec == cloud_stamp.sec &&
+               maps.back().header.stamp.nanosec == cloud_stamp.nanosec;
+      },
+      1s));
+
+  const std::size_t obstacle_cell = cellIndex(maps.back(), 0.5, 0.1);
+  EXPECT_FLOAT_EQ(maps.back().elevation[obstacle_cell], 0.0F);
+  EXPECT_FLOAT_EQ(maps.back().traversability[obstacle_cell], 0.0F);
+  EXPECT_EQ(raw_layers.back().cells.size(), 1U);
+  EXPECT_EQ(inflated_layers.back().cells.size(), 9U);
+
+  executor_.remove_node(flat_mapper);
 }
 
 }  // namespace
