@@ -55,10 +55,13 @@ def make_grid(
         origin_y=0.0,
         unknown_value=UNKNOWN,
         elevation=[0.0] * cells,
+        variance=[0.001] * cells,
         slope=[0.0] * cells,
         roughness=[0.0] * cells,
         traversability=[1.0] * cells,
         observation_count=[4] * cells,
+        confidence=[1.0] * cells,
+        age=[0.0] * cells,
     )
 
 
@@ -896,14 +899,20 @@ class PlannerInputInspectionTests(unittest.TestCase):
             origin_y=-2.0,
             unknown_value=UNKNOWN,
             elevation=[0.2],
+            variance=[0.003],
             slope=[0.1],
             roughness=[0.02],
             traversability=[0.7],
             observation_count=[6],
+            confidence=[0.8],
+            age=[0.4],
         )
         snapshot = _grid_snapshot(message)
+        self.assertEqual(snapshot.variance, [0.003])
         self.assertEqual(snapshot.roughness, [0.02])
         self.assertEqual(snapshot.observation_count, [6])
+        self.assertEqual(snapshot.confidence, [0.8])
+        self.assertEqual(snapshot.age, [0.4])
 
     def test_exit_codes_distinguish_ready_from_rejected_diagnoses(self) -> None:
         self.assertEqual(
@@ -1052,6 +1061,71 @@ class PlannerInputInspectionTests(unittest.TestCase):
         self.assertIn("plane_slope=", text)
         self.assertIn("max_residual=", text)
 
+    def test_verified_flat_start_reports_fit_before_elevation_range_rejection(
+        self,
+    ) -> None:
+        grid, start, _ = make_planar_blind_ring()
+        elevation = list(grid.elevation)
+        for y in range(grid.height):
+            for x in range(grid.width):
+                index = y * grid.width + x
+                if elevation[index] == UNKNOWN:
+                    continue
+                cell_x = grid.origin_x + (x + 0.5) * grid.resolution
+                elevation[index] += 0.06 * (cell_x - start.x)
+        grid = replace(grid, elevation=elevation)
+
+        result = analyze_planner_inputs(
+            grid,
+            start,
+            None,
+            verified_flat_start=VerifiedFlatStartConfig(enabled=True),
+        )
+
+        assessment = result["verified_flat_start"]
+        support_elevation = assessment["support_elevation"]
+        fit = assessment["fit"]
+        self.assertEqual(
+            result["diagnosis"], "start_has_no_valid_cell_in_snap_radius"
+        )
+        self.assertEqual(assessment["status"], "support_not_flat")
+        self.assertEqual(
+            assessment["rejection_reason"],
+            "elevation_range_exceeds_limit",
+        )
+        self.assertGreater(
+            support_elevation["range_m"],
+            assessment["config"]["max_elevation_range"],
+        )
+        self.assertAlmostEqual(
+            fit["slope_rad"], math.atan(math.hypot(0.08, -0.01)), places=6
+        )
+        self.assertAlmostEqual(fit["rmse_m"], 0.0, places=9)
+        self.assertAlmostEqual(fit["residual_range_m"], 0.0, places=9)
+        self.assertEqual(len(assessment["support_sector_elevation"]), 8)
+        self.assertEqual(
+            assessment["support_sector_convention"]["zero_direction"],
+            "map_positive_x",
+        )
+        self.assertEqual(
+            assessment["support_sector_convention"]["rotation"],
+            "counterclockwise",
+        )
+        self.assertIsNotNone(assessment["support_extrema"]["minimum"])
+        self.assertIsNotNone(assessment["support_extrema"]["maximum"])
+        self.assertIsNotNone(
+            assessment["support_extrema"]["maximum_absolute_residual"]
+        )
+        self.assertAlmostEqual(
+            assessment["support_extrema"]["minimum"]["elevation_m"],
+            support_elevation["min_m"],
+        )
+        self.assertAlmostEqual(
+            assessment["support_extrema"]["maximum"]["elevation_m"],
+            support_elevation["max_m"],
+        )
+        self.assertEqual(assessment["filled_cells"], 0)
+
     def test_verified_flat_start_rejects_insufficient_support_sectors(self) -> None:
         grid, start, _ = make_planar_blind_ring()
         elevation = list(grid.elevation)
@@ -1131,6 +1205,18 @@ class PlannerInputInspectionTests(unittest.TestCase):
             assessment["fit"]["max_residual_m"],
             assessment["config"]["max_plane_residual"],
         )
+        residual_point = assessment["support_extrema"][
+            "maximum_absolute_residual"
+        ]
+        self.assertEqual(residual_point["grid_x"], 7)
+        self.assertEqual(residual_point["grid_y"], 23)
+        self.assertAlmostEqual(
+            residual_point["absolute_residual_m"],
+            assessment["fit"]["max_residual_m"],
+        )
+        self.assertEqual(residual_point["variance_m2"], 0.001)
+        self.assertEqual(residual_point["confidence"], 1.0)
+        self.assertEqual(residual_point["age_sec"], 0.0)
         self.assertEqual(assessment["filled_cells"], 0)
 
     def test_verified_flat_start_never_accepts_an_inferred_goal(self) -> None:
@@ -1581,9 +1667,27 @@ class PlannerInputInspectionTests(unittest.TestCase):
             analyze_planner_inputs(grid, pose(1.5, 1.5), None)
 
     def test_malformed_diagnostic_layers_are_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "variance length"):
+            analyze_planner_inputs(
+                replace(make_grid(), variance=[0.0]),
+                pose(1.5, 1.5),
+                None,
+            )
         with self.assertRaisesRegex(ValueError, "roughness length"):
             analyze_planner_inputs(
                 replace(make_grid(), roughness=[0.0]),
+                pose(1.5, 1.5),
+                None,
+            )
+        with self.assertRaisesRegex(ValueError, "confidence length"):
+            analyze_planner_inputs(
+                replace(make_grid(), confidence=[1.0]),
+                pose(1.5, 1.5),
+                None,
+            )
+        with self.assertRaisesRegex(ValueError, "age length"):
+            analyze_planner_inputs(
+                replace(make_grid(), age=[0.0]),
                 pose(1.5, 1.5),
                 None,
             )

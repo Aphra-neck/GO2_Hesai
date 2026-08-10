@@ -46,10 +46,13 @@ class GridSnapshot:
     origin_y: float
     unknown_value: float
     elevation: Sequence[float]
+    variance: Sequence[float]
     slope: Sequence[float]
     roughness: Sequence[float]
     traversability: Sequence[float]
     observation_count: Sequence[int]
+    confidence: Sequence[float]
+    age: Sequence[float]
 
 
 @dataclass(frozen=True)
@@ -560,10 +563,13 @@ def _validate_grid(grid: GridSnapshot) -> None:
     expected = grid.width * grid.height
     for name, values in (
         ("elevation", grid.elevation),
+        ("variance", grid.variance),
         ("slope", grid.slope),
         ("roughness", grid.roughness),
         ("traversability", grid.traversability),
         ("observation_count", grid.observation_count),
+        ("confidence", grid.confidence),
+        ("age", grid.age),
     ):
         if len(values) != expected:
             raise ValueError(
@@ -689,6 +695,21 @@ def _known_layer_value(value: float, unknown_value: float) -> bool:
     return value != unknown_value and math.isfinite(value)
 
 
+def _linear_percentile(sorted_values: Sequence[float], fraction: float) -> float:
+    if not sorted_values:
+        raise ValueError("percentile input must not be empty")
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("percentile fraction must be in [0, 1]")
+    position = fraction * (len(sorted_values) - 1)
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    weight = position - lower
+    return (
+        sorted_values[lower] * (1.0 - weight)
+        + sorted_values[upper] * weight
+    )
+
+
 def _terrain_layer_stats(
     grid: GridSnapshot,
     thresholds: PlannerThresholds,
@@ -803,23 +824,12 @@ def _terrain_layer_stats(
 
     if known_slopes:
         known_slopes.sort()
-
-        def percentile(fraction: float) -> float:
-            position = fraction * (len(known_slopes) - 1)
-            lower = math.floor(position)
-            upper = math.ceil(position)
-            weight = position - lower
-            return (
-                known_slopes[lower] * (1.0 - weight)
-                + known_slopes[upper] * weight
-            )
-
         stats.update(
             {
                 "slope_min_rad": known_slopes[0],
-                "slope_p50_rad": percentile(0.50),
-                "slope_p90_rad": percentile(0.90),
-                "slope_p95_rad": percentile(0.95),
+                "slope_p50_rad": _linear_percentile(known_slopes, 0.50),
+                "slope_p90_rad": _linear_percentile(known_slopes, 0.90),
+                "slope_p95_rad": _linear_percentile(known_slopes, 0.95),
                 "slope_max_rad": known_slopes[-1],
             }
         )
@@ -1176,6 +1186,14 @@ def _verified_flat_start_report(
         "status": status,
         "rejection_reason": None,
         "fit": None,
+        "support_elevation": None,
+        "support_sector_convention": None,
+        "support_sector_elevation": [],
+        "support_extrema": {
+            "minimum": None,
+            "maximum": None,
+            "maximum_absolute_residual": None,
+        },
         "support_cells": 0,
         "support_sectors": 0,
         "support_cells_per_sector": [0] * config.sector_count,
@@ -1212,8 +1230,11 @@ def _assess_verified_flat_start(
         report["status"] = "invalid_configuration"
         report["rejection_reason"] = "planner_threshold_contract"
         return None, report
-    support: list[tuple[float, float, float, int]] = []
+    support: list[tuple[float, float, float, int, int]] = []
     sector_counts = [0] * config.sector_count
+    sector_elevations: list[list[float]] = [
+        [] for _ in range(config.sector_count)
+    ]
     sector_width = 2.0 * math.pi / config.sector_count
     radius_tolerance = 1.0e-9
 
@@ -1244,13 +1265,98 @@ def _assess_verified_flat_start(
                 int(angle / sector_width),
             )
             sector_counts[sector] += 1
-            support.append((dx, dy, float(elevation), index))
+            sector_elevations[sector].append(float(elevation))
+            support.append((dx, dy, float(elevation), index, sector))
 
     report["support_cells"] = len(support)
     report["support_cells_per_sector"] = sector_counts
     report["support_sectors"] = sum(
         count >= config.min_cells_per_sector for count in sector_counts
     )
+    report["support_sector_convention"] = {
+        "frame_id": grid.frame_id,
+        "zero_direction": "map_positive_x",
+        "rotation": "counterclockwise",
+        "sector_width_rad": sector_width,
+    }
+    if support:
+        elevations = sorted(point[2] for point in support)
+        elevation_range = elevations[-1] - elevations[0]
+        report["support_elevation"] = {
+            "min_m": elevations[0],
+            "p05_m": _linear_percentile(elevations, 0.05),
+            "p50_m": _linear_percentile(elevations, 0.50),
+            "p95_m": _linear_percentile(elevations, 0.95),
+            "max_m": elevations[-1],
+            "range_m": elevation_range,
+        }
+        sector_reports: list[dict[str, object]] = []
+        for sector, values in enumerate(sector_elevations):
+            ordered = sorted(values)
+            sector_reports.append(
+                {
+                    "sector": sector,
+                    "cell_count": len(ordered),
+                    "min_m": ordered[0] if ordered else None,
+                    "p05_m": (
+                        _linear_percentile(ordered, 0.05)
+                        if ordered
+                        else None
+                    ),
+                    "p50_m": (
+                        _linear_percentile(ordered, 0.50)
+                        if ordered
+                        else None
+                    ),
+                    "p95_m": (
+                        _linear_percentile(ordered, 0.95)
+                        if ordered
+                        else None
+                    ),
+                    "max_m": ordered[-1] if ordered else None,
+                    "range_m": (
+                        ordered[-1] - ordered[0] if ordered else None
+                    ),
+                }
+            )
+        report["support_sector_elevation"] = sector_reports
+
+        def support_point_report(
+            point: tuple[float, float, float, int, int]
+        ) -> dict[str, object]:
+            dx, dy, elevation, index, sector = point
+            grid_x = index % grid.width
+            grid_y = index // grid.width
+            return {
+                "grid_x": grid_x,
+                "grid_y": grid_y,
+                "world_x": (
+                    grid.origin_x + (grid_x + 0.5) * grid.resolution
+                ),
+                "world_y": (
+                    grid.origin_y + (grid_y + 0.5) * grid.resolution
+                ),
+                "radius_m": math.hypot(dx, dy),
+                "sector": sector,
+                "elevation_m": elevation,
+                "variance_m2": float(grid.variance[index]),
+                "observation_count": int(grid.observation_count[index]),
+                "slope_rad": float(grid.slope[index]),
+                "roughness_m": float(grid.roughness[index]),
+                "traversability": float(grid.traversability[index]),
+                "confidence": float(grid.confidence[index]),
+                "age_sec": float(grid.age[index]),
+            }
+
+        report["support_extrema"] = {
+            "minimum": support_point_report(
+                min(support, key=lambda point: point[2])
+            ),
+            "maximum": support_point_report(
+                max(support, key=lambda point: point[2])
+            ),
+            "maximum_absolute_residual": None,
+        }
     if len(support) < config.min_support_cells:
         report["status"] = "insufficient_support"
         report["rejection_reason"] = "min_support_cells"
@@ -1260,19 +1366,11 @@ def _assess_verified_flat_start(
         report["rejection_reason"] = "min_supported_sectors"
         return None, report
 
-    elevations = [point[2] for point in support]
-    elevation_range = max(elevations) - min(elevations)
-    if elevation_range > config.max_elevation_range:
-        report["status"] = "support_not_flat"
-        report["rejection_reason"] = "elevation_range_exceeds_limit"
-        report["fit"] = {"elevation_range_m": elevation_range}
-        return None, report
-
     mean_x = sum(point[0] for point in support) / len(support)
     mean_y = sum(point[1] for point in support) / len(support)
     mean_z = sum(point[2] for point in support) / len(support)
     xx = xy = yy = xz = yz = 0.0
-    for x, y, z, _ in support:
+    for x, y, z, _, _ in support:
         centered_x = x - mean_x
         centered_y = y - mean_y
         centered_z = z - mean_z
@@ -1284,6 +1382,14 @@ def _assess_verified_flat_start(
     determinant = xx * yy - xy * xy
     scale = max(xx * yy, 1.0)
     if not math.isfinite(determinant) or abs(determinant) <= 1.0e-12 * scale:
+        if elevation_range > config.max_elevation_range:
+            report["status"] = "support_not_flat"
+            report["rejection_reason"] = "elevation_range_exceeds_limit"
+            report["fit"] = {
+                "elevation_range_m": elevation_range,
+                "plane_fit_failure": "singular_normal_equations",
+            }
+            return None, report
         report["status"] = "plane_fit_failed"
         report["rejection_reason"] = "singular_normal_equations"
         return None, report
@@ -1292,12 +1398,29 @@ def _assess_verified_flat_start(
     height_at_start = mean_z - gradient_x * mean_x - gradient_y * mean_y
     residuals = [
         z - (height_at_start + gradient_x * x + gradient_y * y)
-        for x, y, z, _ in support
+        for x, y, z, _, _ in support
     ]
+    ordered_residuals = sorted(residuals)
+    ordered_absolute_residuals = sorted(abs(value) for value in residuals)
     rmse = math.sqrt(
         sum(residual * residual for residual in residuals) / len(residuals)
     )
-    max_residual = max(abs(residual) for residual in residuals)
+    max_residual = ordered_absolute_residuals[-1]
+    max_residual_index = max(
+        range(len(residuals)), key=lambda index: abs(residuals[index])
+    )
+    maximum_residual_point = support_point_report(
+        support[max_residual_index]
+    )
+    maximum_residual_point.update(
+        {
+            "residual_m": residuals[max_residual_index],
+            "absolute_residual_m": abs(residuals[max_residual_index]),
+        }
+    )
+    support_extrema = report["support_extrema"]
+    assert isinstance(support_extrema, dict)
+    support_extrema["maximum_absolute_residual"] = maximum_residual_point
     slope = math.atan(math.hypot(gradient_x, gradient_y))
     report["fit"] = {
         "gradient_x": gradient_x,
@@ -1306,8 +1429,21 @@ def _assess_verified_flat_start(
         "slope_rad": slope,
         "rmse_m": rmse,
         "max_residual_m": max_residual,
+        "absolute_residual_p95_m": _linear_percentile(
+            ordered_absolute_residuals, 0.95
+        ),
+        "residual_min_m": ordered_residuals[0],
+        "residual_p05_m": _linear_percentile(ordered_residuals, 0.05),
+        "residual_p50_m": _linear_percentile(ordered_residuals, 0.50),
+        "residual_p95_m": _linear_percentile(ordered_residuals, 0.95),
+        "residual_max_m": ordered_residuals[-1],
+        "residual_range_m": ordered_residuals[-1] - ordered_residuals[0],
         "elevation_range_m": elevation_range,
     }
+    if elevation_range > config.max_elevation_range:
+        report["status"] = "support_not_flat"
+        report["rejection_reason"] = "elevation_range_exceeds_limit"
+        return None, report
     if slope > config.max_plane_slope:
         report["status"] = "support_not_flat"
         report["rejection_reason"] = "plane_slope_exceeds_limit"
@@ -1391,7 +1527,7 @@ def _assess_verified_flat_start(
         thresholds,
     )
     connected_support = sum(
-        bool(component[index]) for _, _, _, index in support
+        bool(component[index]) for _, _, _, index, _ in support
     )
     report["connected_support_cells"] = connected_support
     if connected_support == 0:
@@ -1856,10 +1992,13 @@ def _grid_snapshot(message: object) -> GridSnapshot:
         origin_y=float(getattr(message, "origin_y")),
         unknown_value=float(getattr(message, "unknown_value")),
         elevation=getattr(message, "elevation"),
+        variance=getattr(message, "variance"),
         slope=getattr(message, "slope"),
         roughness=getattr(message, "roughness"),
         traversability=getattr(message, "traversability"),
         observation_count=getattr(message, "observation_count"),
+        confidence=getattr(message, "confidence"),
+        age=getattr(message, "age"),
     )
 
 
@@ -2172,6 +2311,66 @@ def print_human(result: dict[str, object]) -> None:
         f"connected_support={verified_flat_start['connected_support_cells']} "
         f"exact_start_inferred={verified_flat_start['exact_start_inferred']}"
     )
+    support_elevation = verified_flat_start["support_elevation"]
+    if isinstance(support_elevation, dict):
+        print(
+            "  support_elevation: "
+            f"min={support_elevation['min_m']:.6f} m "
+            f"p05={support_elevation['p05_m']:.6f} m "
+            f"p50={support_elevation['p50_m']:.6f} m "
+            f"p95={support_elevation['p95_m']:.6f} m "
+            f"max={support_elevation['max_m']:.6f} m "
+            f"range={support_elevation['range_m']:.6f} m"
+        )
+    sector_elevation = verified_flat_start["support_sector_elevation"]
+    if isinstance(sector_elevation, list) and sector_elevation:
+        sector_convention = verified_flat_start["support_sector_convention"]
+        if isinstance(sector_convention, dict):
+            print(
+                "  support_sector_convention: "
+                f"frame={sector_convention['frame_id']} "
+                f"zero={sector_convention['zero_direction']} "
+                f"rotation={sector_convention['rotation']} "
+                f"width={sector_convention['sector_width_rad']:.6f} rad"
+            )
+        sector_ranges = ", ".join(
+            (
+                f"{sector['sector']}:{sector['cell_count']}/"
+                f"{sector['range_m']:.6f}"
+                if sector["range_m"] is not None
+                else f"{sector['sector']}:0/none"
+            )
+            for sector in sector_elevation
+        )
+        print(f"  support_sector_elevation: {sector_ranges}")
+    support_extrema = verified_flat_start["support_extrema"]
+    if isinstance(support_extrema, dict):
+        for label in ("minimum", "maximum", "maximum_absolute_residual"):
+            point = support_extrema.get(label)
+            if not isinstance(point, dict):
+                continue
+            residual_text = ""
+            if "residual_m" in point:
+                residual_text = (
+                    f" residual={point['residual_m']:.6f} m"
+                    f" abs_residual={point['absolute_residual_m']:.6f} m"
+                )
+            print(
+                f"  support_{label}: "
+                f"grid=({point['grid_x']}, {point['grid_y']}) "
+                f"world=({point['world_x']:.6f}, {point['world_y']:.6f}) "
+                f"radius={point['radius_m']:.6f} m "
+                f"sector={point['sector']} "
+                f"elevation={point['elevation_m']:.6f} m "
+                f"variance={point['variance_m2']:.6f} m^2 "
+                f"observations={point['observation_count']} "
+                f"slope={point['slope_rad']:.6f} "
+                f"roughness={point['roughness_m']:.6f} m "
+                f"traversability={point['traversability']:.6f} "
+                f"confidence={point['confidence']:.6f} "
+                f"age={point['age_sec']:.6f} s"
+                f"{residual_text}"
+            )
     verified_fit = verified_flat_start["fit"]
     if isinstance(verified_fit, dict) and "slope_rad" in verified_fit:
         print(
@@ -2179,6 +2378,9 @@ def print_human(result: dict[str, object]) -> None:
             f"plane_slope={verified_fit['slope_rad']:.6f} "
             f"rmse={verified_fit['rmse_m']:.6f} m "
             f"max_residual={verified_fit['max_residual_m']:.6f} m "
+            f"abs_residual_p95="
+            f"{verified_fit['absolute_residual_p95_m']:.6f} m "
+            f"residual_range={verified_fit['residual_range_m']:.6f} m "
             f"elevation_range={verified_fit['elevation_range_m']:.6f} m "
             f"gradient=({verified_fit['gradient_x']:.6f}, "
             f"{verified_fit['gradient_y']:.6f})"

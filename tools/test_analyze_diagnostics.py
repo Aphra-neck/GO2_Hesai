@@ -257,10 +257,13 @@ class PlannerInspectionAnalysisTests(unittest.TestCase):
             origin_y=0.0,
             unknown_value=-999.0,
             elevation=[0.0] * 9,
+            variance=[0.0] * 9,
             slope=[0.0] * 9,
             roughness=[0.0] * 9,
             traversability=[1.0] * 9,
             observation_count=[4] * 9,
+            confidence=[1.0] * 9,
+            age=[0.0] * 9,
         )
         start = Pose2D(
             x=1.5,
