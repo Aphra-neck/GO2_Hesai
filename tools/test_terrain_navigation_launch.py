@@ -146,6 +146,9 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             if node.kwargs.get("name") == "flat_obstacle_map_recorder"
         )
         recorder_parameters = recorder.kwargs["parameters"][0]
+        self.assertEqual(
+            recorder_parameters["topic"], "/flat_obstacle_filtered_map_3d"
+        )
         self.assertEqual(recorder_parameters["navigation_config"].name, "config")
         mapper_overrides = [
             value
@@ -153,6 +156,7 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             if isinstance(value, dict) and "planning_mode" in value
         ]
         self.assertEqual(len(mapper_overrides), 1)
+        self.assertEqual(mapper.kwargs["parameters"][0].name, "config")
         self.assertEqual(
             set(mapper_overrides[0]),
             {
@@ -297,11 +301,8 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             {
                 "flat_obstacle.min_height": mapper["flat_obstacle.min_height"],
                 "flat_obstacle.max_height": mapper["flat_obstacle.max_height"],
-                "flat_obstacle.voxel_height": mapper[
-                    "flat_obstacle.voxel_height"
-                ],
-                "flat_obstacle.strong_hit_points": mapper[
-                    "flat_obstacle.strong_hit_points"
+                "flat_obstacle.voxel_resolution_z": mapper[
+                    "flat_obstacle.voxel_resolution_z"
                 ],
                 "flat_obstacle.hit_confirmation_frames": mapper[
                     "flat_obstacle.hit_confirmation_frames"
@@ -324,6 +325,36 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
                 "flat_obstacle.max_odom_age": mapper[
                     "flat_obstacle.max_odom_age"
                 ],
+                "flat_obstacle.ground_fit.max_range": mapper[
+                    "flat_obstacle.ground_fit.max_range"
+                ],
+                "flat_obstacle.ground_fit.seed_height_tolerance": mapper[
+                    "flat_obstacle.ground_fit.seed_height_tolerance"
+                ],
+                "flat_obstacle.ground_fit.max_anchor_error": mapper[
+                    "flat_obstacle.ground_fit.max_anchor_error"
+                ],
+                "flat_obstacle.ground_fit.cell_size": mapper[
+                    "flat_obstacle.ground_fit.cell_size"
+                ],
+                "flat_obstacle.ground_fit.min_points": mapper[
+                    "flat_obstacle.ground_fit.min_points"
+                ],
+                "flat_obstacle.ground_fit.min_span": mapper[
+                    "flat_obstacle.ground_fit.min_span"
+                ],
+                "flat_obstacle.ground_fit.inlier_distance": mapper[
+                    "flat_obstacle.ground_fit.inlier_distance"
+                ],
+                "flat_obstacle.ground_fit.min_inlier_ratio": mapper[
+                    "flat_obstacle.ground_fit.min_inlier_ratio"
+                ],
+                "flat_obstacle.ground_fit.max_rmse": mapper[
+                    "flat_obstacle.ground_fit.max_rmse"
+                ],
+                "flat_obstacle.ground_fit.max_tilt": mapper[
+                    "flat_obstacle.ground_fit.max_tilt"
+                ],
                 "flat_obstacle.visualization.voxel_size": mapper[
                     "flat_obstacle.visualization.voxel_size"
                 ],
@@ -334,8 +365,7 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             {
                 "flat_obstacle.min_height": 0.08,
                 "flat_obstacle.max_height": 0.80,
-                "flat_obstacle.voxel_height": 0.10,
-                "flat_obstacle.strong_hit_points": 3,
+                "flat_obstacle.voxel_resolution_z": 0.10,
                 "flat_obstacle.hit_confirmation_frames": 2,
                 "flat_obstacle.hit_confirmation_window": 0.35,
                 "flat_obstacle.clear_confirmation_frames": 2,
@@ -343,10 +373,23 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
                 "flat_obstacle.obstacle_clearance": 0.10,
                 "flat_obstacle.nominal_body_height": 0.34,
                 "flat_obstacle.max_odom_age": 0.5,
+                "flat_obstacle.ground_fit.max_range": 3.0,
+                "flat_obstacle.ground_fit.seed_height_tolerance": 0.20,
+                "flat_obstacle.ground_fit.max_anchor_error": 0.06,
+                "flat_obstacle.ground_fit.cell_size": 0.20,
+                "flat_obstacle.ground_fit.min_points": 24,
+                "flat_obstacle.ground_fit.min_span": 0.80,
+                "flat_obstacle.ground_fit.inlier_distance": 0.04,
+                "flat_obstacle.ground_fit.min_inlier_ratio": 0.55,
+                "flat_obstacle.ground_fit.max_rmse": 0.04,
+                "flat_obstacle.ground_fit.max_tilt": 0.20,
                 "flat_obstacle.visualization.voxel_size": 0.30,
                 "flat_obstacle.visualization.max_points": 5000,
             },
         )
+        self.assertNotIn("flat_obstacle.voxel_height", mapper)
+        self.assertNotIn("flat_obstacle.strong_hit_points", mapper)
+        self.assertIs(type(mapper["flat_obstacle.ground_fit.min_points"]), int)
         self.assertEqual(
             {
                 "flat_obstacle.footprint_length": planner[
@@ -370,7 +413,37 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             planner["flat_obstacle.obstacle_clearance"],
         )
 
-    def test_flat_obstacle_rviz_separates_3d_obstacles_and_2d_clearance(self):
+    def test_map_capture_is_a_diagnostic_only_sidecar(self):
+        description = _load_launch_description()
+        nodes = [entity for entity in description.entities if "name" in entity.kwargs]
+        mapper = next(
+            node for node in nodes if node.kwargs.get("name") == "terrain_mapper"
+        )
+        planner = next(
+            node
+            for node in nodes
+            if node.kwargs.get("name") == "body_lattice_planner"
+        )
+        recorder = next(
+            node
+            for node in nodes
+            if node.kwargs.get("name") == "flat_obstacle_map_recorder"
+        )
+
+        self.assertEqual(recorder.kwargs["condition"].args[0].name, "record_3d_maps")
+        self.assertNotIn("condition", mapper.kwargs)
+        self.assertNotIn("condition", planner.kwargs)
+        for node in (mapper, planner):
+            self.assertEqual(node.kwargs["parameters"][0].name, "config")
+            overrides = {
+                key
+                for parameters in node.kwargs["parameters"]
+                if isinstance(parameters, dict)
+                for key in parameters
+            }
+            self.assertFalse(any(key.startswith("record_3d_maps") for key in overrides))
+
+    def test_flat_obstacle_rviz_separates_confirmed_live_and_2d_layers(self):
         rviz_file = os.path.join(
             REPO_ROOT,
             "src",
@@ -382,14 +455,30 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             document = yaml.safe_load(stream)
         displays = document["Visualization Manager"]["Displays"]
         by_name = {display["Name"]: display for display in displays}
-        voxels = by_name["Confirmed 3D Obstacles"]
+        confirmed = by_name["Confirmed 3D Obstacles"]
+        live = by_name["Live Filtered Points (Unconfirmed)"]
         raw = by_name["Raw Obstacle Cells"]
         inflated = by_name["Inflated Clearance Cells"]
-        self.assertEqual(voxels["Class"], "rviz_default_plugins/PointCloud2")
-        self.assertIs(voxels["Enabled"], True)
+
+        self.assertEqual(confirmed["Class"], "rviz_default_plugins/PointCloud2")
+        self.assertIs(confirmed["Enabled"], True)
         self.assertEqual(
-            voxels["Topic"]["Value"], "/flat_obstacle_confirmed_voxels"
+            confirmed["Topic"]["Value"], "/flat_obstacle_filtered_map_3d"
         )
+        self.assertEqual(confirmed["Topic"]["Reliability Policy"], "Reliable")
+        self.assertEqual(confirmed["Topic"]["Durability Policy"], "Volatile")
+        self.assertEqual(confirmed["Topic"]["Depth"], 8)
+        self.assertEqual(confirmed["Color Transformer"], "FlatColor")
+        self.assertEqual(confirmed["Color"], "255; 35; 35")
+
+        self.assertEqual(live["Class"], "rviz_default_plugins/PointCloud2")
+        self.assertIs(live["Enabled"], False)
+        self.assertEqual(live["Topic"]["Value"], "/flat_obstacle_filtered_points")
+        self.assertEqual(live["Topic"]["Reliability Policy"], "Best Effort")
+        self.assertEqual(live["Topic"]["Durability Policy"], "Volatile")
+        self.assertEqual(live["Color Transformer"], "FlatColor")
+        self.assertEqual(live["Color"], "255; 170; 0")
+
         self.assertEqual(raw["Class"], "rviz_default_plugins/GridCells")
         self.assertIs(raw["Enabled"], False)
         self.assertEqual(raw["Topic"]["Value"], "/flat_obstacle_raw")

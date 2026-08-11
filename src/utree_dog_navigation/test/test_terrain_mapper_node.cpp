@@ -14,6 +14,7 @@
 
 #include "builtin_interfaces/msg/time.hpp"
 #include "nav_msgs/msg/grid_cells.hpp"
+#include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/executors/single_threaded_executor.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -149,6 +150,25 @@ protected:
     return cloud;
   }
 
+  sensor_msgs::msg::PointCloud2 makeFlatSceneCloud(
+    const builtin_interfaces::msg::Time & stamp,
+    double body_x = 0.0, double body_y = 0.0, double ground_z = 0.0,
+    const std::vector<std::array<float, 3>> & obstacles = {}) const
+  {
+    std::vector<std::array<float, 3>> points;
+    points.reserve(81U + obstacles.size());
+    for (int y = -4; y <= 4; ++y) {
+      for (int x = -4; x <= 4; ++x) {
+        points.push_back({
+          static_cast<float>(body_x + 0.30 * static_cast<double>(x)),
+          static_cast<float>(body_y + 0.30 * static_cast<double>(y)),
+          static_cast<float>(ground_z)});
+      }
+    }
+    points.insert(points.end(), obstacles.begin(), obstacles.end());
+    return makeCloud(stamp, points);
+  }
+
   std::size_t cellIndex(
     const utree_dog_msgs::msg::TerrainGrid & terrain, double world_x, double world_y) const
   {
@@ -157,6 +177,20 @@ protected:
     const auto grid_y = static_cast<std::size_t>(
       std::floor((world_y - terrain.origin_y) / terrain.resolution));
     return grid_y * terrain.width + grid_x;
+  }
+
+  std::vector<std::array<float, 3>> pointCloudPoints(
+    const sensor_msgs::msg::PointCloud2 & cloud) const
+  {
+    std::vector<std::array<float, 3>> points;
+    points.reserve(static_cast<std::size_t>(cloud.width) * cloud.height);
+    sensor_msgs::PointCloud2ConstIterator<float> x(cloud, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> y(cloud, "y");
+    sensor_msgs::PointCloud2ConstIterator<float> z(cloud, "z");
+    for (; x != x.end(); ++x, ++y, ++z) {
+      points.push_back({*x, *y, *z});
+    }
+    return points;
   }
 
   void expectCloudStampRejected(const builtin_interfaces::msg::Time & invalid_stamp)
@@ -528,7 +562,19 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeRequiresExplicitGroundConfirmation
   EXPECT_THROW(std::make_shared<TerrainMapperNode>(options), std::invalid_argument);
 }
 
-TEST_F(TerrainMapperNodeTest, FlatObstacleModeAdvertises2DAnd3DVisualizationLayers)
+TEST_F(TerrainMapperNodeTest, FlatObstacleModeRequiresTwoDistinctHitFrames)
+{
+  rclcpp::NodeOptions options;
+  options.arguments({"--ros-args", "-r", "__node:=terrain_mapper_single_hit_frame"});
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat_obstacle"),
+    rclcpp::Parameter("flat_ground_confirmed", true),
+    rclcpp::Parameter("flat_obstacle.hit_confirmation_frames", 1),
+  });
+  EXPECT_THROW(std::make_shared<TerrainMapperNode>(options), std::invalid_argument);
+}
+
+TEST_F(TerrainMapperNodeTest, FlatObstacleModeAdvertisesFilteredObstacleLayers)
 {
   const std::string namespace_name =
     "/flat_mapper_interface_" + std::to_string(instance_count_);
@@ -551,23 +597,32 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeAdvertises2DAnd3DVisualizationLaye
                harness_node_->count_publishers(
           namespace_name + "/flat_obstacle_inflated") == 1U &&
                harness_node_->count_publishers(
-          namespace_name + "/flat_obstacle_confirmed_voxels") == 1U &&
+          namespace_name + "/flat_obstacle_filtered_points") == 1U &&
                harness_node_->count_publishers(
-          namespace_name + "/flat_obstacle_map_3d") == 1U;
+          namespace_name + "/flat_obstacle_filtered_map_3d") == 1U;
       },
       1s));
 
+  const auto live_publishers = harness_node_->get_publishers_info_by_topic(
+    namespace_name + "/flat_obstacle_filtered_points");
+  ASSERT_EQ(live_publishers.size(), 1U);
+  const auto live_qos = live_publishers.front().qos_profile().get_rmw_qos_profile();
+  EXPECT_EQ(live_qos.reliability, RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT);
+  EXPECT_EQ(live_qos.durability, RMW_QOS_POLICY_DURABILITY_VOLATILE);
+
   const auto recorder_publishers = harness_node_->get_publishers_info_by_topic(
-    namespace_name + "/flat_obstacle_map_3d");
+    namespace_name + "/flat_obstacle_filtered_map_3d");
   ASSERT_EQ(recorder_publishers.size(), 1U);
-  EXPECT_EQ(
-    recorder_publishers.front().qos_profile().get_rmw_qos_profile().reliability,
-    RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+  const auto recorder_qos = recorder_publishers.front().qos_profile().get_rmw_qos_profile();
+  EXPECT_EQ(recorder_qos.reliability, RMW_QOS_POLICY_RELIABILITY_RELIABLE);
+  EXPECT_EQ(recorder_qos.durability, RMW_QOS_POLICY_DURABILITY_VOLATILE);
+  EXPECT_DOUBLE_EQ(
+    flat_mapper->get_parameter("flat_obstacle.voxel_resolution_z").as_double(), 0.10);
 
   executor_.remove_node(flat_mapper);
 }
 
-TEST_F(TerrainMapperNodeTest, FlatObstacleModeLocksOnlyFreshWorldOdometryAndPublishesLayers)
+TEST_F(TerrainMapperNodeTest, FlatObstacleModeNeedsTwoExactStampFramesBeforePublishing)
 {
   const std::string namespace_name =
     "/flat_mapper_data_" + std::to_string(instance_count_);
@@ -584,10 +639,10 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeLocksOnlyFreshWorldOdometryAndPubl
     rclcpp::Parameter("cloud_topic", cloud_topic),
     rclcpp::Parameter("odom_topic", odom_topic),
     rclcpp::Parameter("resolution", 0.2),
-    rclcpp::Parameter("size_x", 2.0),
-    rclcpp::Parameter("size_y", 2.0),
-    rclcpp::Parameter("origin_x", -1.0),
-    rclcpp::Parameter("origin_y", -1.0),
+    rclcpp::Parameter("size_x", 4.0),
+    rclcpp::Parameter("size_y", 4.0),
+    rclcpp::Parameter("origin_x", -2.0),
+    rclcpp::Parameter("origin_y", -2.0),
     rclcpp::Parameter("publish_rate", 50.0),
   });
   auto flat_mapper = std::make_shared<TerrainMapperNode>(options);
@@ -598,8 +653,8 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeLocksOnlyFreshWorldOdometryAndPubl
   std::vector<utree_dog_msgs::msg::TerrainGrid> maps;
   std::vector<nav_msgs::msg::GridCells> raw_layers;
   std::vector<nav_msgs::msg::GridCells> inflated_layers;
-  std::vector<sensor_msgs::msg::PointCloud2> voxel_clouds;
-  std::vector<sensor_msgs::msg::PointCloud2> planning_voxel_maps;
+  std::vector<sensor_msgs::msg::PointCloud2> filtered_points;
+  std::vector<sensor_msgs::msg::PointCloud2> filtered_maps;
   const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
   auto map_sub = harness_node_->create_subscription<utree_dog_msgs::msg::TerrainGrid>(
     namespace_name + "/terrain_map", map_qos,
@@ -612,206 +667,101 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeLocksOnlyFreshWorldOdometryAndPubl
     [&inflated_layers](const nav_msgs::msg::GridCells::SharedPtr msg) {
       inflated_layers.push_back(*msg);
     });
-  auto voxel_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-    namespace_name + "/flat_obstacle_confirmed_voxels", rclcpp::SensorDataQoS(),
-    [&voxel_clouds](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-      voxel_clouds.push_back(*msg);
+  auto filtered_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+    namespace_name + "/flat_obstacle_filtered_points", rclcpp::SensorDataQoS(),
+    [&filtered_points](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      filtered_points.push_back(*msg);
     });
-  auto planning_voxel_sub =
-    harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-    namespace_name + "/flat_obstacle_map_3d", rclcpp::SensorDataQoS(),
-    [&planning_voxel_maps](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-      planning_voxel_maps.push_back(*msg);
+  auto filtered_map_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+    namespace_name + "/flat_obstacle_filtered_map_3d",
+    rclcpp::QoS(8).reliable().durability_volatile(),
+    [&filtered_maps](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      filtered_maps.push_back(*msg);
     });
   executor_.add_node(flat_mapper);
   ASSERT_TRUE(spinUntil(
-      [&flat_cloud_pub, &flat_odom_pub, &map_sub, &raw_sub, &inflated_sub, &voxel_sub,
-        &planning_voxel_sub]() {
+      [&flat_cloud_pub, &flat_odom_pub, &map_sub, &raw_sub, &inflated_sub,
+        &filtered_sub, &filtered_map_sub]() {
         return flat_cloud_pub->get_subscription_count() == 1U &&
                flat_odom_pub->get_subscription_count() == 1U &&
-               map_sub->get_publisher_count() == 1U && raw_sub->get_publisher_count() == 1U &&
+               map_sub->get_publisher_count() == 1U &&
+               raw_sub->get_publisher_count() == 1U &&
                inflated_sub->get_publisher_count() == 1U &&
-               voxel_sub->get_publisher_count() == 1U &&
-               planning_voxel_sub->get_publisher_count() == 1U;
+               filtered_sub->get_publisher_count() == 1U &&
+               filtered_map_sub->get_publisher_count() == 1U;
       },
       1s));
 
   nav_msgs::msg::Odometry odom;
-  odom.header.stamp = harness_node_->now();
-  odom.header.frame_id = "wrong_frame";
+  odom.header.frame_id = "world";
   odom.child_frame_id = "base_link";
   odom.pose.pose.position.z = 0.34;
   odom.pose.pose.orientation.w = 1.0;
-  flat_odom_pub->publish(odom);
-  spinFor(30ms);
-  odom.header.stamp = harness_node_->now();
-  odom.header.frame_id = "world";
-  odom.child_frame_id = "wrong_child";
-  flat_odom_pub->publish(odom);
-  spinFor(30ms);
-  flat_cloud_pub->publish(makeCloud(harness_node_->now(), {{{0.5F, 0.1F, 0.10F}}}));
-  spinFor(100ms);
-  EXPECT_TRUE(maps.empty());
+  const std::array<float, 3> confirmed_obstacle{{0.85F, 0.35F, 0.12F}};
+  const std::array<float, 3> current_frame_only_obstacle{{-0.85F, 0.35F, 0.22F}};
+  const std::vector<std::array<float, 3>> first_obstacles{{confirmed_obstacle}};
 
-  const builtin_interfaces::msg::Time cloud_stamp = harness_node_->now();
-  odom.header.stamp = cloud_stamp;
-  odom.header.frame_id = "world";
-  odom.child_frame_id = "base_link";
-  flat_cloud_pub->publish(makeCloud(
-      cloud_stamp,
-      {{{0.50F, 0.10F, 0.10F}, {0.51F, 0.11F, 0.11F}, {0.52F, 0.12F, 0.12F}}}));
+  const builtin_interfaces::msg::Time first_stamp = harness_node_->now();
+  odom.header.stamp = first_stamp;
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      first_stamp, 0.0, 0.0, 0.0, first_obstacles));
   spinFor(30ms);
   EXPECT_TRUE(maps.empty());
   flat_odom_pub->publish(odom);
   ASSERT_TRUE(spinUntil(
-      [&maps, &raw_layers, &inflated_layers, &voxel_clouds, &planning_voxel_maps,
-        &cloud_stamp]() {
-        return !maps.empty() && !raw_layers.empty() && !inflated_layers.empty() &&
-               !voxel_clouds.empty() && voxel_clouds.back().width == 1U &&
-               !planning_voxel_maps.empty() && planning_voxel_maps.back().width == 1U &&
-               maps.back().header.stamp.sec == cloud_stamp.sec &&
-               maps.back().header.stamp.nanosec == cloud_stamp.nanosec;
+      [&maps, &raw_layers, &filtered_points, &filtered_maps, &first_stamp]() {
+        return !maps.empty() && maps.back().header.stamp.sec == first_stamp.sec &&
+               maps.back().header.stamp.nanosec == first_stamp.nanosec &&
+               maps.back().traversability.empty() && !raw_layers.empty() &&
+               raw_layers.back().cells.empty() && !filtered_points.empty() &&
+               filtered_points.back().width == 1U && !filtered_maps.empty() &&
+               filtered_maps.back().width == 0U;
       },
       1s));
 
-  const std::size_t obstacle_cell = cellIndex(maps.back(), 0.5, 0.1);
-  EXPECT_FLOAT_EQ(maps.back().elevation[obstacle_cell], 0.0F);
+  maps.clear();
+  raw_layers.clear();
+  inflated_layers.clear();
+  filtered_points.clear();
+  filtered_maps.clear();
+  spinFor(20ms);
+  const builtin_interfaces::msg::Time second_stamp = harness_node_->now();
+  odom.header.stamp = second_stamp;
+  flat_odom_pub->publish(odom);
+  const std::vector<std::array<float, 3>> second_obstacles{
+    confirmed_obstacle, current_frame_only_obstacle};
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      second_stamp, 0.0, 0.0, 0.0, second_obstacles));
+  ASSERT_TRUE(spinUntil(
+      [&maps, &raw_layers, &inflated_layers, &filtered_points, &filtered_maps,
+        &second_stamp]() {
+        return !maps.empty() && !maps.back().traversability.empty() &&
+               maps.back().header.stamp.sec == second_stamp.sec &&
+               maps.back().header.stamp.nanosec == second_stamp.nanosec &&
+               !raw_layers.empty() && raw_layers.back().cells.size() == 1U &&
+               !inflated_layers.empty() && !inflated_layers.back().cells.empty() &&
+               !filtered_points.empty() && filtered_points.back().width == 2U &&
+               !filtered_maps.empty() && filtered_maps.back().width == 1U;
+      },
+      1s));
+
+  const std::size_t obstacle_cell = cellIndex(maps.back(), 0.85, 0.35);
+  EXPECT_NEAR(maps.back().elevation[obstacle_cell], 0.0F, 1.0e-4F);
   EXPECT_FLOAT_EQ(maps.back().traversability[obstacle_cell], 0.0F);
-  EXPECT_EQ(raw_layers.back().cells.size(), 1U);
-  EXPECT_EQ(inflated_layers.back().cells.size(), 9U);
-
-  executor_.remove_node(flat_mapper);
-}
-
-TEST_F(TerrainMapperNodeTest, FlatObstacleModeDoesNotRefreshForFilteredOrUnmatchedCloud)
-{
-  const std::string namespace_name =
-    "/flat_mapper_exact_pose_" + std::to_string(instance_count_);
-  const std::string cloud_topic = namespace_name + "/cloud";
-  const std::string odom_topic = namespace_name + "/odom";
-  rclcpp::NodeOptions options;
-  options.arguments({
-    "--ros-args", "-r", "__ns:=" + namespace_name,
-    "-r", "__node:=terrain_mapper",
-  });
-  options.parameter_overrides({
-    rclcpp::Parameter("planning_mode", "flat_obstacle"),
-    rclcpp::Parameter("flat_ground_confirmed", true),
-    rclcpp::Parameter("cloud_topic", cloud_topic),
-    rclcpp::Parameter("odom_topic", odom_topic),
-    rclcpp::Parameter("resolution", 0.2),
-    rclcpp::Parameter("size_x", 2.0),
-    rclcpp::Parameter("size_y", 2.0),
-    rclcpp::Parameter("origin_x", -1.0),
-    rclcpp::Parameter("origin_y", -1.0),
-    rclcpp::Parameter("publish_rate", 50.0),
-  });
-  auto flat_mapper = std::make_shared<TerrainMapperNode>(options);
-  auto flat_cloud_pub = harness_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
-    cloud_topic, rclcpp::SensorDataQoS());
-  auto flat_odom_pub = harness_node_->create_publisher<nav_msgs::msg::Odometry>(
-    odom_topic, rclcpp::SensorDataQoS());
-  std::vector<utree_dog_msgs::msg::TerrainGrid> maps;
-  const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
-  auto map_sub = harness_node_->create_subscription<utree_dog_msgs::msg::TerrainGrid>(
-    namespace_name + "/terrain_map", map_qos,
-    [&maps](const utree_dog_msgs::msg::TerrainGrid::SharedPtr msg) {maps.push_back(*msg);});
-  executor_.add_node(flat_mapper);
-  ASSERT_TRUE(spinUntil(
-      [&flat_cloud_pub, &flat_odom_pub, &map_sub]() {
-        return flat_cloud_pub->get_subscription_count() == 1U &&
-               flat_odom_pub->get_subscription_count() == 1U &&
-               map_sub->get_publisher_count() == 1U;
-      },
-      1s));
-
-  nav_msgs::msg::Odometry odom;
-  odom.header.frame_id = "world";
-  odom.child_frame_id = "base_link";
-  odom.pose.pose.position.z = 0.34;
-  odom.pose.pose.orientation.w = 1.0;
-  const builtin_interfaces::msg::Time accepted_stamp = harness_node_->now();
-  odom.header.stamp = accepted_stamp;
-  flat_odom_pub->publish(odom);
-  flat_cloud_pub->publish(makeCloud(
-      accepted_stamp,
-      {{{0.50F, 0.10F, 0.10F}, {0.51F, 0.11F, 0.11F}, {0.52F, 0.12F, 0.12F}}}));
-  ASSERT_TRUE(spinUntil(
-      [&maps, &accepted_stamp]() {
-        return !maps.empty() &&
-               maps.back().header.stamp.sec == accepted_stamp.sec &&
-               maps.back().header.stamp.nanosec == accepted_stamp.nanosec;
-      },
-      1s));
-
-  maps.clear();
-  const builtin_interfaces::msg::Time filtered_stamp = harness_node_->now();
-  odom.header.stamp = filtered_stamp;
-  flat_odom_pub->publish(odom);
-  flat_cloud_pub->publish(makeCloud(filtered_stamp, {{{0.10F, 0.0F, 0.34F}}}));
-  spinFor(80ms);
-  ASSERT_FALSE(maps.empty());
-  EXPECT_TRUE(std::all_of(
-      maps.begin(), maps.end(), [&accepted_stamp](const auto & map) {
-        return map.header.stamp.sec == accepted_stamp.sec &&
-               map.header.stamp.nanosec == accepted_stamp.nanosec;
-      }));
-
-  maps.clear();
-  const builtin_interfaces::msg::Time unmatched_stamp = harness_node_->now();
-  flat_cloud_pub->publish(makeCloud(
-      unmatched_stamp,
-      {{{-0.50F, 0.10F, 0.10F}, {-0.51F, 0.11F, 0.11F}, {-0.52F, 0.12F, 0.12F}}}));
-  spinFor(80ms);
-  ASSERT_FALSE(maps.empty());
-  EXPECT_TRUE(std::all_of(
-      maps.begin(), maps.end(), [&accepted_stamp](const auto & map) {
-        return map.header.stamp.sec == accepted_stamp.sec &&
-               map.header.stamp.nanosec == accepted_stamp.nanosec;
-      }));
-
-  odom.header.stamp = unmatched_stamp;
-  flat_odom_pub->publish(odom);
-  ASSERT_TRUE(spinUntil(
-      [&maps, &unmatched_stamp]() {
-        return !maps.empty() &&
-               maps.back().header.stamp.sec == unmatched_stamp.sec &&
-               maps.back().header.stamp.nanosec == unmatched_stamp.nanosec;
-      },
-      1s));
-
-  maps.clear();
-  const builtin_interfaces::msg::Time rollback_stamp =
-    rclcpp::Time(unmatched_stamp) - rclcpp::Duration::from_seconds(0.05);
-  flat_cloud_pub->publish(makeCloud(rollback_stamp, {{{0.10F, 0.0F, 0.34F}}}));
-  spinFor(30ms);
-  odom.header.stamp = rollback_stamp;
-  flat_odom_pub->publish(odom);
-  ASSERT_TRUE(spinUntil(
-      [&maps, &rollback_stamp]() {
-        return std::any_of(
-          maps.begin(), maps.end(), [&rollback_stamp](const auto & map) {
-            return map.header.stamp.sec == rollback_stamp.sec &&
-                   map.header.stamp.nanosec == rollback_stamp.nanosec &&
-                   map.width == 0U && map.height == 0U;
-          });
-      },
-      1s));
-
-  maps.clear();
-  const builtin_interfaces::msg::Time recovered_stamp = harness_node_->now();
-  odom.header.stamp = recovered_stamp;
-  flat_odom_pub->publish(odom);
-  flat_cloud_pub->publish(makeCloud(
-      recovered_stamp,
-      {{{-0.50F, 0.10F, 0.10F}, {-0.51F, 0.11F, 0.11F}, {-0.52F, 0.12F, 0.12F}}}));
-  ASSERT_TRUE(spinUntil(
-      [&maps, &recovered_stamp]() {
-        return !maps.empty() &&
-               maps.back().header.stamp.sec == recovered_stamp.sec &&
-               maps.back().header.stamp.nanosec == recovered_stamp.nanosec;
-      },
-      1s));
+  const auto live_points = pointCloudPoints(filtered_points.back());
+  const auto contains_point = [](const auto & points, const auto & expected) {
+      return std::any_of(
+        points.begin(), points.end(), [&expected](const auto & point) {
+          return std::abs(point[0] - expected[0]) < 1.0e-4F &&
+                 std::abs(point[1] - expected[1]) < 1.0e-4F &&
+                 std::abs(point[2] - expected[2]) < 1.0e-4F;
+        });
+    };
+  EXPECT_TRUE(contains_point(live_points, confirmed_obstacle));
+  EXPECT_TRUE(contains_point(live_points, current_frame_only_obstacle));
+  const auto confirmed_points = pointCloudPoints(filtered_maps.back());
+  ASSERT_EQ(confirmed_points.size(), 1U);
+  EXPECT_TRUE(contains_point(confirmed_points, confirmed_obstacle));
 
   executor_.remove_node(flat_mapper);
 }
@@ -833,7 +783,7 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeClearsOldEpochAfterPoseJump)
     rclcpp::Parameter("cloud_topic", cloud_topic),
     rclcpp::Parameter("odom_topic", odom_topic),
     rclcpp::Parameter("resolution", 0.2),
-    rclcpp::Parameter("size_x", 6.0),
+    rclcpp::Parameter("size_x", 4.0),
     rclcpp::Parameter("size_y", 4.0),
     rclcpp::Parameter("origin_x", -2.0),
     rclcpp::Parameter("origin_y", -2.0),
@@ -863,52 +813,348 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeClearsOldEpochAfterPoseJump)
   odom.child_frame_id = "base_link";
   odom.pose.pose.position.z = 0.34;
   odom.pose.pose.orientation.w = 1.0;
-  builtin_interfaces::msg::Time stamp = harness_node_->now();
-  odom.header.stamp = stamp;
-  flat_odom_pub->publish(odom);
-  flat_cloud_pub->publish(makeCloud(
-      stamp,
-      {{{0.80F, 0.10F, 0.10F}, {0.81F, 0.11F, 0.11F}, {0.82F, 0.12F, 0.12F}}}));
-  ASSERT_TRUE(spinUntil([&maps]() {return !maps.empty();}, 1s));
-  ASSERT_EQ(
-    std::count(maps.back().traversability.begin(), maps.back().traversability.end(), 0.0F),
-    1);
+  const std::vector<std::array<float, 3>> first_obstacle{{{0.80F, 0.30F, 0.12F}}};
+  for (int frame = 0; frame < 2; ++frame) {
+    spinFor(20ms);
+    const builtin_interfaces::msg::Time stamp = harness_node_->now();
+    odom.header.stamp = stamp;
+    flat_odom_pub->publish(odom);
+    flat_cloud_pub->publish(makeFlatSceneCloud(stamp, 0.0, 0.0, 0.0, first_obstacle));
+  }
+  ASSERT_TRUE(spinUntil(
+      [&maps]() {
+        return !maps.empty() && !maps.back().traversability.empty() &&
+               std::count(
+          maps.back().traversability.begin(), maps.back().traversability.end(), 0.0F) == 1;
+      },
+      1s));
 
   maps.clear();
-  stamp = harness_node_->now();
-  odom.header.stamp = stamp;
+  spinFor(20ms);
+  builtin_interfaces::msg::Time jump_stamp = harness_node_->now();
+  odom.header.stamp = jump_stamp;
   odom.pose.pose.position.x = 1.5;
   odom.pose.pose.position.z = 1.34;
   flat_odom_pub->publish(odom);
   ASSERT_TRUE(spinUntil(
-      [&maps, &stamp]() {
+      [&maps, &jump_stamp]() {
         return !maps.empty() && maps.back().traversability.empty() &&
-               maps.back().header.stamp.sec == stamp.sec &&
-               maps.back().header.stamp.nanosec == stamp.nanosec;
+               maps.back().header.stamp.sec == jump_stamp.sec &&
+               maps.back().header.stamp.nanosec == jump_stamp.nanosec;
       },
       1s));
 
+  const std::vector<std::array<float, 3>> second_obstacle{{{2.30F, 0.30F, 1.12F}}};
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      jump_stamp, 1.5, 0.0, 1.0, second_obstacle));
+  spinFor(30ms);
   maps.clear();
-  flat_cloud_pub->publish(makeCloud(
-      stamp,
-      {{{2.30F, 0.10F, 1.10F}, {2.31F, 0.11F, 1.11F}, {2.32F, 0.12F, 1.12F}}}));
+  spinFor(20ms);
+  const builtin_interfaces::msg::Time recovered_stamp = harness_node_->now();
+  odom.header.stamp = recovered_stamp;
+  flat_odom_pub->publish(odom);
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      recovered_stamp, 1.5, 0.0, 1.0, second_obstacle));
   ASSERT_TRUE(spinUntil(
-      [&maps, &stamp]() {
+      [&maps, &recovered_stamp]() {
         return !maps.empty() && !maps.back().traversability.empty() &&
-               maps.back().header.stamp.sec == stamp.sec &&
-               maps.back().header.stamp.nanosec == stamp.nanosec;
+               maps.back().header.stamp.sec == recovered_stamp.sec &&
+               maps.back().header.stamp.nanosec == recovered_stamp.nanosec;
       },
       1s));
-  EXPECT_EQ(
-    std::count(maps.back().traversability.begin(), maps.back().traversability.end(), 0.0F),
-    1);
-  EXPECT_FLOAT_EQ(maps.back().traversability[cellIndex(maps.back(), 0.8, 0.1)], 1.0F);
-  EXPECT_FLOAT_EQ(maps.back().traversability[cellIndex(maps.back(), 2.3, 0.1)], 0.0F);
+  EXPECT_FLOAT_EQ(maps.back().traversability[cellIndex(maps.back(), 0.8, 0.3)], 1.0F);
+  EXPECT_FLOAT_EQ(maps.back().traversability[cellIndex(maps.back(), 2.3, 0.3)], 0.0F);
 
   executor_.remove_node(flat_mapper);
 }
 
-TEST_F(TerrainMapperNodeTest, FlatObstacleStaleSourceClearsOnlyLiveVisualizationLayers)
+TEST_F(TerrainMapperNodeTest, FlatObstacleSourceStampRollbackPublishesEmpty3DState)
+{
+  const std::string namespace_name =
+    "/flat_mapper_stamp_rollback_" + std::to_string(instance_count_);
+  const std::string cloud_topic = namespace_name + "/cloud";
+  const std::string odom_topic = namespace_name + "/odom";
+  rclcpp::NodeOptions options;
+  options.arguments({
+    "--ros-args", "-r", "__ns:=" + namespace_name,
+    "-r", "__node:=terrain_mapper",
+  });
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat_obstacle"),
+    rclcpp::Parameter("flat_ground_confirmed", true),
+    rclcpp::Parameter("cloud_topic", cloud_topic),
+    rclcpp::Parameter("odom_topic", odom_topic),
+    rclcpp::Parameter("resolution", 0.2),
+    rclcpp::Parameter("size_x", 4.0),
+    rclcpp::Parameter("size_y", 4.0),
+    rclcpp::Parameter("origin_x", -2.0),
+    rclcpp::Parameter("origin_y", -2.0),
+    rclcpp::Parameter("publish_rate", 100.0),
+    rclcpp::Parameter("cloud_stale_warning_age", 2.0),
+  });
+  auto flat_mapper = std::make_shared<TerrainMapperNode>(options);
+  auto flat_cloud_pub = harness_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+    cloud_topic, rclcpp::SensorDataQoS());
+  auto flat_odom_pub = harness_node_->create_publisher<nav_msgs::msg::Odometry>(
+    odom_topic, rclcpp::SensorDataQoS());
+  std::vector<utree_dog_msgs::msg::TerrainGrid> maps;
+  std::vector<sensor_msgs::msg::PointCloud2> filtered_points;
+  std::vector<sensor_msgs::msg::PointCloud2> filtered_maps;
+  const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
+  auto map_sub = harness_node_->create_subscription<utree_dog_msgs::msg::TerrainGrid>(
+    namespace_name + "/terrain_map", map_qos,
+    [&maps](const utree_dog_msgs::msg::TerrainGrid::SharedPtr msg) {maps.push_back(*msg);});
+  auto filtered_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+    namespace_name + "/flat_obstacle_filtered_points", rclcpp::SensorDataQoS(),
+    [&filtered_points](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      filtered_points.push_back(*msg);
+    });
+  auto filtered_map_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+    namespace_name + "/flat_obstacle_filtered_map_3d",
+    rclcpp::QoS(8).reliable().durability_volatile(),
+    [&filtered_maps](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      filtered_maps.push_back(*msg);
+    });
+  executor_.add_node(flat_mapper);
+  ASSERT_TRUE(spinUntil(
+      [&flat_cloud_pub, &flat_odom_pub, &map_sub, &filtered_sub, &filtered_map_sub]() {
+        return flat_cloud_pub->get_subscription_count() == 1U &&
+               flat_odom_pub->get_subscription_count() == 1U &&
+               map_sub->get_publisher_count() == 1U &&
+               filtered_sub->get_publisher_count() == 1U &&
+               filtered_map_sub->get_publisher_count() == 1U;
+      },
+      1s));
+
+  nav_msgs::msg::Odometry odom;
+  odom.header.frame_id = "world";
+  odom.child_frame_id = "base_link";
+  odom.pose.pose.position.z = 0.34;
+  odom.pose.pose.orientation.w = 1.0;
+  const std::vector<std::array<float, 3>> obstacle{{{0.80F, 0.30F, 0.12F}}};
+  builtin_interfaces::msg::Time first_stamp;
+  for (int frame = 0; frame < 2; ++frame) {
+    spinFor(20ms);
+    const builtin_interfaces::msg::Time stamp = harness_node_->now();
+    if (frame == 0) {
+      first_stamp = stamp;
+    }
+    odom.header.stamp = stamp;
+    flat_odom_pub->publish(odom);
+    flat_cloud_pub->publish(makeFlatSceneCloud(stamp, 0.0, 0.0, 0.0, obstacle));
+  }
+  ASSERT_TRUE(spinUntil(
+      [&maps, &filtered_points, &filtered_maps]() {
+        return !maps.empty() && !maps.back().traversability.empty() &&
+               !filtered_points.empty() && filtered_points.back().width == 1U &&
+               !filtered_maps.empty() && filtered_maps.back().width == 1U;
+      },
+      1s));
+
+  maps.clear();
+  filtered_points.clear();
+  filtered_maps.clear();
+  odom.header.stamp = first_stamp;
+  flat_odom_pub->publish(odom);
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      first_stamp, 0.0, 0.0, 0.0, obstacle));
+  ASSERT_TRUE(spinUntil(
+      [&maps, &filtered_points, &filtered_maps, &first_stamp]() {
+        return !maps.empty() && maps.back().traversability.empty() &&
+               maps.back().header.stamp.sec == first_stamp.sec &&
+               maps.back().header.stamp.nanosec == first_stamp.nanosec &&
+               !filtered_points.empty() && filtered_points.back().width == 1U &&
+               !filtered_maps.empty() && filtered_maps.back().width == 0U;
+      },
+      1s));
+
+  const std::array<float, 3> recovered_obstacle{{-0.80F, 0.30F, 0.22F}};
+  const std::vector<std::array<float, 3>> recovered_obstacles{{recovered_obstacle}};
+  maps.clear();
+  filtered_maps.clear();
+  spinFor(20ms);
+  const builtin_interfaces::msg::Time first_recovery_stamp = harness_node_->now();
+  odom.header.stamp = first_recovery_stamp;
+  flat_odom_pub->publish(odom);
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      first_recovery_stamp, 0.0, 0.0, 0.0, recovered_obstacles));
+  ASSERT_TRUE(spinUntil(
+      [&maps, &filtered_maps, &first_recovery_stamp]() {
+        return !maps.empty() && !maps.back().traversability.empty() &&
+               maps.back().header.stamp.sec == first_recovery_stamp.sec &&
+               maps.back().header.stamp.nanosec == first_recovery_stamp.nanosec &&
+               !filtered_maps.empty() && filtered_maps.back().width == 0U;
+      },
+      1s));
+
+  maps.clear();
+  filtered_maps.clear();
+  spinFor(20ms);
+  const builtin_interfaces::msg::Time second_recovery_stamp = harness_node_->now();
+  odom.header.stamp = second_recovery_stamp;
+  flat_odom_pub->publish(odom);
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      second_recovery_stamp, 0.0, 0.0, 0.0, recovered_obstacles));
+  ASSERT_TRUE(spinUntil(
+      [&maps, &filtered_maps, &second_recovery_stamp]() {
+        return !maps.empty() && !maps.back().traversability.empty() &&
+               maps.back().header.stamp.sec == second_recovery_stamp.sec &&
+               maps.back().header.stamp.nanosec == second_recovery_stamp.nanosec &&
+               !filtered_maps.empty() && filtered_maps.back().width == 1U;
+      },
+      1s));
+  const auto recovered_points = pointCloudPoints(filtered_maps.back());
+  ASSERT_EQ(recovered_points.size(), 1U);
+  EXPECT_NEAR(recovered_points.front()[0], recovered_obstacle[0], 1.0e-4F);
+  EXPECT_NEAR(recovered_points.front()[1], recovered_obstacle[1], 1.0e-4F);
+  EXPECT_NEAR(recovered_points.front()[2], recovered_obstacle[2], 1.0e-4F);
+
+  executor_.remove_node(flat_mapper);
+}
+
+TEST_F(TerrainMapperNodeTest, FlatObstacleUnmatchedCloudTimeoutPublishesEmpty3DState)
+{
+  const std::string namespace_name =
+    "/flat_mapper_unmatched_timeout_" + std::to_string(instance_count_);
+  const std::string cloud_topic = namespace_name + "/cloud";
+  const std::string odom_topic = namespace_name + "/odom";
+  rclcpp::NodeOptions options;
+  options.arguments({
+    "--ros-args", "-r", "__ns:=" + namespace_name,
+    "-r", "__node:=terrain_mapper",
+  });
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat_obstacle"),
+    rclcpp::Parameter("flat_ground_confirmed", true),
+    rclcpp::Parameter("cloud_topic", cloud_topic),
+    rclcpp::Parameter("odom_topic", odom_topic),
+    rclcpp::Parameter("resolution", 0.2),
+    rclcpp::Parameter("size_x", 4.0),
+    rclcpp::Parameter("size_y", 4.0),
+    rclcpp::Parameter("origin_x", -2.0),
+    rclcpp::Parameter("origin_y", -2.0),
+    rclcpp::Parameter("publish_rate", 100.0),
+    rclcpp::Parameter("cloud_stale_warning_age", 2.0),
+  });
+  auto flat_mapper = std::make_shared<TerrainMapperNode>(options);
+  auto flat_cloud_pub = harness_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+    cloud_topic, rclcpp::SensorDataQoS());
+  auto flat_odom_pub = harness_node_->create_publisher<nav_msgs::msg::Odometry>(
+    odom_topic, rclcpp::SensorDataQoS());
+  std::vector<utree_dog_msgs::msg::TerrainGrid> maps;
+  std::vector<sensor_msgs::msg::PointCloud2> filtered_points;
+  std::vector<sensor_msgs::msg::PointCloud2> filtered_maps;
+  const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
+  auto map_sub = harness_node_->create_subscription<utree_dog_msgs::msg::TerrainGrid>(
+    namespace_name + "/terrain_map", map_qos,
+    [&maps](const utree_dog_msgs::msg::TerrainGrid::SharedPtr msg) {maps.push_back(*msg);});
+  auto filtered_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+    namespace_name + "/flat_obstacle_filtered_points", rclcpp::SensorDataQoS(),
+    [&filtered_points](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      filtered_points.push_back(*msg);
+    });
+  auto filtered_map_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+    namespace_name + "/flat_obstacle_filtered_map_3d",
+    rclcpp::QoS(8).reliable().durability_volatile(),
+    [&filtered_maps](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      filtered_maps.push_back(*msg);
+    });
+  executor_.add_node(flat_mapper);
+  ASSERT_TRUE(spinUntil(
+      [&flat_cloud_pub, &flat_odom_pub, &map_sub, &filtered_sub, &filtered_map_sub]() {
+        return flat_cloud_pub->get_subscription_count() == 1U &&
+               flat_odom_pub->get_subscription_count() == 1U &&
+               map_sub->get_publisher_count() == 1U &&
+               filtered_sub->get_publisher_count() == 1U &&
+               filtered_map_sub->get_publisher_count() == 1U;
+      },
+      1s));
+
+  nav_msgs::msg::Odometry odom;
+  odom.header.frame_id = "world";
+  odom.child_frame_id = "base_link";
+  odom.pose.pose.position.z = 0.34;
+  odom.pose.pose.orientation.w = 1.0;
+  const std::vector<std::array<float, 3>> obstacle{{{0.80F, 0.30F, 0.12F}}};
+  for (int frame = 0; frame < 2; ++frame) {
+    spinFor(20ms);
+    const builtin_interfaces::msg::Time stamp = harness_node_->now();
+    odom.header.stamp = stamp;
+    flat_odom_pub->publish(odom);
+    flat_cloud_pub->publish(makeFlatSceneCloud(stamp, 0.0, 0.0, 0.0, obstacle));
+  }
+  ASSERT_TRUE(spinUntil(
+      [&maps, &filtered_points, &filtered_maps]() {
+        return !maps.empty() && !maps.back().traversability.empty() &&
+               !filtered_points.empty() && filtered_points.back().width == 1U &&
+               !filtered_maps.empty() && filtered_maps.back().width == 1U;
+      },
+      1s));
+
+  maps.clear();
+  filtered_points.clear();
+  filtered_maps.clear();
+  spinFor(20ms);
+  const builtin_interfaces::msg::Time unmatched_stamp = harness_node_->now();
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      unmatched_stamp, 0.0, 0.0, 0.0, obstacle));
+  ASSERT_TRUE(spinUntil(
+      [&maps, &filtered_points, &filtered_maps, &unmatched_stamp]() {
+        return !maps.empty() && maps.back().traversability.empty() &&
+               maps.back().header.stamp.sec == unmatched_stamp.sec &&
+               maps.back().header.stamp.nanosec == unmatched_stamp.nanosec &&
+               !filtered_points.empty() && filtered_points.back().width == 0U &&
+               !filtered_maps.empty() && filtered_maps.back().width == 0U;
+      },
+      1s));
+
+  const std::array<float, 3> recovered_obstacle{{-0.80F, 0.30F, 0.22F}};
+  const std::vector<std::array<float, 3>> recovered_obstacles{{recovered_obstacle}};
+  maps.clear();
+  filtered_points.clear();
+  filtered_maps.clear();
+  spinFor(20ms);
+  const builtin_interfaces::msg::Time first_recovery_stamp = harness_node_->now();
+  odom.header.stamp = first_recovery_stamp;
+  flat_odom_pub->publish(odom);
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      first_recovery_stamp, 0.0, 0.0, 0.0, recovered_obstacles));
+  ASSERT_TRUE(spinUntil(
+      [&maps, &filtered_points, &filtered_maps, &first_recovery_stamp]() {
+        return !maps.empty() && maps.back().traversability.empty() &&
+               maps.back().header.stamp.sec == first_recovery_stamp.sec &&
+               maps.back().header.stamp.nanosec == first_recovery_stamp.nanosec &&
+               !filtered_points.empty() && filtered_points.back().width == 1U &&
+               !filtered_maps.empty() && filtered_maps.back().width == 0U;
+      },
+      1s));
+
+  maps.clear();
+  filtered_maps.clear();
+  spinFor(20ms);
+  const builtin_interfaces::msg::Time second_recovery_stamp = harness_node_->now();
+  odom.header.stamp = second_recovery_stamp;
+  flat_odom_pub->publish(odom);
+  flat_cloud_pub->publish(makeFlatSceneCloud(
+      second_recovery_stamp, 0.0, 0.0, 0.0, recovered_obstacles));
+  ASSERT_TRUE(spinUntil(
+      [&maps, &filtered_maps, &second_recovery_stamp]() {
+        return !maps.empty() && !maps.back().traversability.empty() &&
+               maps.back().header.stamp.sec == second_recovery_stamp.sec &&
+               maps.back().header.stamp.nanosec == second_recovery_stamp.nanosec &&
+               !filtered_maps.empty() && filtered_maps.back().width == 1U;
+      },
+      1s));
+  const auto recovered_points = pointCloudPoints(filtered_maps.back());
+  ASSERT_EQ(recovered_points.size(), 1U);
+  EXPECT_NEAR(recovered_points.front()[0], recovered_obstacle[0], 1.0e-4F);
+  EXPECT_NEAR(recovered_points.front()[1], recovered_obstacle[1], 1.0e-4F);
+  EXPECT_NEAR(recovered_points.front()[2], recovered_obstacle[2], 1.0e-4F);
+
+  executor_.remove_node(flat_mapper);
+}
+
+TEST_F(TerrainMapperNodeTest, FlatObstacleStaleSourcePublishesFullyFailClosedState)
 {
   const std::string namespace_name =
     "/flat_mapper_stale_layers_" + std::to_string(instance_count_);
@@ -925,24 +1171,28 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleStaleSourceClearsOnlyLiveVisualization
     rclcpp::Parameter("cloud_topic", cloud_topic),
     rclcpp::Parameter("odom_topic", odom_topic),
     rclcpp::Parameter("resolution", 0.2),
-    rclcpp::Parameter("size_x", 2.0),
-    rclcpp::Parameter("size_y", 2.0),
-    rclcpp::Parameter("origin_x", -1.0),
-    rclcpp::Parameter("origin_y", -1.0),
+    rclcpp::Parameter("size_x", 4.0),
+    rclcpp::Parameter("size_y", 4.0),
+    rclcpp::Parameter("origin_x", -2.0),
+    rclcpp::Parameter("origin_y", -2.0),
     rclcpp::Parameter("publish_rate", 100.0),
-    rclcpp::Parameter("cloud_stale_warning_age", 0.15),
+    rclcpp::Parameter("cloud_stale_warning_age", 0.30),
   });
   auto flat_mapper = std::make_shared<TerrainMapperNode>(options);
   auto flat_cloud_pub = harness_node_->create_publisher<sensor_msgs::msg::PointCloud2>(
     cloud_topic, rclcpp::SensorDataQoS());
   auto flat_odom_pub = harness_node_->create_publisher<nav_msgs::msg::Odometry>(
     odom_topic, rclcpp::SensorDataQoS());
+  std::vector<utree_dog_msgs::msg::TerrainGrid> maps;
   std::vector<nav_msgs::msg::GridCells> raw_layers;
   std::vector<nav_msgs::msg::GridCells> inflated_layers;
   std::vector<nav_msgs::msg::OccupancyGrid> costmaps;
-  std::vector<sensor_msgs::msg::PointCloud2> rviz_voxels;
-  std::vector<sensor_msgs::msg::PointCloud2> recorded_maps;
+  std::vector<sensor_msgs::msg::PointCloud2> filtered_points;
+  std::vector<sensor_msgs::msg::PointCloud2> filtered_maps;
   const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
+  auto map_sub = harness_node_->create_subscription<utree_dog_msgs::msg::TerrainGrid>(
+    namespace_name + "/terrain_map", map_qos,
+    [&maps](const utree_dog_msgs::msg::TerrainGrid::SharedPtr msg) {maps.push_back(*msg);});
   auto raw_sub = harness_node_->create_subscription<nav_msgs::msg::GridCells>(
     namespace_name + "/flat_obstacle_raw", map_qos,
     [&raw_layers](const nav_msgs::msg::GridCells::SharedPtr msg) {raw_layers.push_back(*msg);});
@@ -954,65 +1204,69 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleStaleSourceClearsOnlyLiveVisualization
   auto cost_sub = harness_node_->create_subscription<nav_msgs::msg::OccupancyGrid>(
     namespace_name + "/terrain_costmap", map_qos,
     [&costmaps](const nav_msgs::msg::OccupancyGrid::SharedPtr msg) {costmaps.push_back(*msg);});
-  auto rviz_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-    namespace_name + "/flat_obstacle_confirmed_voxels", rclcpp::SensorDataQoS(),
-    [&rviz_voxels](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-      rviz_voxels.push_back(*msg);
+  auto filtered_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+    namespace_name + "/flat_obstacle_filtered_points", rclcpp::SensorDataQoS(),
+    [&filtered_points](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      filtered_points.push_back(*msg);
     });
-  auto recorder_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
-    namespace_name + "/flat_obstacle_map_3d",
+  auto filtered_map_sub = harness_node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+    namespace_name + "/flat_obstacle_filtered_map_3d",
     rclcpp::QoS(8).reliable().durability_volatile(),
-    [&recorded_maps](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
-      recorded_maps.push_back(*msg);
+    [&filtered_maps](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+      filtered_maps.push_back(*msg);
     });
   executor_.add_node(flat_mapper);
   ASSERT_TRUE(spinUntil(
-      [&flat_cloud_pub, &flat_odom_pub, &raw_sub, &inflated_sub, &cost_sub,
-        &rviz_sub, &recorder_sub]() {
+      [&flat_cloud_pub, &flat_odom_pub, &map_sub, &raw_sub, &inflated_sub, &cost_sub,
+        &filtered_sub, &filtered_map_sub]() {
         return flat_cloud_pub->get_subscription_count() == 1U &&
                flat_odom_pub->get_subscription_count() == 1U &&
+               map_sub->get_publisher_count() == 1U &&
                raw_sub->get_publisher_count() == 1U &&
                inflated_sub->get_publisher_count() == 1U &&
                cost_sub->get_publisher_count() == 1U &&
-               rviz_sub->get_publisher_count() == 1U &&
-               recorder_sub->get_publisher_count() == 1U;
+               filtered_sub->get_publisher_count() == 1U &&
+               filtered_map_sub->get_publisher_count() == 1U;
       },
       1s));
 
   nav_msgs::msg::Odometry odom;
-  const builtin_interfaces::msg::Time stamp = harness_node_->now();
-  odom.header.stamp = stamp;
   odom.header.frame_id = "world";
   odom.child_frame_id = "base_link";
   odom.pose.pose.position.z = 0.34;
   odom.pose.pose.orientation.w = 1.0;
-  flat_odom_pub->publish(odom);
-  flat_cloud_pub->publish(makeCloud(
-      stamp,
-      {{{0.50F, 0.10F, 0.10F}, {0.51F, 0.11F, 0.11F}, {0.52F, 0.12F, 0.12F}}}));
+  const std::vector<std::array<float, 3>> obstacle{{{0.80F, 0.30F, 0.12F}}};
+  for (int frame = 0; frame < 2; ++frame) {
+    spinFor(20ms);
+    const builtin_interfaces::msg::Time stamp = harness_node_->now();
+    odom.header.stamp = stamp;
+    flat_odom_pub->publish(odom);
+    flat_cloud_pub->publish(makeFlatSceneCloud(stamp, 0.0, 0.0, 0.0, obstacle));
+  }
   ASSERT_TRUE(spinUntil(
-      [&raw_layers, &costmaps, &rviz_voxels, &recorded_maps]() {
-        return !raw_layers.empty() && raw_layers.back().cells.size() == 1U &&
+      [&maps, &raw_layers, &costmaps, &filtered_points, &filtered_maps]() {
+        return !maps.empty() && !maps.back().traversability.empty() &&
+               !raw_layers.empty() && raw_layers.back().cells.size() == 1U &&
                !costmaps.empty() &&
                std::count(costmaps.back().data.begin(), costmaps.back().data.end(), 100) > 0 &&
-               !rviz_voxels.empty() && rviz_voxels.back().width == 1U &&
-               !recorded_maps.empty() && recorded_maps.back().width == 1U;
+               !filtered_points.empty() && filtered_points.back().width == 1U &&
+               !filtered_maps.empty() && filtered_maps.back().width == 1U;
       },
       1s));
 
   ASSERT_TRUE(spinUntil(
-      [&raw_layers, &inflated_layers, &costmaps, &rviz_voxels]() {
-        return !raw_layers.empty() && raw_layers.back().cells.empty() &&
+      [&maps, &raw_layers, &inflated_layers, &costmaps, &filtered_points,
+        &filtered_maps]() {
+        return !maps.empty() && maps.back().traversability.empty() &&
+               !raw_layers.empty() && raw_layers.back().cells.empty() &&
                !inflated_layers.empty() && inflated_layers.back().cells.empty() &&
                !costmaps.empty() && std::all_of(
           costmaps.back().data.begin(), costmaps.back().data.end(),
           [](std::int8_t value) {return value == -1;}) &&
-               !rviz_voxels.empty() && rviz_voxels.back().width == 0U;
+               !filtered_points.empty() && filtered_points.back().width == 0U &&
+               !filtered_maps.empty() && filtered_maps.back().width == 0U;
       },
       1s));
-  EXPECT_TRUE(std::all_of(
-      recorded_maps.begin(), recorded_maps.end(),
-      [](const sensor_msgs::msg::PointCloud2 & cloud) {return cloud.width == 1U;}));
 
   executor_.remove_node(flat_mapper);
 }

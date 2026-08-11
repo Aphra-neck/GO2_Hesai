@@ -24,6 +24,29 @@ constexpr std::chrono::milliseconds kPendingFlatCloudMaxWait{250};
 constexpr double kFlatPoseJumpTranslation = 1.0;
 constexpr double kFlatPoseJumpAngle = 0.7853981633974483;
 
+struct VisualizationVoxelKey
+{
+  std::int64_t x;
+  std::int64_t y;
+  std::int64_t z;
+
+  bool operator==(const VisualizationVoxelKey & other) const noexcept
+  {
+    return x == other.x && y == other.y && z == other.z;
+  }
+};
+
+struct VisualizationVoxelKeyHash
+{
+  std::size_t operator()(const VisualizationVoxelKey & key) const noexcept
+  {
+    std::size_t result = std::hash<std::int64_t>{}(key.x);
+    result ^= std::hash<std::int64_t>{}(key.y) + 0x9e3779b9U + (result << 6U) + (result >> 2U);
+    result ^= std::hash<std::int64_t>{}(key.z) + 0x9e3779b9U + (result << 6U) + (result >> 2U);
+    return result;
+  }
+};
+
 struct Quaternion
 {
   double x;
@@ -154,13 +177,23 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
     throw std::invalid_argument(
             "cloud_stale_warning_age must be finite and in [0.001, 60] seconds");
   }
-  FlatObstacleVoxelConfig flat_config;
+  FlatObstacleLayerConfig flat_config;
+  flat_config.resolution = config.resolution;
+  flat_config.size_x = config.size_x;
+  flat_config.size_y = config.size_y;
+  flat_config.origin_x = config.origin_x;
+  flat_config.origin_y = config.origin_y;
+  flat_config.min_range = min_range_;
+  flat_config.max_range = max_range_;
+  flat_config.self_length = self_length_;
+  flat_config.self_width = self_width_;
+  flat_config.self_height = self_height_;
   flat_config.min_height = declare_parameter("flat_obstacle.min_height", 0.08);
   flat_config.max_height = declare_parameter("flat_obstacle.max_height", 0.80);
-  flat_config.voxel_height = declare_parameter("flat_obstacle.voxel_height", 0.10);
-  flat_config.clearance = declare_parameter("flat_obstacle.obstacle_clearance", 0.10);
-  const int strong_hit_points =
-    declare_parameter("flat_obstacle.strong_hit_points", 3);
+  flat_config.voxel_resolution_z =
+    declare_parameter("flat_obstacle.voxel_resolution_z", 0.10);
+  flat_config.obstacle_clearance =
+    declare_parameter("flat_obstacle.obstacle_clearance", 0.10);
   const int hit_confirmation_frames =
     declare_parameter("flat_obstacle.hit_confirmation_frames", 2);
   flat_config.hit_confirmation_window =
@@ -169,18 +202,39 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
     declare_parameter("flat_obstacle.clear_confirmation_frames", 2);
   flat_config.clear_confirmation_window =
     declare_parameter("flat_obstacle.clear_confirmation_window", 0.35);
-  if (strong_hit_points < 1 || hit_confirmation_frames < 1 ||
-    clear_confirmation_frames < 1)
+  const int ground_fit_min_points =
+    declare_parameter("flat_obstacle.ground_fit.min_points", 24);
+  flat_config.ground_fit.max_range =
+    declare_parameter("flat_obstacle.ground_fit.max_range", 3.0);
+  flat_config.ground_fit.seed_height_tolerance =
+    declare_parameter("flat_obstacle.ground_fit.seed_height_tolerance", 0.20);
+  flat_config.ground_fit.cell_size =
+    declare_parameter("flat_obstacle.ground_fit.cell_size", 0.20);
+  flat_config.ground_fit.min_span =
+    declare_parameter("flat_obstacle.ground_fit.min_span", 0.80);
+  flat_config.ground_fit.inlier_distance =
+    declare_parameter("flat_obstacle.ground_fit.inlier_distance", 0.04);
+  flat_config.ground_fit.min_inlier_ratio =
+    declare_parameter("flat_obstacle.ground_fit.min_inlier_ratio", 0.55);
+  flat_config.ground_fit.max_rmse =
+    declare_parameter("flat_obstacle.ground_fit.max_rmse", 0.04);
+  flat_config.ground_fit.max_tilt =
+    declare_parameter("flat_obstacle.ground_fit.max_tilt", 0.20);
+  flat_config.ground_fit.max_anchor_error =
+    declare_parameter("flat_obstacle.ground_fit.max_anchor_error", 0.06);
+  if (hit_confirmation_frames < 2 || clear_confirmation_frames < 1 ||
+    ground_fit_min_points < 3)
   {
     throw std::invalid_argument(
-            "flat obstacle voxel evidence counts must be greater than zero");
+            "flat obstacle hit confirmation must use at least two distinct frames; "
+            "clear confirmation and ground fit minimum must be valid");
   }
-  flat_config.strong_hit_points = static_cast<std::size_t>(strong_hit_points);
   flat_config.hit_confirmation_frames =
     static_cast<std::size_t>(hit_confirmation_frames);
   flat_config.clear_confirmation_frames =
     static_cast<std::size_t>(clear_confirmation_frames);
-  flat_nominal_body_height_ =
+  flat_config.ground_fit.min_points = static_cast<std::size_t>(ground_fit_min_points);
+  flat_config.nominal_body_height =
     declare_parameter("flat_obstacle.nominal_body_height", 0.34);
   flat_max_odom_age_ = declare_parameter("flat_obstacle.max_odom_age", 0.5);
   body_yaw_offset_ = declare_parameter("body_yaw_offset", -1.5707963267948966);
@@ -191,8 +245,8 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
     declare_parameter("flat_obstacle.visualization.voxel_size", 0.30);
   const int visualization_max_points =
     declare_parameter("flat_obstacle.visualization.max_points", 5000);
-  if (!std::isfinite(flat_nominal_body_height_) || flat_nominal_body_height_ <= 0.0 ||
-    flat_nominal_body_height_ > 2.0)
+  if (!std::isfinite(flat_config.nominal_body_height) ||
+    flat_config.nominal_body_height <= 0.0 || flat_config.nominal_body_height > 2.0)
   {
     throw std::invalid_argument(
             "flat_obstacle.nominal_body_height must be finite and in (0, 2] metres");
@@ -213,7 +267,7 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
   }
   visualization_max_points_ = static_cast<std::size_t>(visualization_max_points);
   if (flat_obstacle_mode_) {
-    flat_voxel_map_ = std::make_unique<FlatObstacleVoxelMap>(config, flat_config);
+    flat_obstacle_layer_ = std::make_unique<FlatObstacleLayer>(flat_config);
   } else {
     map_builder_ = std::make_unique<TerrainMapBuilder>(config);
   }
@@ -225,11 +279,11 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
     flat_raw_pub_ = create_publisher<nav_msgs::msg::GridCells>("flat_obstacle_raw", map_qos);
     flat_inflated_pub_ =
       create_publisher<nav_msgs::msg::GridCells>("flat_obstacle_inflated", map_qos);
-    flat_voxel_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      "flat_obstacle_confirmed_voxels",
+    flat_filtered_points_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "flat_obstacle_filtered_points",
       rclcpp::QoS(1).best_effort().durability_volatile());
-    flat_map_3d_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      "flat_obstacle_map_3d",
+    flat_filtered_map_3d_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "flat_obstacle_filtered_map_3d",
       rclcpp::QoS(8).reliable().durability_volatile());
   }
   cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -247,8 +301,8 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
     get_logger(), "%s map: %.1f x %.1f m, %.3f m/cell, %zu x %zu cells",
     flat_obstacle_mode_ ? "Flat obstacle" : "Terrain",
     config.size_x, config.size_y, config.resolution,
-    flat_obstacle_mode_ ? flat_voxel_map_->width() : map_builder_->width(),
-    flat_obstacle_mode_ ? flat_voxel_map_->height() : map_builder_->height());
+    flat_obstacle_mode_ ? flat_obstacle_layer_->snapshot().width : map_builder_->width(),
+    flat_obstacle_mode_ ? flat_obstacle_layer_->snapshot().height : map_builder_->height());
 }
 
 void TerrainMapperNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -320,15 +374,6 @@ void TerrainMapperNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr ms
       invalidateFlatEpoch(pose);
     }
     cacheFlatPose(pose);
-    if (!flat_ground_locked_) {
-      flat_ground_z_ = pose.z - flat_nominal_body_height_;
-      flat_ground_locked_ = true;
-      RCLCPP_INFO(
-        get_logger(),
-        "Flat obstacle ground locked at z=%.3f m from standing body z=%.3f m; "
-        "keep the robot standing while this mode is active",
-        flat_ground_z_, pose.z);
-    }
     processPendingFlatClouds(pose);
   }
 }
@@ -392,7 +437,7 @@ void TerrainMapperNode::processCloud(
 {
   FlatBodyPose matched_flat_pose;
   if (flat_obstacle_mode_) {
-    if (flat_pose == nullptr || !flat_ground_locked_) {
+    if (flat_pose == nullptr) {
       return;
     }
     matched_flat_pose = *flat_pose;
@@ -442,7 +487,7 @@ void TerrainMapperNode::processCloud(
     if (source_stamp_order < 0) {
       RCLCPP_WARN(
         get_logger(),
-        "Flat obstacle source clock moved backward by %.3f s; starting a new voxel epoch",
+        "Flat obstacle source clock moved backward by %.3f s; starting a new map epoch",
         -last_cloud_source_delta_);
       invalidateFlatEpoch(*flat_pose);
     }
@@ -470,6 +515,10 @@ void TerrainMapperNode::processCloud(
   const double sin_yaw = std::sin(pose_yaw);
   for (; x != x.end(); ++x, ++y, ++z) {
     if (!std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z)) {continue;}
+    if (flat_obstacle_mode_) {
+      accepted_points.push_back({*x, *y, *z});
+      continue;
+    }
     const double dx = *x - pose_x;
     const double dy = *y - pose_y;
     const double dz = *z - pose_z;
@@ -483,12 +532,6 @@ void TerrainMapperNode::processCloud(
       std::abs(dz) < self_height_ * 0.5) {continue;}
     accepted_points.push_back({*x, *y, *z});
   }
-  if (flat_obstacle_mode_ && accepted_points.empty()) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 3000,
-      "Rejected empty flat obstacle point cloud after range, height, and self filtering");
-    return;
-  }
   bool flat_timing_continuous = false;
   if (flat_obstacle_mode_ && have_cloud_interval_) {
     flat_timing_continuous =
@@ -501,22 +544,37 @@ void TerrainMapperNode::processCloud(
     double pose_angle = 0.0;
     const bool pose_continuous =
       flatPoseContinuous(*flat_pose, pose_translation, pose_angle);
-    const auto update = flat_voxel_map_->update(
-      accepted_points, flatSensorOrigin(*flat_pose), stamp_seconds, flat_ground_z_,
-      flat_timing_continuous && pose_continuous);
+    FlatObstacleFrame frame;
+    frame.points = std::move(accepted_points);
+    frame.body_position = {flat_pose->x, flat_pose->y, flat_pose->z};
+    frame.body_yaw = flat_pose->yaw;
+    frame.sensor_origin = flatSensorOrigin(*flat_pose);
+    frame.stamp_seconds = stamp_seconds;
+    frame.timing_continuous = flat_timing_continuous && pose_continuous;
+    const auto update = flat_obstacle_layer_->update(frame);
     if (!update.accepted) {
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 3000,
-        "Rejected flat obstacle voxel update with invalid or nonmonotonic input");
+        "Rejected flat obstacle layer update: status=%s reason=%s",
+        toString(update.status), update.reason.c_str());
       return;
+    }
+    if (!update.usable) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Flat obstacle layer is fail-closed: status=%s reason=%s, "
+        "ground_candidates=%zu, ground_inliers=%zu",
+        toString(update.status), update.reason.c_str(),
+        update.ground_plane.candidate_points, update.ground_plane.inlier_points);
     }
     last_processed_flat_pose_ = *flat_pose;
     have_processed_flat_pose_ = true;
-    last_in_map_cell_count_ = update.endpoint_voxels;
+    last_in_map_cell_count_ = update.filtered_voxels;
+    last_accepted_point_count_ = frame.points.size();
   } else {
     last_in_map_cell_count_ = map_builder_->integrateFrame(accepted_points, stamp_seconds);
+    last_accepted_point_count_ = accepted_points.size();
   }
-  last_accepted_point_count_ = accepted_points.size();
   last_cloud_stamp_ = msg->header.stamp;
   last_cloud_received_ = received_at;
 }
@@ -588,16 +646,22 @@ void TerrainMapperNode::prunePendingFlatClouds(
   std::chrono::steady_clock::time_point current_time)
 {
   std::size_t dropped = 0U;
+  builtin_interfaces::msg::Time newest_dropped_stamp;
   while (!pending_flat_clouds_.empty() &&
     current_time - pending_flat_clouds_.front().received_at > kPendingFlatCloudMaxWait)
   {
+    newest_dropped_stamp = pending_flat_clouds_.front().message->header.stamp;
     pending_flat_clouds_.pop_front();
     ++dropped;
   }
   if (dropped != 0U) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 3000,
-      "Dropped %zu flat obstacle cloud(s) without exact-timestamp body odometry",
+    FlatBodyPose reset_pose = last_processed_flat_pose_;
+    reset_pose.stamp = newest_dropped_stamp;
+    invalidateFlatEpoch(reset_pose);
+    RCLCPP_WARN(
+      get_logger(),
+      "Dropped %zu flat obstacle cloud(s) without exact-timestamp body odometry; "
+      "invalidated the map epoch",
       dropped);
   }
 }
@@ -626,7 +690,7 @@ bool TerrainMapperNode::flatPoseContinuous(
 
 void TerrainMapperNode::invalidateFlatEpoch(const FlatBodyPose & pose)
 {
-  flat_voxel_map_->resetEpoch();
+  flat_obstacle_layer_->resetEpoch();
   flat_odom_history_.clear();
   pending_flat_clouds_.clear();
   have_processed_flat_pose_ = false;
@@ -635,24 +699,33 @@ void TerrainMapperNode::invalidateFlatEpoch(const FlatBodyPose & pose)
   last_cloud_stamp_ = builtin_interfaces::msg::Time{};
   last_accepted_point_count_ = 0U;
   last_in_map_cell_count_ = 0U;
-  flat_ground_z_ = pose.z - flat_nominal_body_height_;
-  flat_ground_locked_ = true;
 
+  publishUnusableFlatState(pose.stamp);
+  RCLCPP_WARN(
+    get_logger(),
+    "Reset flat obstacle layer; waiting for a new exact-stamp cloud/odom pair");
+}
+
+void TerrainMapperNode::publishUnusableFlatState(
+  const builtin_interfaces::msg::Time & stamp,
+  bool publish_current_filtered_points)
+{
+  const auto snapshot = flat_obstacle_layer_->snapshot();
   utree_dog_msgs::msg::TerrainGrid invalid_map;
-  invalid_map.header.stamp = pose.stamp;
+  invalid_map.header.stamp = stamp;
   invalid_map.header.frame_id = map_frame_;
   terrain_pub_->publish(invalid_map);
   const std::vector<std::uint8_t> empty_mask;
-  flat_raw_pub_->publish(makeFlatCells(empty_mask, pose.stamp, 0.02));
-  flat_inflated_pub_->publish(makeFlatCells(empty_mask, pose.stamp, 0.01));
-  cost_pub_->publish(makeUnknownFlatCostmap(pose.stamp));
-  if (flat_voxel_pub_->get_subscription_count() > 0U) {
-    flat_voxel_pub_->publish(makeVoxelCloud({}, pose.stamp, true));
+  flat_raw_pub_->publish(makeFlatCells(empty_mask, snapshot, stamp, 0.02));
+  flat_inflated_pub_->publish(makeFlatCells(empty_mask, snapshot, stamp, 0.01));
+  cost_pub_->publish(makeUnknownFlatCostmap(snapshot, stamp));
+  if (publish_current_filtered_points) {
+    flat_filtered_points_pub_->publish(makePointCloud(
+        snapshot.filtered_points, stamp, true));
+  } else {
+    flat_filtered_points_pub_->publish(makePointCloud({}, stamp, true));
   }
-  RCLCPP_WARN(
-    get_logger(),
-    "Relocked flat obstacle ground at world z=%.3f m; waiting for a new exact-stamp cloud/odom pair",
-    flat_ground_z_);
+  flat_filtered_map_3d_pub_->publish(makePointCloud({}, stamp, false));
 }
 
 void TerrainMapperNode::publishMap()
@@ -699,34 +772,30 @@ void TerrainMapperNode::publishMap()
     }
   }
   if (flat_obstacle_mode_ && !source_is_fresh) {
-    const std::vector<std::uint8_t> empty_mask;
-    flat_raw_pub_->publish(makeFlatCells(empty_mask, last_cloud_stamp_, 0.02));
-    flat_inflated_pub_->publish(makeFlatCells(empty_mask, last_cloud_stamp_, 0.01));
-    cost_pub_->publish(makeUnknownFlatCostmap(last_cloud_stamp_));
-    if (flat_voxel_pub_->get_subscription_count() > 0U) {
-      flat_voxel_pub_->publish(makeVoxelCloud({}, last_cloud_stamp_, true));
-    }
+    publishUnusableFlatState(last_cloud_stamp_);
     return;
   }
   if (flat_obstacle_mode_) {
-    const bool include_voxel_centers =
-      flat_voxel_pub_->get_subscription_count() > 0U ||
-      flat_map_3d_pub_->get_subscription_count() > 0U;
-    const auto snapshot = flat_voxel_map_->snapshot(
-      last_cloud_stamp_, map_frame_, flat_ground_z_, include_voxel_centers);
-    terrain_pub_->publish(snapshot.terrain);
-    cost_pub_->publish(makeCostmap(snapshot.terrain, &snapshot.inflated_obstacles));
-    flat_inflated_pub_->publish(makeFlatCells(
-        snapshot.inflated_obstacles, last_cloud_stamp_, 0.01));
-    flat_raw_pub_->publish(makeFlatCells(
-        snapshot.raw_obstacles, last_cloud_stamp_, 0.02));
-    if (flat_voxel_pub_->get_subscription_count() > 0U) {
-      flat_voxel_pub_->publish(makeVoxelCloud(
-          snapshot.confirmed_voxel_centers, last_cloud_stamp_, true));
+    const auto snapshot = flat_obstacle_layer_->snapshot();
+    if (!snapshot.usable) {
+      publishUnusableFlatState(
+        last_cloud_stamp_, snapshot.status == FlatObstacleLayerStatus::kWarmingUp);
+      return;
     }
-    if (flat_map_3d_pub_->get_subscription_count() > 0U) {
-      flat_map_3d_pub_->publish(makeVoxelCloud(
-          snapshot.confirmed_voxel_centers, last_cloud_stamp_, false));
+    const auto terrain = makeFlatTerrain(snapshot, last_cloud_stamp_);
+    terrain_pub_->publish(terrain);
+    cost_pub_->publish(makeCostmap(terrain, &snapshot.inflated_obstacles));
+    flat_inflated_pub_->publish(makeFlatCells(
+        snapshot.inflated_obstacles, snapshot, last_cloud_stamp_, 0.01));
+    flat_raw_pub_->publish(makeFlatCells(
+        snapshot.raw_obstacles, snapshot, last_cloud_stamp_, 0.02));
+    if (flat_filtered_points_pub_->get_subscription_count() > 0U) {
+      flat_filtered_points_pub_->publish(makePointCloud(
+          snapshot.filtered_points, last_cloud_stamp_, true));
+    }
+    if (flat_filtered_map_3d_pub_->get_subscription_count() > 0U) {
+      flat_filtered_map_3d_pub_->publish(makePointCloud(
+          snapshot.obstacle_points, last_cloud_stamp_, false));
     }
     return;
   }
@@ -807,6 +876,41 @@ void TerrainMapperNode::publishMap()
   cost_pub_->publish(makeCostmap(terrain));
 }
 
+utree_dog_msgs::msg::TerrainGrid TerrainMapperNode::makeFlatTerrain(
+  const FlatObstacleLayerSnapshot & snapshot,
+  const builtin_interfaces::msg::Time & stamp) const
+{
+  utree_dog_msgs::msg::TerrainGrid terrain;
+  terrain.header.stamp = stamp;
+  terrain.header.frame_id = map_frame_;
+  terrain.resolution = static_cast<float>(snapshot.resolution);
+  terrain.width = static_cast<std::uint32_t>(snapshot.width);
+  terrain.height = static_cast<std::uint32_t>(snapshot.height);
+  terrain.origin_x = static_cast<float>(snapshot.origin_x);
+  terrain.origin_y = static_cast<float>(snapshot.origin_y);
+  terrain.unknown_value = TerrainMapBuilder::kUnknown;
+  const std::size_t cell_count = snapshot.width * snapshot.height;
+  terrain.elevation.resize(cell_count);
+  terrain.variance.assign(cell_count, 0.0F);
+  terrain.slope.assign(cell_count, 0.0F);
+  terrain.roughness.assign(cell_count, 0.0F);
+  terrain.traversability.assign(cell_count, 1.0F);
+  terrain.observation_count.assign(cell_count, 1U);
+  terrain.confidence.assign(cell_count, 1.0F);
+  terrain.age.assign(cell_count, 0.0F);
+  for (std::size_t index = 0U; index < cell_count; ++index) {
+    const double x = snapshot.origin_x +
+      (static_cast<double>(index % snapshot.width) + 0.5) * snapshot.resolution;
+    const double y = snapshot.origin_y +
+      (static_cast<double>(index / snapshot.width) + 0.5) * snapshot.resolution;
+    terrain.elevation[index] = static_cast<float>(snapshot.ground_plane.heightAt(x, y));
+    if (snapshot.raw_obstacles[index] != 0U) {
+      terrain.traversability[index] = 0.0F;
+    }
+  }
+  return terrain;
+}
+
 nav_msgs::msg::OccupancyGrid TerrainMapperNode::makeCostmap(
   const utree_dog_msgs::msg::TerrainGrid & terrain,
   const std::vector<std::uint8_t> * inflated_obstacles) const
@@ -843,14 +947,14 @@ nav_msgs::msg::OccupancyGrid TerrainMapperNode::makeCostmap(
 
 nav_msgs::msg::GridCells TerrainMapperNode::makeFlatCells(
   const std::vector<std::uint8_t> & mask,
+  const FlatObstacleLayerSnapshot & snapshot,
   const builtin_interfaces::msg::Time & stamp, double z_offset) const
 {
   nav_msgs::msg::GridCells result;
   result.header.stamp = stamp;
   result.header.frame_id = map_frame_;
-  const auto & config = flat_voxel_map_->mapConfig();
-  result.cell_width = config.resolution;
-  result.cell_height = config.resolution;
+  result.cell_width = snapshot.resolution;
+  result.cell_height = snapshot.resolution;
   result.cells.reserve(static_cast<std::size_t>(std::count_if(
       mask.begin(), mask.end(), [](std::uint8_t value) {return value != 0U;})));
   for (std::size_t index = 0; index < mask.size(); ++index) {
@@ -858,37 +962,37 @@ nav_msgs::msg::GridCells TerrainMapperNode::makeFlatCells(
       continue;
     }
     geometry_msgs::msg::Point point;
-    point.x = config.origin_x +
-      (static_cast<double>(index % flat_voxel_map_->width()) + 0.5) * config.resolution;
-    point.y = config.origin_y +
-      (static_cast<double>(index / flat_voxel_map_->width()) + 0.5) * config.resolution;
-    point.z = flat_ground_z_ + z_offset;
+    point.x = snapshot.origin_x +
+      (static_cast<double>(index % snapshot.width) + 0.5) * snapshot.resolution;
+    point.y = snapshot.origin_y +
+      (static_cast<double>(index / snapshot.width) + 0.5) * snapshot.resolution;
+    point.z = snapshot.ground_plane.heightAt(point.x, point.y) + z_offset;
     result.cells.push_back(point);
   }
   return result;
 }
 
 nav_msgs::msg::OccupancyGrid TerrainMapperNode::makeUnknownFlatCostmap(
+  const FlatObstacleLayerSnapshot & snapshot,
   const builtin_interfaces::msg::Time & stamp) const
 {
   nav_msgs::msg::OccupancyGrid result;
   result.header.stamp = stamp;
   result.header.frame_id = map_frame_;
-  const auto & config = flat_voxel_map_->mapConfig();
-  result.info.resolution = config.resolution;
-  result.info.width = static_cast<std::uint32_t>(flat_voxel_map_->width());
-  result.info.height = static_cast<std::uint32_t>(flat_voxel_map_->height());
-  result.info.origin.position.x = config.origin_x;
-  result.info.origin.position.y = config.origin_y;
+  result.info.resolution = snapshot.resolution;
+  result.info.width = static_cast<std::uint32_t>(snapshot.width);
+  result.info.height = static_cast<std::uint32_t>(snapshot.height);
+  result.info.origin.position.x = snapshot.origin_x;
+  result.info.origin.position.y = snapshot.origin_y;
   result.info.origin.orientation.w = 1.0;
   result.data.assign(
-    flat_voxel_map_->width() * flat_voxel_map_->height(),
+    snapshot.width * snapshot.height,
     static_cast<std::int8_t>(-1));
   return result;
 }
 
-sensor_msgs::msg::PointCloud2 TerrainMapperNode::makeVoxelCloud(
-  const std::vector<TerrainPoint> & voxel_centers,
+sensor_msgs::msg::PointCloud2 TerrainMapperNode::makePointCloud(
+  const std::vector<TerrainPoint> & points,
   const builtin_interfaces::msg::Time & stamp, bool downsample) const
 {
   std::vector<const TerrainPoint *> selected;
@@ -896,16 +1000,13 @@ sensor_msgs::msg::PointCloud2 TerrainMapperNode::makeVoxelCloud(
     double leaf_size = visualization_voxel_size_;
     do {
       selected.clear();
-      std::unordered_set<std::uint64_t> occupied_leaves;
-      occupied_leaves.reserve(voxel_centers.size());
-      for (const auto & point : voxel_centers) {
-        const auto x = static_cast<std::uint64_t>(std::max(0.0, std::floor(
-              (point.x - flat_voxel_map_->mapConfig().origin_x) / leaf_size)));
-        const auto y = static_cast<std::uint64_t>(std::max(0.0, std::floor(
-              (point.y - flat_voxel_map_->mapConfig().origin_y) / leaf_size)));
-        const auto z = static_cast<std::uint64_t>(std::max(0.0, std::floor(
-              (point.z - flat_ground_z_) / leaf_size)));
-        const std::uint64_t key = (x << 42U) | (y << 21U) | z;
+      std::unordered_set<VisualizationVoxelKey, VisualizationVoxelKeyHash> occupied_leaves;
+      occupied_leaves.reserve(points.size());
+      for (const auto & point : points) {
+        const VisualizationVoxelKey key{
+          static_cast<std::int64_t>(std::floor(point.x / leaf_size)),
+          static_cast<std::int64_t>(std::floor(point.y / leaf_size)),
+          static_cast<std::int64_t>(std::floor(point.z / leaf_size))};
         if (occupied_leaves.insert(key).second) {
           selected.push_back(&point);
         }
@@ -916,8 +1017,8 @@ sensor_msgs::msg::PointCloud2 TerrainMapperNode::makeVoxelCloud(
       leaf_size *= 2.0;
     } while (std::isfinite(leaf_size));
   } else {
-    selected.reserve(voxel_centers.size());
-    for (const auto & point : voxel_centers) {
+    selected.reserve(points.size());
+    for (const auto & point : points) {
       selected.push_back(&point);
     }
   }

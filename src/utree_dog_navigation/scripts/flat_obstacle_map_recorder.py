@@ -16,6 +16,18 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from sensor_msgs.msg import PointCloud2, PointField
 
 
+DEFAULT_TOPIC = "/flat_obstacle_filtered_map_3d"
+
+
+def recorder_qos_profile() -> QoSProfile:
+    return QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=8,
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
+    )
+
+
 def classify_source_stamp(stamp_ns: int, last_seen_stamp_ns: int) -> str:
     if stamp_ns <= 0:
         return "invalid"
@@ -29,18 +41,19 @@ def classify_source_stamp(stamp_ns: int, last_seen_stamp_ns: int) -> str:
 def require_world_frame(frame_id: str) -> None:
     if frame_id != "world":
         raise ValueError(
-            f"planning 3D map frame must be 'world', received {frame_id!r}"
+            f"filtered obstacle map frame must be 'world', received {frame_id!r}"
         )
 
 
 def validate_output_root(path: Path) -> Path:
     resolved = path.expanduser().resolve()
     if any(part.lower() == "g02_log" for part in resolved.parts):
-        raise ValueError("3D map capture output must not be inside G02_log")
+        raise ValueError("filtered obstacle map output must not be inside G02_log")
     for candidate in (resolved, *resolved.parents):
         if (candidate / ".git").exists():
             raise ValueError(
-                f"3D map capture output must be outside every Git workspace: {resolved}"
+                "filtered obstacle map output must be outside every Git workspace: "
+                f"{resolved}"
             )
     return resolved
 
@@ -152,7 +165,7 @@ class FlatObstacleMapRecorder(Node):
     def __init__(self) -> None:
         super().__init__("flat_obstacle_map_recorder")
         topic = self.declare_parameter(
-            "topic", "/flat_obstacle_map_3d"
+            "topic", DEFAULT_TOPIC
         ).get_parameter_value().string_value
         output_root = validate_output_root(Path(self.declare_parameter(
             "output_directory", "~/go2_map_exports"
@@ -198,7 +211,8 @@ class FlatObstacleMapRecorder(Node):
             raise ValueError("min_interval must be finite and non-negative")
         if planning_mode != "flat_obstacle" or not flat_ground_confirmed:
             raise ValueError(
-                "3D map capture requires flat_obstacle mode and explicit ground confirmation"
+                "filtered obstacle map capture requires flat_obstacle mode and "
+                "explicit ground confirmation"
             )
         if not math.isfinite(body_yaw_offset) or not all(
             math.isfinite(value) for value in lidar_offset
@@ -250,17 +264,11 @@ class FlatObstacleMapRecorder(Node):
         self.status = "recording"
         self.stop_reason = ""
         self.exit_code = 0
-        qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=8,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
         self.subscription = self.create_subscription(
-            PointCloud2, topic, self._cloud_callback, qos
+            PointCloud2, topic, self._cloud_callback, recorder_qos_profile()
         )
         self.get_logger().info(
-            f"Recording planning 3D maps to {self.session_directory}"
+            f"Recording filtered 3D obstacle maps to {self.session_directory}"
         )
 
     def _stop(self, reason: str, failed: bool = False) -> None:
@@ -274,7 +282,7 @@ class FlatObstacleMapRecorder(Node):
         self.exit_code = 1 if failed else 0
         log = self.get_logger().error if failed else self.get_logger().info
         log(
-            f"3D map recording {self.status}: {reason}; "
+            f"Filtered obstacle map recording {self.status}: {reason}; "
             f"snapshots={self.saved_snapshots}, bytes={self.total_bytes}, "
             f"directory={self.session_directory}"
         )
@@ -331,13 +339,13 @@ class FlatObstacleMapRecorder(Node):
             self.last_saved_stamp_ns = stamp_ns
             if self.saved_snapshots == 1 or self.saved_snapshots % 10 == 0:
                 self.get_logger().info(
-                    f"Saved 3D planning map {self.saved_snapshots}/"
+                    f"Saved filtered 3D obstacle map {self.saved_snapshots}/"
                     f"{self.max_snapshots}: {file_name}, points={len(points)}"
                 )
             if self.saved_snapshots >= self.max_snapshots:
                 self._stop("maximum snapshot count reached")
         except (OSError, ValueError, struct.error) as error:
-            self.get_logger().error(f"3D map capture failed: {error}")
+            self.get_logger().error(f"Filtered obstacle map capture failed: {error}")
             self._stop(str(error), failed=True)
 
     def close(self) -> None:
@@ -368,7 +376,9 @@ class FlatObstacleMapRecorder(Node):
         except OSError as error:
             self.exit_code = 1
             self.status = "failed"
-            self.get_logger().error(f"Failed to finalize 3D map session: {error}")
+            self.get_logger().error(
+                f"Failed to finalize filtered obstacle map session: {error}"
+            )
 
 
 def main(args=None) -> int:

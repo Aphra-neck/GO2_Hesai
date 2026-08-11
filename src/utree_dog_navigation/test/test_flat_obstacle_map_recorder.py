@@ -43,6 +43,15 @@ def test_extract_xyz_respects_point_step_and_skips_nonfinite():
     assert RECORDER.extract_xyz(message) == [(1.0, 2.0, 3.0)]
 
 
+def test_recorder_uses_reliable_filtered_obstacle_map_topic():
+    assert RECORDER.DEFAULT_TOPIC == "/flat_obstacle_filtered_map_3d"
+    qos = RECORDER.recorder_qos_profile()
+    assert qos.depth == 8
+    assert qos.history == RECORDER.HistoryPolicy.KEEP_LAST
+    assert qos.reliability == RECORDER.ReliabilityPolicy.RELIABLE
+    assert qos.durability == RECORDER.DurabilityPolicy.VOLATILE
+
+
 def test_write_binary_pcd_is_cloudcompare_compatible(tmp_path):
     path = tmp_path / "map.pcd"
 
@@ -57,7 +66,7 @@ def test_write_binary_pcd_is_cloudcompare_compatible(tmp_path):
     assert written == len(content)
 
 
-def test_write_binary_pcd_preserves_an_empty_processed_map(tmp_path):
+def test_write_binary_pcd_preserves_an_empty_filtered_obstacle_map(tmp_path):
     path = tmp_path / "empty.pcd"
 
     RECORDER.write_binary_pcd(path, [])

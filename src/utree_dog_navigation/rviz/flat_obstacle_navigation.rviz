@@ -47,18 +47,31 @@ Visualization Manager:
       Name: Confirmed 3D Obstacles
       Enabled: true
       Topic:
-        Value: /flat_obstacle_confirmed_voxels
+        Value: /flat_obstacle_filtered_map_3d
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 8
+      Decay Time: 0
+      Style: Points
+      Size (Pixels): 4
+      Color Transformer: FlatColor
+      Color: 255; 35; 35
+      Use Fixed Frame: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Live Filtered Points (Unconfirmed)
+      Enabled: false
+      Topic:
+        Value: /flat_obstacle_filtered_points
         Reliability Policy: Best Effort
         Durability Policy: Volatile
         History Policy: Keep Last
         Depth: 1
-      Decay Time: 1
+      Decay Time: 0
       Style: Points
-      Size (Pixels): 4
-      Color Transformer: AxisColor
-      Axis: Z
-      Min Color: 255; 190; 35
-      Max Color: 235; 45; 45
+      Size (Pixels): 3
+      Color Transformer: FlatColor
+      Color: 255; 170; 0
       Use Fixed Frame: true
     - Class: rviz_default_plugins/Odometry
       Name: Go2 Body Odometry

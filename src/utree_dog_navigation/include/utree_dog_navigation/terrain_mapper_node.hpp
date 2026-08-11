@@ -14,13 +14,13 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "utree_dog_msgs/msg/terrain_grid.hpp"
-#include "utree_dog_navigation/flat_obstacle_voxel_map.hpp"
+#include "utree_dog_navigation/flat_obstacle_layer.hpp"
 #include "utree_dog_navigation/terrain_map_builder.hpp"
 
 namespace utree_dog_navigation
 {
 
-// ROS adapter for TerrainMapBuilder. It owns topic I/O and sensor-frame filtering.
+// ROS adapter for terrain and flat-obstacle mapping. It owns topic I/O and filtering.
 class TerrainMapperNode : public rclcpp::Node
 {
 public:
@@ -65,16 +65,24 @@ private:
     const FlatBodyPose & pose, double & translation, double & angle) const;
   void invalidateFlatEpoch(const FlatBodyPose & pose);
   void publishMap();
+  void publishUnusableFlatState(
+    const builtin_interfaces::msg::Time & stamp,
+    bool publish_current_filtered_points = false);
+  utree_dog_msgs::msg::TerrainGrid makeFlatTerrain(
+    const FlatObstacleLayerSnapshot & snapshot,
+    const builtin_interfaces::msg::Time & stamp) const;
   nav_msgs::msg::OccupancyGrid makeCostmap(
     const utree_dog_msgs::msg::TerrainGrid & terrain,
     const std::vector<std::uint8_t> * inflated_obstacles = nullptr) const;
   nav_msgs::msg::GridCells makeFlatCells(
     const std::vector<std::uint8_t> & mask,
+    const FlatObstacleLayerSnapshot & snapshot,
     const builtin_interfaces::msg::Time & stamp, double z_offset) const;
   nav_msgs::msg::OccupancyGrid makeUnknownFlatCostmap(
+    const FlatObstacleLayerSnapshot & snapshot,
     const builtin_interfaces::msg::Time & stamp) const;
-  sensor_msgs::msg::PointCloud2 makeVoxelCloud(
-    const std::vector<TerrainPoint> & voxel_centers,
+  sensor_msgs::msg::PointCloud2 makePointCloud(
+    const std::vector<TerrainPoint> & points,
     const builtin_interfaces::msg::Time & stamp, bool downsample) const;
   TerrainPoint flatSensorOrigin(const FlatBodyPose & pose) const;
 
@@ -96,7 +104,6 @@ private:
   int min_observed_frames_{4};
   double publish_rate_{2.0};
   double cloud_stale_warning_age_{1.0};
-  double flat_nominal_body_height_{0.34};
   double flat_max_odom_age_{0.5};
   double body_yaw_offset_{-1.5707963267948966};
   double lidar_offset_x_{0.171};
@@ -104,13 +111,11 @@ private:
   double lidar_offset_z_{0.0908};
   double visualization_voxel_size_{0.30};
   std::size_t visualization_max_points_{5000U};
-  double flat_ground_z_{0.0};
   double robot_x_{0.0};
   double robot_y_{0.0};
   double robot_z_{0.0};
   double robot_yaw_{0.0};
   bool have_odom_{false};
-  bool flat_ground_locked_{false};
   bool have_processed_flat_pose_{false};
   bool have_cloud_interval_{false};
   bool last_published_start_feature_ready_{false};
@@ -126,15 +131,15 @@ private:
   std::deque<FlatBodyPose> flat_odom_history_;
   std::deque<PendingFlatCloud> pending_flat_clouds_;
   std::unique_ptr<TerrainMapBuilder> map_builder_;
-  std::unique_ptr<FlatObstacleVoxelMap> flat_voxel_map_;
+  std::unique_ptr<FlatObstacleLayer> flat_obstacle_layer_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<utree_dog_msgs::msg::TerrainGrid>::SharedPtr terrain_pub_;
   rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr cost_pub_;
   rclcpp::Publisher<nav_msgs::msg::GridCells>::SharedPtr flat_raw_pub_;
   rclcpp::Publisher<nav_msgs::msg::GridCells>::SharedPtr flat_inflated_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr flat_voxel_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr flat_map_3d_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr flat_filtered_points_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr flat_filtered_map_3d_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

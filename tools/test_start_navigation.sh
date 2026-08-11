@@ -133,6 +133,18 @@ grep -Fq 'rviz_config:='"${workspace}"'/src/utree_dog_navigation/rviz/flat_obsta
   "${trace_file}"
 
 : > "${trace_file}"
+capture_output="$(
+  env "${common_environment[@]}" GO2_PLANNING_MODE=flat_obstacle \
+    GO2_FLAT_GROUND_CONFIRMED=true GO2_MAP_CAPTURE=true \
+    GO2_MAP_CAPTURE_DIR="${FIXTURE_ROOT}/map-exports" \
+    "${workspace}/shell/start_navigation.sh"
+)"
+grep -Fq ' Diagnostic filtered 3D obstacle map capture: true' <<< "${capture_output}"
+grep -Fq ' Filtered map output root: ' <<< "${capture_output}"
+grep -Fq ' Filtered map limits: 120 snapshots, 100 MB' <<< "${capture_output}"
+grep -Fq 'record_3d_maps:=true' "${trace_file}"
+
+: > "${trace_file}"
 enabled_output="$(
   env "${common_environment[@]}" GO2_VERIFIED_FLAT_START=true \
     "${workspace}/shell/start_navigation.sh"

@@ -44,7 +44,7 @@ ament_target_dependencies(body_odom_adapter_node
 
 add_library(terrain_mapping_core
   src/terrain_map_builder.cpp
-  src/flat_obstacle_voxel_map.cpp)
+  src/flat_obstacle_layer.cpp)
 target_include_directories(terrain_mapping_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -103,6 +103,17 @@ install(TARGETS
 install(DIRECTORY include/
   DESTINATION include)
 
+# Remove the one obsolete header left by incremental/symlink installs after
+# FlatObstacleVoxelMap was replaced. Do not clean any other package artifacts.
+install(CODE [[
+  set(_obsolete_flat_obstacle_header
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/include/utree_dog_navigation/flat_obstacle_voxel_map.hpp")
+  if(EXISTS "${_obsolete_flat_obstacle_header}" OR
+      IS_SYMLINK "${_obsolete_flat_obstacle_header}")
+    file(REMOVE "${_obsolete_flat_obstacle_header}")
+  endif()
+]])
+
 install(DIRECTORY config launch rviz
   DESTINATION share/${PROJECT_NAME})
 
@@ -119,10 +130,10 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_terrain_map_builder utree_dog_msgs)
 
   ament_add_gtest(
-    test_flat_obstacle_voxel_map
-    test/test_flat_obstacle_voxel_map.cpp)
-  target_link_libraries(test_flat_obstacle_voxel_map terrain_mapping_core)
-  ament_target_dependencies(test_flat_obstacle_voxel_map utree_dog_msgs)
+    test_flat_obstacle_layer
+    test/test_flat_obstacle_layer.cpp)
+  target_link_libraries(test_flat_obstacle_layer terrain_mapping_core)
+  ament_target_dependencies(test_flat_obstacle_layer utree_dog_msgs)
 
   ament_add_pytest_test(
     test_flat_obstacle_map_recorder

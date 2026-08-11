@@ -160,10 +160,10 @@ echo " Body yaw offset: ${BODY_YAW_OFFSET} rad"
 echo " XT-16 offset: (${LIDAR_OFFSET_X}, ${LIDAR_OFFSET_Y}, ${LIDAR_OFFSET_Z}) m"
 echo " Navigation config: ${NAVIGATION_CONFIG}"
 echo " RViz config: ${NAVIGATION_RVIZ_CONFIG}"
-echo " 3D map capture: ${MAP_CAPTURE}"
+echo " Diagnostic filtered 3D obstacle map capture: ${MAP_CAPTURE}"
 if [[ "${MAP_CAPTURE}" == "true" ]]; then
-  echo " 3D map output root: ${MAP_CAPTURE_DIR}"
-  echo " 3D map limits: ${MAP_CAPTURE_MAX_SNAPSHOTS} snapshots, ${MAP_CAPTURE_MAX_MB} MB"
+  echo " Filtered map output root: ${MAP_CAPTURE_DIR}"
+  echo " Filtered map limits: ${MAP_CAPTURE_MAX_SNAPSHOTS} snapshots, ${MAP_CAPTURE_MAX_MB} MB"
 fi
 if [[ "${PLANNING_MODE}" == "flat_obstacle" ]]; then
   echo " Robot posture: STANDING and stationary required; never start this mode while prone."

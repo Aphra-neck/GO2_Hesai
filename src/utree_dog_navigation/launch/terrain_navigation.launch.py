@@ -189,6 +189,7 @@ def generate_launch_description():
                 output="screen",
                 parameters=[
                     {
+                        "topic": "/flat_obstacle_filtered_map_3d",
                         "output_directory": record_3d_maps_output,
                         "max_snapshots": ParameterValue(
                             record_3d_maps_max_snapshots,
