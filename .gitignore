@@ -16,6 +16,8 @@ logs/
 
 # Generated maps and point clouds
 *.pcd
+*.pcd.tmp
+go2_map_exports/
 map/
 
 # Editor and OS noise

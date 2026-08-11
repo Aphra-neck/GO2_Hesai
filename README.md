@@ -516,6 +516,63 @@ cd ~/catkin_ws
 ./shell/start_navigation.sh
 ```
 
+二维平地障碍模式要求机器狗已经正常站立并保持静止，必须显式确认后启动：
+
+```bash
+cd ~/catkin_ws
+GO2_PLANNING_MODE=flat_obstacle \
+GO2_FLAT_GROUND_CONFIRMED=true \
+./shell/start_navigation.sh
+```
+
+#### 可选：保存实际参与二维规划的三维障碍地图
+
+`flat_obstacle` 模式在投影为二维障碍层之前维护经过裁剪、多帧确认和三维射线清除的体素地图。
+需要对照真实场景检查预处理效果时，可临时打开 PCD 记录器：
+
+```bash
+cd ~/catkin_ws
+GO2_PLANNING_MODE=flat_obstacle \
+GO2_FLAT_GROUND_CONFIRMED=true \
+GO2_MAP_CAPTURE=true \
+PLANNING_RVIZ=true \
+./shell/start_navigation.sh
+```
+
+记录功能默认关闭。开启后，它按规划地图的源时间 epoch 和时间戳保存 CloudCompare 可读取的
+binary PCD；即使 SLAM 源时钟回退并开启新地图 epoch，也不会把新地图误判成旧帧。默认最多
+`120` 张或 `100 MiB`，输出到 `~/go2_map_exports/<session>/`。每个会话还包含：
+
+- `session.json`：代码提交、格式、上限和实际配置文件 SHA-256；
+- `navigation_config.yaml`：本轮实际启动配置的副本；
+- `manifest.jsonl`：每张 PCD 的时间戳、点数、坐标系和字节数；
+- `result.json`：正常停止、达到上限或写盘失败的最终状态。
+
+零障碍地图也会保存为合法的零点 PCD，以便识别过滤过度。写盘失败会使记录器非零退出，
+但不会伪装成正常完成。录制会增加 Jetson 的磁盘和 DDS 负载，只在诊断时打开；迭代结束后
+恢复默认的 `GO2_MAP_CAPTURE=false`。
+
+只有在运动、SDK2 bridge、规划和 SLAM 全部停止后才导出。先在 Jetson 找到最新会话并生成校验：
+
+```bash
+map_session="$(find "$HOME/go2_map_exports" -mindepth 1 -maxdepth 1 -type d \
+  -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
+test -n "$map_session" || exit 1
+find "$map_session" -maxdepth 1 -type f -name '*.pcd' -print0 \
+  | sort -z | xargs -0 -r sha256sum > "$map_session/SHA256SUMS"
+printf 'map_session=%s\n' "$map_session"
+```
+
+再从 Windows PowerShell 下载到大数据目录：
+
+```powershell
+New-Item -ItemType Directory -Force D:\GO2_Data\maps
+scp -r unitree@192.168.151.213:/home/unitree/go2_map_exports/<session> `
+  D:\GO2_Data\maps\
+```
+
+这些 PCD 及其临时文件不得加入主仓库或 `G02_log`，也不得通过 `go2-log upload` 上传。
+
 该脚本默认 `PLANNING_RVIZ=false`。只有临时改回 Jetson 本地可视化时才使用
 `PLANNING_RVIZ=true ./shell/start_navigation.sh`；分布式日常流程不要设置它。
 
@@ -894,8 +951,15 @@ pgrep -af \
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
 | `UNITREE_SDK_LIBRARY_DIR` | `/usr/local/lib` | Unitree SDK 配套 DDS 动态库目录 |
 | `GO2_BODY_YAW_OFFSET_RAD` | `-1.5707963267948966` | IMU 到 `base_link` 的 yaw 校正 |
+| `GO2_LIDAR_OFFSET_X/Y/Z` | `0.171 / 0 / 0.0908` | 同时驱动 XT-16 静态 TF 与三维清除射线原点，仅安装外参复测后修改 |
 | `PLANNING_RVIZ` | `false` | 仅显式设为 `true` 时在 Jetson 启动规划 RViz |
 | `GO2_VERIFIED_FLAT_START` | `false` | 仅显式设为 `true` 时启用当前 plan 私有的 verified-flat-start |
+| `GO2_PLANNING_MODE` | `terrain` | 平地二维障碍导航显式设为 `flat_obstacle` |
+| `GO2_FLAT_GROUND_CONFIRMED` | `false` | 机器狗已站立且平地条件已由操作员确认时显式设为 `true` |
+| `GO2_MAP_CAPTURE` | `false` | 临时记录规划前的三维确认体素地图 |
+| `GO2_MAP_CAPTURE_DIR` | `~/go2_map_exports` | PCD 会话根目录，启动脚本禁止放在 Git 工作区内 |
+| `GO2_MAP_CAPTURE_MAX_SNAPSHOTS` | `120` | 单次记录的最大地图数量 |
+| `GO2_MAP_CAPTURE_MAX_MB` | `100` | 单次记录的最大 PCD 总量，单位 MiB |
 
 ### 坐标与 RViz 所有权
 

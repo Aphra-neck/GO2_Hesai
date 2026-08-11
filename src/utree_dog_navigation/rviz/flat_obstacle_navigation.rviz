@@ -14,7 +14,7 @@ Visualization Manager:
   Displays:
     - Class: rviz_default_plugins/Grid
       Name: Ground Grid
-      Enabled: true
+      Enabled: false
       Cell Size: 0.5
       Plane: XY
       Plane Cell Count: 40
@@ -43,6 +43,23 @@ Visualization Manager:
       Min Color: 40; 90; 220
       Max Color: 240; 80; 40
       Use Fixed Frame: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Confirmed 3D Obstacles
+      Enabled: true
+      Topic:
+        Value: /flat_obstacle_confirmed_voxels
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 1
+      Decay Time: 1
+      Style: Points
+      Size (Pixels): 4
+      Color Transformer: AxisColor
+      Axis: Z
+      Min Color: 255; 190; 35
+      Max Color: 235; 45; 45
+      Use Fixed Frame: true
     - Class: rviz_default_plugins/Odometry
       Name: Go2 Body Odometry
       Enabled: true
@@ -65,10 +82,10 @@ Visualization Manager:
         History Policy: Keep Last
         Depth: 1
       Color: 210; 40; 210
-      Alpha: 0.70
+      Alpha: 0.25
     - Class: rviz_default_plugins/GridCells
       Name: Raw Obstacle Cells
-      Enabled: true
+      Enabled: false
       Topic:
         Value: /flat_obstacle_raw
         Reliability Policy: Reliable

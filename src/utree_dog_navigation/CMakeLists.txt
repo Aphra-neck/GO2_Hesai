@@ -43,7 +43,8 @@ ament_target_dependencies(body_odom_adapter_node
   nav_msgs rclcpp)
 
 add_library(terrain_mapping_core
-  src/terrain_map_builder.cpp)
+  src/terrain_map_builder.cpp
+  src/flat_obstacle_voxel_map.cpp)
 target_include_directories(terrain_mapping_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -105,12 +106,27 @@ install(DIRECTORY include/
 install(DIRECTORY config launch rviz
   DESTINATION share/${PROJECT_NAME})
 
+install(PROGRAMS
+  scripts/flat_obstacle_map_recorder.py
+  DESTINATION lib/${PROJECT_NAME})
+
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
 
   ament_add_gtest(test_terrain_map_builder test/test_terrain_map_builder.cpp)
   target_link_libraries(test_terrain_map_builder terrain_mapping_core)
   ament_target_dependencies(test_terrain_map_builder utree_dog_msgs)
+
+  ament_add_gtest(
+    test_flat_obstacle_voxel_map
+    test/test_flat_obstacle_voxel_map.cpp)
+  target_link_libraries(test_flat_obstacle_voxel_map terrain_mapping_core)
+  ament_target_dependencies(test_flat_obstacle_voxel_map utree_dog_msgs)
+
+  ament_add_pytest_test(
+    test_flat_obstacle_map_recorder
+    test/test_flat_obstacle_map_recorder.py)
 
   ament_add_gtest(test_terrain_mapper_node test/test_terrain_mapper_node.cpp)
   target_link_libraries(test_terrain_mapper_node terrain_mapper_node_lib)

@@ -140,6 +140,13 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             for node in nodes
             if node.kwargs.get("name") == "body_lattice_planner"
         )
+        recorder = next(
+            node
+            for node in nodes
+            if node.kwargs.get("name") == "flat_obstacle_map_recorder"
+        )
+        recorder_parameters = recorder.kwargs["parameters"][0]
+        self.assertEqual(recorder_parameters["navigation_config"].name, "config")
         mapper_overrides = [
             value
             for value in mapper.kwargs.get("parameters", [])
@@ -148,13 +155,39 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
         self.assertEqual(len(mapper_overrides), 1)
         self.assertEqual(
             set(mapper_overrides[0]),
-            {"planning_mode", "body_frame", "flat_ground_confirmed"},
+            {
+                "planning_mode",
+                "body_frame",
+                "body_yaw_offset",
+                "flat_obstacle.lidar_offset.x",
+                "flat_obstacle.lidar_offset.y",
+                "flat_obstacle.lidar_offset.z",
+                "flat_ground_confirmed",
+            },
         )
         self.assertEqual(mapper_overrides[0]["planning_mode"].name, "planning_mode")
         self.assertEqual(mapper_overrides[0]["body_frame"].name, "body_frame")
+        mapper_yaw_offset = mapper_overrides[0]["body_yaw_offset"]
+        self.assertIs(mapper_yaw_offset.value_type, float)
+        self.assertEqual(mapper_yaw_offset.value.name, "body_yaw_offset")
+        for axis in "xyz":
+            mapper_offset = mapper_overrides[0][f"flat_obstacle.lidar_offset.{axis}"]
+            self.assertIs(mapper_offset.value_type, float)
+            self.assertEqual(mapper_offset.value.name, f"lidar_offset_{axis}")
         mapper_confirmation = mapper_overrides[0]["flat_ground_confirmed"]
         self.assertIs(mapper_confirmation.value_type, bool)
         self.assertEqual(mapper_confirmation.value.name, "flat_ground_confirmed")
+        lidar_tf = next(
+            node for node in nodes if node.kwargs.get("name") == "imu_to_hesai_lidar_tf"
+        )
+        lidar_tf_arguments = lidar_tf.kwargs["arguments"]
+        for flag, launch_name in (
+            ("--x", "lidar_offset_x"),
+            ("--y", "lidar_offset_y"),
+            ("--z", "lidar_offset_z"),
+        ):
+            value = lidar_tf_arguments[lidar_tf_arguments.index(flag) + 1]
+            self.assertEqual(value.name, launch_name)
 
         planner_overrides = [
             value
@@ -264,7 +297,24 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             {
                 "flat_obstacle.min_height": mapper["flat_obstacle.min_height"],
                 "flat_obstacle.max_height": mapper["flat_obstacle.max_height"],
-                "flat_obstacle.clear_after": mapper["flat_obstacle.clear_after"],
+                "flat_obstacle.voxel_height": mapper[
+                    "flat_obstacle.voxel_height"
+                ],
+                "flat_obstacle.strong_hit_points": mapper[
+                    "flat_obstacle.strong_hit_points"
+                ],
+                "flat_obstacle.hit_confirmation_frames": mapper[
+                    "flat_obstacle.hit_confirmation_frames"
+                ],
+                "flat_obstacle.hit_confirmation_window": mapper[
+                    "flat_obstacle.hit_confirmation_window"
+                ],
+                "flat_obstacle.clear_confirmation_frames": mapper[
+                    "flat_obstacle.clear_confirmation_frames"
+                ],
+                "flat_obstacle.clear_confirmation_window": mapper[
+                    "flat_obstacle.clear_confirmation_window"
+                ],
                 "flat_obstacle.obstacle_clearance": mapper[
                     "flat_obstacle.obstacle_clearance"
                 ],
@@ -274,14 +324,27 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
                 "flat_obstacle.max_odom_age": mapper[
                     "flat_obstacle.max_odom_age"
                 ],
+                "flat_obstacle.visualization.voxel_size": mapper[
+                    "flat_obstacle.visualization.voxel_size"
+                ],
+                "flat_obstacle.visualization.max_points": mapper[
+                    "flat_obstacle.visualization.max_points"
+                ],
             },
             {
                 "flat_obstacle.min_height": 0.08,
                 "flat_obstacle.max_height": 0.80,
-                "flat_obstacle.clear_after": 1.0,
+                "flat_obstacle.voxel_height": 0.10,
+                "flat_obstacle.strong_hit_points": 3,
+                "flat_obstacle.hit_confirmation_frames": 2,
+                "flat_obstacle.hit_confirmation_window": 0.35,
+                "flat_obstacle.clear_confirmation_frames": 2,
+                "flat_obstacle.clear_confirmation_window": 0.35,
                 "flat_obstacle.obstacle_clearance": 0.10,
-                "flat_obstacle.nominal_body_height": 0.42,
+                "flat_obstacle.nominal_body_height": 0.34,
                 "flat_obstacle.max_odom_age": 0.5,
+                "flat_obstacle.visualization.voxel_size": 0.30,
+                "flat_obstacle.visualization.max_points": 5000,
             },
         )
         self.assertEqual(
@@ -307,7 +370,7 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             planner["flat_obstacle.obstacle_clearance"],
         )
 
-    def test_flat_obstacle_rviz_shows_raw_and_inflated_cells(self):
+    def test_flat_obstacle_rviz_separates_3d_obstacles_and_2d_clearance(self):
         rviz_file = os.path.join(
             REPO_ROOT,
             "src",
@@ -319,14 +382,21 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             document = yaml.safe_load(stream)
         displays = document["Visualization Manager"]["Displays"]
         by_name = {display["Name"]: display for display in displays}
+        voxels = by_name["Confirmed 3D Obstacles"]
         raw = by_name["Raw Obstacle Cells"]
         inflated = by_name["Inflated Clearance Cells"]
+        self.assertEqual(voxels["Class"], "rviz_default_plugins/PointCloud2")
+        self.assertIs(voxels["Enabled"], True)
+        self.assertEqual(
+            voxels["Topic"]["Value"], "/flat_obstacle_confirmed_voxels"
+        )
         self.assertEqual(raw["Class"], "rviz_default_plugins/GridCells")
-        self.assertIs(raw["Enabled"], True)
+        self.assertIs(raw["Enabled"], False)
         self.assertEqual(raw["Topic"]["Value"], "/flat_obstacle_raw")
         self.assertEqual(raw["Color"], "255; 35; 35")
         self.assertEqual(inflated["Class"], "rviz_default_plugins/GridCells")
         self.assertIs(inflated["Enabled"], True)
+        self.assertEqual(inflated["Alpha"], 0.25)
         self.assertEqual(
             inflated["Topic"]["Value"], "/flat_obstacle_inflated"
         )

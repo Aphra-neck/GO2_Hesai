@@ -7,6 +7,9 @@ PLANNING_RVIZ="${PLANNING_RVIZ:-false}"
 PLANNING_MODE="${GO2_PLANNING_MODE:-terrain}"
 FLAT_GROUND_CONFIRMED="${GO2_FLAT_GROUND_CONFIRMED:-false}"
 BODY_YAW_OFFSET="${GO2_BODY_YAW_OFFSET_RAD:--1.5707963267948966}"
+LIDAR_OFFSET_X="${GO2_LIDAR_OFFSET_X:-0.171}"
+LIDAR_OFFSET_Y="${GO2_LIDAR_OFFSET_Y:-0.0}"
+LIDAR_OFFSET_Z="${GO2_LIDAR_OFFSET_Z:-0.0908}"
 NAVIGATION_CONFIG="${GO2_NAVIGATION_CONFIG:-${WORKSPACE_DIR}/src/utree_dog_navigation/config/terrain_navigation.yaml}"
 if [[ -n "${GO2_NAVIGATION_RVIZ_CONFIG:-}" ]]; then
   NAVIGATION_RVIZ_CONFIG="${GO2_NAVIGATION_RVIZ_CONFIG}"
@@ -16,6 +19,15 @@ else
   NAVIGATION_RVIZ_CONFIG="${WORKSPACE_DIR}/src/utree_dog_navigation/rviz/hesai_navigation.rviz"
 fi
 VERIFIED_FLAT_START="${GO2_VERIFIED_FLAT_START:-false}"
+MAP_CAPTURE="${GO2_MAP_CAPTURE:-false}"
+MAP_CAPTURE_DIR="${GO2_MAP_CAPTURE_DIR:-${HOME}/go2_map_exports}"
+MAP_CAPTURE_MAX_SNAPSHOTS="${GO2_MAP_CAPTURE_MAX_SNAPSHOTS:-120}"
+MAP_CAPTURE_MAX_MB="${GO2_MAP_CAPTURE_MAX_MB:-100}"
+if SOURCE_GIT_SHA="$(git -C "${WORKSPACE_DIR}" rev-parse --verify HEAD 2>/dev/null)"; then
+  :
+else
+  SOURCE_GIT_SHA="unknown"
+fi
 GO2_BODY_YAW_OFFSET_RAD="${BODY_YAW_OFFSET}"
 export GO2_BODY_YAW_OFFSET_RAD
 
@@ -57,6 +69,35 @@ case "${VERIFIED_FLAT_START}" in
     ;;
 esac
 
+case "${MAP_CAPTURE}" in
+  true|false) ;;
+  *)
+    echo "GO2_MAP_CAPTURE must be true or false, got: ${MAP_CAPTURE}" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${MAP_CAPTURE}" == "true" && "${PLANNING_MODE}" != "flat_obstacle" ]]; then
+  echo "GO2_MAP_CAPTURE is available only in flat_obstacle mode." >&2
+  exit 1
+fi
+
+if [[ ! "${MAP_CAPTURE_MAX_SNAPSHOTS}" =~ ^[1-9][0-9]*$ ]] ||
+   [[ ! "${MAP_CAPTURE_MAX_MB}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GO2_MAP_CAPTURE_MAX_SNAPSHOTS and GO2_MAP_CAPTURE_MAX_MB must be positive integers." >&2
+  exit 1
+fi
+
+if [[ "${MAP_CAPTURE}" == "true" ]]; then
+  MAP_CAPTURE_DIR="$(realpath -m -- "${MAP_CAPTURE_DIR}")"
+  case "${MAP_CAPTURE_DIR}/" in
+    "${WORKSPACE_DIR}/"*)
+      echo "GO2_MAP_CAPTURE_DIR must be outside the Git workspace: ${MAP_CAPTURE_DIR}" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 source "${SCRIPT_DIR}/ros2_environment.sh"
 
 if ! ros2 pkg prefix utree_dog_navigation >/dev/null 2>&1; then
@@ -77,10 +118,11 @@ fi
 
 if pgrep -f -- "/utree_dog_navigation/body_odom_adapter_node" >/dev/null 2>&1 ||
    pgrep -f -- "/utree_dog_navigation/terrain_mapper_node" >/dev/null 2>&1 ||
-   pgrep -f -- "/utree_dog_navigation/body_lattice_planner_node" >/dev/null 2>&1; then
+   pgrep -f -- "/utree_dog_navigation/body_lattice_planner_node" >/dev/null 2>&1 ||
+   pgrep -f -- "/utree_dog_navigation/flat_obstacle_map_recorder.py" >/dev/null 2>&1; then
   echo "Terrain navigation is already running." >&2
   pgrep -af -- \
-    "utree_dog_navigation/(body_odom_adapter_node|terrain_mapper_node|body_lattice_planner_node)" \
+    "utree_dog_navigation/(body_odom_adapter_node|terrain_mapper_node|body_lattice_planner_node|flat_obstacle_map_recorder.py)" \
     >&2 || true
   exit 1
 fi
@@ -115,8 +157,14 @@ echo " Planning mode: ${PLANNING_MODE}"
 echo " Flat ground confirmed: ${FLAT_GROUND_CONFIRMED}"
 echo " Verified flat start: ${VERIFIED_FLAT_START}"
 echo " Body yaw offset: ${BODY_YAW_OFFSET} rad"
+echo " XT-16 offset: (${LIDAR_OFFSET_X}, ${LIDAR_OFFSET_Y}, ${LIDAR_OFFSET_Z}) m"
 echo " Navigation config: ${NAVIGATION_CONFIG}"
 echo " RViz config: ${NAVIGATION_RVIZ_CONFIG}"
+echo " 3D map capture: ${MAP_CAPTURE}"
+if [[ "${MAP_CAPTURE}" == "true" ]]; then
+  echo " 3D map output root: ${MAP_CAPTURE_DIR}"
+  echo " 3D map limits: ${MAP_CAPTURE_MAX_SNAPSHOTS} snapshots, ${MAP_CAPTURE_MAX_MB} MB"
+fi
 if [[ "${PLANNING_MODE}" == "flat_obstacle" ]]; then
   echo " Robot posture: STANDING and stationary required; never start this mode while prone."
 fi
@@ -139,6 +187,14 @@ ros2 launch utree_dog_navigation terrain_navigation.launch.py \
   "rviz:=${PLANNING_RVIZ}" \
   "rviz_config:=${NAVIGATION_RVIZ_CONFIG}" \
   "body_yaw_offset:=${BODY_YAW_OFFSET}" \
+  "lidar_offset_x:=${LIDAR_OFFSET_X}" \
+  "lidar_offset_y:=${LIDAR_OFFSET_Y}" \
+  "lidar_offset_z:=${LIDAR_OFFSET_Z}" \
   "planning_mode:=${PLANNING_MODE}" \
   "flat_ground_confirmed:=${FLAT_GROUND_CONFIRMED}" \
-  "verified_flat_start:=${VERIFIED_FLAT_START}"
+  "verified_flat_start:=${VERIFIED_FLAT_START}" \
+  "record_3d_maps:=${MAP_CAPTURE}" \
+  "record_3d_maps_output:=${MAP_CAPTURE_DIR}" \
+  "record_3d_maps_max_snapshots:=${MAP_CAPTURE_MAX_SNAPSHOTS}" \
+  "record_3d_maps_max_megabytes:=${MAP_CAPTURE_MAX_MB}" \
+  "record_3d_maps_source_git_sha:=${SOURCE_GIT_SHA}"

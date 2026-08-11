@@ -27,9 +27,23 @@ def generate_launch_description():
     rviz_config = LaunchConfiguration("rviz_config")
     body_yaw_offset = LaunchConfiguration("body_yaw_offset")
     body_frame = LaunchConfiguration("body_frame")
+    lidar_offset_x = LaunchConfiguration("lidar_offset_x")
+    lidar_offset_y = LaunchConfiguration("lidar_offset_y")
+    lidar_offset_z = LaunchConfiguration("lidar_offset_z")
     planning_mode = LaunchConfiguration("planning_mode")
     flat_ground_confirmed = LaunchConfiguration("flat_ground_confirmed")
     verified_flat_start = LaunchConfiguration("verified_flat_start")
+    record_3d_maps = LaunchConfiguration("record_3d_maps")
+    record_3d_maps_output = LaunchConfiguration("record_3d_maps_output")
+    record_3d_maps_max_snapshots = LaunchConfiguration(
+        "record_3d_maps_max_snapshots"
+    )
+    record_3d_maps_max_megabytes = LaunchConfiguration(
+        "record_3d_maps_max_megabytes"
+    )
+    record_3d_maps_source_git_sha = LaunchConfiguration(
+        "record_3d_maps_source_git_sha"
+    )
 
     body_odom_adapter = Node(
         package="utree_dog_navigation",
@@ -70,11 +84,31 @@ def generate_launch_description():
                 default_value="-1.5707963267948966",
             ),
             DeclareLaunchArgument("body_frame", default_value="base_link"),
+            DeclareLaunchArgument("lidar_offset_x", default_value="0.171"),
+            DeclareLaunchArgument("lidar_offset_y", default_value="0.0"),
+            DeclareLaunchArgument("lidar_offset_z", default_value="0.0908"),
             DeclareLaunchArgument("planning_mode", default_value="terrain"),
             DeclareLaunchArgument("flat_ground_confirmed", default_value="false"),
             DeclareLaunchArgument(
                 "verified_flat_start",
                 default_value="false",
+            ),
+            DeclareLaunchArgument("record_3d_maps", default_value="false"),
+            DeclareLaunchArgument(
+                "record_3d_maps_output",
+                default_value="~/go2_map_exports",
+            ),
+            DeclareLaunchArgument(
+                "record_3d_maps_max_snapshots",
+                default_value="120",
+            ),
+            DeclareLaunchArgument(
+                "record_3d_maps_max_megabytes",
+                default_value="100",
+            ),
+            DeclareLaunchArgument(
+                "record_3d_maps_source_git_sha",
+                default_value="unknown",
             ),
             RegisterEventHandler(
                 OnProcessExit(
@@ -108,7 +142,9 @@ def generate_launch_description():
                 name="imu_to_hesai_lidar_tf",
                 output="screen",
                 arguments=[
-                    "--x", "0.171", "--y", "0", "--z", "0.0908",
+                    "--x", lidar_offset_x,
+                    "--y", lidar_offset_y,
+                    "--z", lidar_offset_z,
                     "--roll", "0", "--pitch", "0", "--yaw", "0",
                     "--frame-id", "imu", "--child-frame-id", "hesai_lidar",
                 ],
@@ -123,12 +159,71 @@ def generate_launch_description():
                     {
                         "planning_mode": planning_mode,
                         "body_frame": body_frame,
+                        "body_yaw_offset": ParameterValue(
+                            body_yaw_offset,
+                            value_type=float,
+                        ),
+                        "flat_obstacle.lidar_offset.x": ParameterValue(
+                            lidar_offset_x,
+                            value_type=float,
+                        ),
+                        "flat_obstacle.lidar_offset.y": ParameterValue(
+                            lidar_offset_y,
+                            value_type=float,
+                        ),
+                        "flat_obstacle.lidar_offset.z": ParameterValue(
+                            lidar_offset_z,
+                            value_type=float,
+                        ),
                         "flat_ground_confirmed": ParameterValue(
                             flat_ground_confirmed,
                             value_type=bool,
                         ),
                     },
                 ],
+            ),
+            Node(
+                package="utree_dog_navigation",
+                executable="flat_obstacle_map_recorder.py",
+                name="flat_obstacle_map_recorder",
+                output="screen",
+                parameters=[
+                    {
+                        "output_directory": record_3d_maps_output,
+                        "max_snapshots": ParameterValue(
+                            record_3d_maps_max_snapshots,
+                            value_type=int,
+                        ),
+                        "max_total_megabytes": ParameterValue(
+                            record_3d_maps_max_megabytes,
+                            value_type=int,
+                        ),
+                        "source_git_sha": record_3d_maps_source_git_sha,
+                        "navigation_config": config,
+                        "planning_mode": planning_mode,
+                        "flat_ground_confirmed": ParameterValue(
+                            flat_ground_confirmed,
+                            value_type=bool,
+                        ),
+                        "body_yaw_offset": ParameterValue(
+                            body_yaw_offset,
+                            value_type=float,
+                        ),
+                        "lidar_offset_x": ParameterValue(
+                            lidar_offset_x,
+                            value_type=float,
+                        ),
+                        "lidar_offset_y": ParameterValue(
+                            lidar_offset_y,
+                            value_type=float,
+                        ),
+                        "lidar_offset_z": ParameterValue(
+                            lidar_offset_z,
+                            value_type=float,
+                        ),
+                    },
+                ],
+                condition=IfCondition(record_3d_maps),
             ),
             Node(
                 package="utree_dog_navigation",

@@ -779,6 +779,33 @@ TEST_F(FlatObstaclePlannerNodeTest, LocksEveryPathPoseToInitialStandingBodyHeigh
   }
 }
 
+TEST_F(FlatObstaclePlannerNodeTest, MalformedEpochInvalidationRelocksStandingHeight)
+{
+  publishFlatPlan(0.03);
+  const std::size_t paths_before_invalidation = paths_.size();
+
+  utree_dog_msgs::msg::TerrainGrid invalidation;
+  invalidation.header.stamp = harness_node_->now();
+  invalidation.header.frame_id = "world";
+  map_pub_->publish(invalidation);
+  ASSERT_TRUE(spinUntil(
+      [this, paths_before_invalidation]() {
+        return paths_.size() > paths_before_invalidation && paths_.back().poses.empty();
+      },
+      1s));
+
+  auto relocked_odom = makeOdom(harness_node_->now());
+  relocked_odom.pose.pose.position.z = 1.03;
+  odom_pub_->publish(relocked_odom);
+  map_pub_->publish(makeFlatMap(harness_node_->now()));
+  goal_pub_->publish(makeGoal(harness_node_->now()));
+  ASSERT_TRUE(spinUntil(
+      [this]() {return !paths_.empty() && !paths_.back().poses.empty();}, 2s));
+  for (const auto & pose : paths_.back().poses) {
+    EXPECT_NEAR(pose.pose.position.z, 1.03, 1.0e-9);
+  }
+}
+
 TEST_F(FlatObstaclePlannerNodeTest, RetainsQuantizedStartPoseWhenExactYawDiffers)
 {
   constexpr double kExactYaw = 0.10;

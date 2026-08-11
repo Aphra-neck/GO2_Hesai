@@ -183,9 +183,14 @@ void BodyLatticePlannerNode::mapCallback(
 {
   planner_->setMap(msg);
   if (!planner_->mapValid()) {
+    if (planning_mode_ == PlanningMode::kFlatObstacle) {
+      flat_body_height_locked_ = false;
+      clearGoal("flat-obstacle map epoch was invalidated");
+    } else {
+      clearPath("malformed terrain map");
+    }
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), 3000, "Rejected malformed terrain map");
-    clearPath("malformed terrain map");
     return;
   }
   if (msg->header.frame_id != map_frame_) {
@@ -228,9 +233,11 @@ void BodyLatticePlannerNode::odomCallback(const nav_msgs::msg::Odometry::SharedP
     }
     return;
   }
+  bool flat_height_relocked = false;
   if (planning_mode_ == PlanningMode::kFlatObstacle && !flat_body_height_locked_) {
     flat_body_height_z_ = odom_->pose.pose.position.z;
     flat_body_height_locked_ = true;
+    flat_height_relocked = true;
     RCLCPP_INFO(
       get_logger(),
       "Locked flat-obstacle body path height at world z=%.3f m for this run",
@@ -238,6 +245,9 @@ void BodyLatticePlannerNode::odomCallback(const nav_msgs::msg::Odometry::SharedP
   }
   if (path_active_ && !odom_stamp_fresh) {
     clearForStaleInput("body odometry timestamp became stale or invalid");
+  }
+  if (flat_height_relocked && have_goal_ && planner_->hasMap() && planner_->mapValid()) {
+    requestPlan();
   }
 }
 

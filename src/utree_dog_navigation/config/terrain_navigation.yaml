@@ -43,14 +43,23 @@ terrain_mapper:
     cloud_stale_warning_age: 1.0
     # Keep rebuild recovery aligned with body_lattice_planner.start_snap_radius.
     confidence_rebuild.start_radius: 0.55
-    # flat_obstacle is an explicitly confirmed, standing-robot mode. It locks
-    # the floor once and treats every non-obstacle cell inside this existing map as free.
+    # flat_obstacle is an explicitly confirmed, standing-robot mode. It keeps
+    # 3D collision voxels, then projects confirmed obstacles into the 2D planner.
     flat_obstacle.min_height: 0.08
     flat_obstacle.max_height: 0.80
-    flat_obstacle.clear_after: 1.0
+    flat_obstacle.voxel_height: 0.10
+    flat_obstacle.strong_hit_points: 3
+    flat_obstacle.hit_confirmation_frames: 2
+    flat_obstacle.hit_confirmation_window: 0.35
+    flat_obstacle.clear_confirmation_frames: 2
+    flat_obstacle.clear_confirmation_window: 0.35
     flat_obstacle.obstacle_clearance: 0.10
-    flat_obstacle.nominal_body_height: 0.42
+    # Stationary XT-16 calibration: body z minus observed floor z.
+    flat_obstacle.nominal_body_height: 0.34
     flat_obstacle.max_odom_age: 0.5
+    # Visualization is independently downsampled and never feeds planning.
+    flat_obstacle.visualization.voxel_size: 0.30
+    flat_obstacle.visualization.max_points: 5000
 
 body_lattice_planner:
   ros__parameters:
