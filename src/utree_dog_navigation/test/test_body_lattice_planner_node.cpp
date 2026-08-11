@@ -669,6 +669,71 @@ TEST_F(BodyLatticePlannerNodeTest, PathTimestampPreservesOldestCausalInput)
     rclcpp::Time(expected_stamp).nanoseconds());
 }
 
+TEST_F(BodyLatticePlannerNodeTest, PathPosesCarryStableGoalGenerationAcrossMapReplans)
+{
+  const auto initial_time = harness_node_->now();
+  const auto initial_map_time = initial_time - 50ms;
+  const auto initial_odom_time = initial_time - 20ms;
+  const auto first_goal_time = initial_time - 10ms;
+
+  map_pub_->publish(makeMap(initial_map_time));
+  odom_pub_->publish(makeOdom(initial_odom_time));
+  goal_pub_->publish(makeGoal(first_goal_time));
+  ASSERT_TRUE(
+    spinUntil(
+      [this]() {return !paths_.empty() && !paths_.back().poses.empty();}, 2s));
+
+  const auto expect_pose_generation = [](const nav_msgs::msg::Path & path,
+      const rclcpp::Time & expected_generation) {
+      ASSERT_FALSE(path.poses.empty());
+      for (const auto & pose : path.poses) {
+        EXPECT_EQ(pose.header.frame_id, path.header.frame_id);
+        EXPECT_EQ(
+          rclcpp::Time(pose.header.stamp).nanoseconds(),
+          expected_generation.nanoseconds());
+      }
+    };
+
+  EXPECT_EQ(
+    rclcpp::Time(paths_.back().header.stamp).nanoseconds(),
+    initial_map_time.nanoseconds());
+  expect_pose_generation(paths_.back(), first_goal_time);
+
+  const std::size_t paths_before_replan = paths_.size();
+  const auto replan_map_time = harness_node_->now();
+  map_pub_->publish(makeMap(replan_map_time));
+  ASSERT_TRUE(
+    spinUntil(
+      [this, paths_before_replan]() {
+        return paths_.size() > paths_before_replan && !paths_.back().poses.empty();
+      }, 2s));
+
+  EXPECT_EQ(
+    rclcpp::Time(paths_.back().header.stamp).nanoseconds(),
+    initial_odom_time.nanoseconds());
+  expect_pose_generation(paths_.back(), first_goal_time);
+
+  const std::size_t paths_before_new_goal = paths_.size();
+  const auto second_goal_time = harness_node_->now();
+  ASSERT_NE(second_goal_time.nanoseconds(), first_goal_time.nanoseconds());
+  auto second_goal = makeGoal(second_goal_time);
+  second_goal.pose.position.y = 0.5;
+  goal_pub_->publish(second_goal);
+  ASSERT_TRUE(
+    spinUntil(
+      [this, paths_before_new_goal]() {
+        return paths_.size() > paths_before_new_goal && !paths_.back().poses.empty();
+      }, 2s));
+
+  EXPECT_EQ(
+    rclcpp::Time(paths_.back().header.stamp).nanoseconds(),
+    initial_odom_time.nanoseconds());
+  expect_pose_generation(paths_.back(), second_goal_time);
+  EXPECT_NE(
+    rclcpp::Time(paths_.back().poses.front().header.stamp).nanoseconds(),
+    first_goal_time.nanoseconds());
+}
+
 TEST_F(BodyLatticePlannerNodeTest, ObservedFlatPathRetainsHeightAndUnitOrientation)
 {
   publishFreshPlan();

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "geometry_msgs/msg/twist_stamped.hpp"
@@ -15,7 +17,8 @@ namespace utree_go2_sdk2_bridge
 {
 
 // Converts the geometric body path into bounded Go2 SportClient velocity commands.
-// Motion is disabled by default and is stopped whenever required input becomes stale.
+// Motion is disarmed by default. One explicit arm authorizes subsequent valid paths,
+// while every active command is stopped whenever its required input becomes stale.
 class Go2Sdk2BridgeNode : public rclcpp::Node
 {
 public:
@@ -31,9 +34,12 @@ private:
   void controlTick();
   void controlTickImpl();
   void failSafe(const char * reason);
-  void stopRobot(const char * reason) noexcept;
-  bool cachedInputsValid() const;
-  bool inputsFresh(const rclcpp::Time & current_time) const;
+  bool waitForNewPath(const char * reason);
+  bool stopRobot(const char * reason) noexcept;
+  bool cachedPathValid() const;
+  bool cachedOdomValid() const;
+  bool pathFresh(const rclcpp::Time & current_time) const;
+  bool odomFresh(const rclcpp::Time & current_time) const;
   double messageAgeSeconds(
     const rclcpp::Time & message_time,
     const rclcpp::Time & current_time) const;
@@ -42,13 +48,12 @@ private:
     const rclcpp::Time & current_time,
     double timeout) const;
   bool lowcmdPublisherPresent();
-  std::size_t selectLookaheadPose() const;
 
   std::string network_interface_;
   std::string world_frame_;
   std::string body_frame_;
   int domain_id_{0};
-  bool enabled_{false};
+  MotionAuthorization motion_authorization_;
   // Cleared only after SportClient confirms StopMove.
   bool command_active_{false};
   double command_rate_{20.0};
@@ -58,11 +63,17 @@ private:
   double lookahead_distance_{0.6};
   double goal_position_tolerance_{0.15};
   double goal_yaw_tolerance_{0.20};
+  double heading_alignment_enter_angle_{0.7853981633974483};
+  double heading_alignment_exit_angle_{0.2617993877991494};
+  bool heading_alignment_active_{false};
   double linear_gain_{1.0};
   double yaw_gain_{1.5};
-  double max_vx_{0.6};
-  double max_vy_{0.35};
-  double max_yaw_rate_{0.8};
+  double max_vx_{kValidatedMaxVx};
+  double max_vy_{kValidatedMaxVy};
+  double max_yaw_rate_{kValidatedMaxYawRate};
+  PathProgressTracker path_progress_tracker_;
+  CompletedGoalLatch completed_goal_latch_;
+  std::optional<std::int64_t> path_goal_generation_;
   nav_msgs::msg::Path::SharedPtr path_;
   nav_msgs::msg::Odometry::SharedPtr odom_;
   std::unique_ptr<unitree::robot::go2::SportClient> sport_client_;

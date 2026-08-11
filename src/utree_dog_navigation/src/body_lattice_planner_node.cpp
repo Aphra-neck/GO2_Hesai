@@ -331,7 +331,8 @@ void BodyLatticePlannerNode::requestPlan()
   const rclcpp::Time map_time(map.header.stamp, completion_time.get_clock_type());
   const rclcpp::Time odom_time(odom_->header.stamp, completion_time.get_clock_type());
   const auto & source_stamp = map_time <= odom_time ? map.header.stamp : odom_->header.stamp;
-  const nav_msgs::msg::Path path = makePath(result, start, source_stamp);
+  const nav_msgs::msg::Path path = makePath(
+    result, start, source_stamp, goal_->header.stamp);
   const rclcpp::Time publish_time = now();
   if (expireGoalIfNeeded()) {return;}
   if (!framesValid() || !posesValid() || !inputsFresh(publish_time)) {
@@ -485,7 +486,8 @@ void BodyLatticePlannerNode::clearGoal(const char * reason)
 
 nav_msgs::msg::Path BodyLatticePlannerNode::makePath(
   const PlanningResult & result, const WorldState & exact_start,
-  const builtin_interfaces::msg::Time & source_stamp) const
+  const builtin_interfaces::msg::Time & source_stamp,
+  const builtin_interfaces::msg::Time & goal_stamp) const
 {
   const auto & map = planner_->map();
   nav_msgs::msg::Path path;
@@ -493,7 +495,7 @@ nav_msgs::msg::Path BodyLatticePlannerNode::makePath(
   path.header.frame_id = map.header.frame_id;
   const bool include_exact_start = result.include_exact_start || result.exact_start_inferred;
   path.poses.reserve(result.states.size() + static_cast<std::size_t>(include_exact_start));
-  const auto append_pose = [&path, this](
+  const auto append_pose = [&path, &goal_stamp, this](
       double x, double y, double elevation, double dzdx, double dzdy, double yaw)
     {
     tf2::Quaternion orientation;
@@ -505,7 +507,8 @@ nav_msgs::msg::Path BodyLatticePlannerNode::makePath(
         -std::atan2(dzdx, 1.0), yaw);
     }
     geometry_msgs::msg::PoseStamped pose;
-    pose.header = path.header;
+    pose.header.frame_id = path.header.frame_id;
+    pose.header.stamp = goal_stamp;
     pose.pose.position.x = x;
     pose.pose.position.y = y;
     pose.pose.position.z = planning_mode_ == PlanningMode::kFlatObstacle ?

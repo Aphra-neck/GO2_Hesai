@@ -115,6 +115,7 @@ struct PlanningResult
 {
   bool success{false};
   int expansions{0};
+  double path_cost{0.0};
   VerifiedFlatStartStatus start_status{VerifiedFlatStartStatus::kNotNeeded};
   bool include_exact_start{false};
   bool exact_start_inferred{false};

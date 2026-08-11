@@ -209,6 +209,28 @@ acquire_lock() {
   die "could not acquire the go2-log command lock"
 }
 
+checked_pgrep() {
+  local pattern="$1"
+  local matches='' status=0
+  if matches="$(pgrep -af -- "${pattern}" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "${status}" in
+    0)
+      [[ -n "${matches}" ]] || return 2
+      printf '%s\n' "${matches}"
+      ;;
+    1)
+      [[ -z "${matches}" ]] || return 2
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
 session_bytes() {
   local session_dir="$1"
   du -sb -- "${session_dir}" 2>/dev/null | awk '{print $1}' || echo 0
@@ -1832,9 +1854,16 @@ run_collector() {
     enforce_session_size_limit "${session_dir}" ||
       echo "WARNING: preserve the oversized session with SCP: ${session_dir}" >&2
     if [[ -f "${ACTIVE_FILE}" ]] && [[ "$(< "${ACTIVE_FILE}")" == "${session_dir}" ]]; then
-      local remaining_writers
-      remaining_writers="$(running_auxiliary_diagnostic_writers |
-        grep -F -- "${session_dir}" || true)"
+      local remaining_writers='' all_auxiliary_writers=''
+      if ! all_auxiliary_writers="$(running_auxiliary_diagnostic_writers)"; then
+        writer_cleanup_failed=1
+        append_event "${session_dir}" warning collector \
+          "diagnostic writer process query failed; active-session state was preserved"
+      else
+        remaining_writers="$(
+          grep -F -- "${session_dir}" <<< "${all_auxiliary_writers}" || true
+        )"
+      fi
       if (( writer_cleanup_failed == 0 )) && [[ -z "${remaining_writers}" ]]; then
         rm -f -- "${ACTIVE_FILE}"
       else
@@ -1909,7 +1938,45 @@ run_collector() {
   trap - EXIT INT TERM
 }
 
+write_start_result() {
+  local result_file="$1"
+  local ownership="$2"
+  local session_dir="$3"
+  [[ -n "${result_file}" ]] || return 0
+
+  local session_id result_temp
+  session_id="$(basename -- "${session_dir}")"
+  [[ "${ownership}" == created || "${ownership}" == existing ]] ||
+    die "invalid diagnostic start ownership result: ${ownership}"
+  [[ -n "${session_id}" && "${session_id}" != *$'\n'* &&
+      "${session_dir}" != *$'\n'* ]] ||
+    die "diagnostic start result contains an invalid session value"
+  [[ -d "$(dirname -- "${result_file}")" ]] ||
+    die "diagnostic start result directory does not exist: $(dirname -- "${result_file}")"
+
+  result_temp="$(mktemp -- "${result_file}.tmp.XXXXXX")" ||
+    die "could not create diagnostic start result temporary file"
+  chmod 0600 -- "${result_temp}" || {
+    rm -f -- "${result_temp}"
+    die "could not protect diagnostic start result temporary file"
+  }
+  if ! {
+    echo 'format=go2-log-start-v1'
+    echo "ownership=${ownership}"
+    echo "session_id=${session_id}"
+    echo "session_dir=${session_dir}"
+  } > "${result_temp}"; then
+    rm -f -- "${result_temp}"
+    die "could not write diagnostic start result"
+  fi
+  if ! mv -f -- "${result_temp}" "${result_file}"; then
+    rm -f -- "${result_temp}"
+    die "could not publish diagnostic start result"
+  fi
+}
+
 start_session() {
+  local result_file="${1:-}"
   acquire_lock
   command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
@@ -1918,6 +1985,7 @@ start_session() {
     pid="$(read_first_line "${current}/collector.pid" 2>/dev/null || true)"
     if collector_is_running "${pid}" "${current}"; then
       record_active_runtime_overrides "${current}"
+      write_start_result "${result_file}" existing "${current}"
       echo "Diagnostic session is already running: $(basename -- "${current}")"
       echo "Directory: ${current}"
       echo "Collector PID: ${pid}"
@@ -1926,7 +1994,9 @@ start_session() {
     die "active diagnostic session is stale ($(basename -- "${current}")); run './tools/go2-log stop' before starting a new session"
   fi
 
-  writers="$(running_diagnostic_writers)"
+  if ! writers="$(running_diagnostic_writers)"; then
+    die "diagnostic writer process query failed before starting a session"
+  fi
   if [[ -n "${writers}" ]]; then
     echo "${writers}" >&2
     die "live diagnostic writer exists without active-session state; inspect and stop it before starting a new session"
@@ -1969,6 +2039,7 @@ start_session() {
     die "collector failed to start; see ${session_dir}/collector.log"
   fi
 
+  write_start_result "${result_file}" created "${session_dir}"
   echo "Started diagnostic session: ${session_id}"
   echo "Directory: ${session_dir}"
   echo "Collector PID: ${collector_pid}"
@@ -1999,10 +2070,21 @@ status_session() {
 
 stop_session() {
   acquire_lock
+  local expected_session_id="${1:-}"
+  local expected_session_dir=""
   local session_dir pid rosout_details rosout_pid rosout_boot rosout_start
   local timing_details timing_pid timing_boot timing_start
-  local rosout_status timing_status writers
+  local rosout_status timing_status writers all_writers
+  if [[ -n "${expected_session_id}" ]]; then
+    validate_session_id "${expected_session_id}"
+    expected_session_dir="${SESSIONS_DIR}/${expected_session_id}"
+  fi
   session_dir="$(active_session_dir 2>/dev/null)" || die "no active session"
+  if [[ -n "${expected_session_id}" &&
+        "${session_dir}" != "${expected_session_dir}" ]]; then
+    die \
+      "refusing to stop unexpected active diagnostic session: expected ${expected_session_dir}, active ${session_dir}"
+  fi
   pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
 
   if ! collector_is_running "${pid}" "${session_dir}"; then
@@ -2026,7 +2108,10 @@ stop_session() {
         die "stale collector has a verified timing writer that could not be stopped; active state was preserved"
       fi
     fi
-    writers="$(running_diagnostic_writers | grep -F -- "${session_dir}" || true)"
+    if ! all_writers="$(running_diagnostic_writers)"; then
+      die "diagnostic writer process query failed; active state was preserved"
+    fi
+    writers="$(grep -F -- "${session_dir}" <<< "${all_writers}" || true)"
     [[ -z "${writers}" ]] ||
       die "stale session still has a live diagnostic writer; active state was preserved"
     rm -f -- "${ACTIVE_FILE}"
@@ -2045,7 +2130,10 @@ stop_session() {
   if [[ -f "${ACTIVE_FILE}" ]] && [[ "$(< "${ACTIVE_FILE}")" == "${session_dir}" ]]; then
     die "collector stopped but writer cleanup did not complete; active state was preserved"
   fi
-  writers="$(running_diagnostic_writers | grep -F -- "${session_dir}" || true)"
+  if ! all_writers="$(running_diagnostic_writers)"; then
+    die "diagnostic writer process query failed; active state was preserved"
+  fi
+  writers="$(grep -F -- "${session_dir}" <<< "${all_writers}" || true)"
   [[ -z "${writers}" ]] ||
     die "session still has a live diagnostic writer; active state was preserved"
   rm -f -- "${ACTIVE_FILE}"
@@ -2053,27 +2141,73 @@ stop_session() {
   echo "Directory: ${session_dir}"
 }
 
-running_robot_processes() {
-  pgrep -af "${ROBOT_PROCESS_PATTERN}" 2>/dev/null || true
+lowcmd_publisher_count() {
+  source_ros_environment
+  command -v ros2 >/dev/null 2>&1 || {
+    echo "ROS 2 command is unavailable while checking /lowcmd publishers." >&2
+    return 1
+  }
+
+  local lowcmd_info='' lowcmd_status=0 publisher_count=''
+  if lowcmd_info="$(
+      timeout 8 ros2 topic info --no-daemon --spin-time 3 /lowcmd 2>&1
+    )"; then
+    lowcmd_status=0
+  else
+    lowcmd_status=$?
+  fi
+
+  if (( lowcmd_status != 0 )); then
+    if (( lowcmd_status == 1 )) &&
+      [[ "${lowcmd_info}" == "Unknown topic '/lowcmd'" ]]; then
+      printf '0\n'
+      return 0
+    fi
+    [[ -z "${lowcmd_info}" ]] || printf '%s\n' "${lowcmd_info}" >&2
+    return 1
+  fi
+
+  publisher_count="$(
+    awk -F': *' '$1 == "Publisher count" {print $2; exit}' <<< "${lowcmd_info}"
+  )"
+  [[ "${publisher_count}" =~ ^[0-9]+$ ]] || {
+    [[ -z "${lowcmd_info}" ]] || printf '%s\n' "${lowcmd_info}" >&2
+    return 1
+  }
+  printf '%s\n' "${publisher_count}"
 }
 
 assert_robot_idle() {
   local action="${1:-Git push}"
-  local processes
-  processes="$(running_robot_processes)"
+  local processes='' publisher_count=''
+  if ! processes="$(checked_pgrep "${ROBOT_PROCESS_PATTERN}")"; then
+    echo "Refusing ${action}: robot process query failed." >&2
+    return 1
+  fi
   if [[ -n "${processes}" ]]; then
     echo "Refusing ${action} while robot/SLAM/planning processes are running:" >&2
     echo "${processes}" >&2
     return 1
   fi
+
+  if ! publisher_count="$(lowcmd_publisher_count)"; then
+    echo "Refusing ${action}: /lowcmd publisher query failed." >&2
+    return 1
+  fi
+  if (( publisher_count > 0 )); then
+    echo \
+      "Refusing ${action}: /lowcmd has ${publisher_count} publisher(s)." \
+      >&2
+    return 1
+  fi
 }
 
 running_diagnostic_writers() {
-  pgrep -af '[g]o2-log (_collect|_rosout|_timing)' 2>/dev/null || true
+  checked_pgrep '[g]o2-log (_collect|_rosout|_timing)'
 }
 
 running_auxiliary_diagnostic_writers() {
-  pgrep -af '[g]o2-log (_rosout|_timing)' 2>/dev/null || true
+  checked_pgrep '[g]o2-log (_rosout|_timing)'
 }
 
 validate_session_for_upload() {
@@ -3248,7 +3382,9 @@ repair_session() {
   if collector_is_running "${collector_pid}" "${session_dir}"; then
     die "selected session is still being collected by PID ${collector_pid}"
   fi
-  writers="$(running_diagnostic_writers)"
+  if ! writers="$(running_diagnostic_writers)"; then
+    die "diagnostic writer process query failed before repair"
+  fi
   if [[ -n "${writers}" ]]; then
     echo "${writers}" >&2
     die "stop all diagnostic writers before repair"
@@ -3310,7 +3446,9 @@ upload_session() {
   if collector_is_running "${collector_pid}" "${session_dir}"; then
     die "selected session is still being collected by PID ${collector_pid}"
   fi
-  writers="$(running_diagnostic_writers)"
+  if ! writers="$(running_diagnostic_writers)"; then
+    die "diagnostic writer process query failed before upload"
+  fi
   if [[ -n "${writers}" ]]; then
     echo "${writers}" >&2
     die "stop all diagnostic writers before upload"
@@ -3368,13 +3506,16 @@ show_usage() {
 Usage: go2-log <command> [arguments]
 
 Commands:
-  start                 Start a bounded diagnostic session.
+  start [--result-file PATH]
+                        Start a bounded diagnostic session. The optional file
+                        receives the lock-consistent machine-readable result.
   status                Show collector state and session size.
   planner-check [ARGS]  Inspect planner inputs and record them in the session.
   planner-series [--samples N] [--interval SEC] [INSPECTOR ARGS]
                         Repeat planner checks (defaults: N=10, SEC=1.0).
                         Pass --no-goal (recommended) or --goal-x/--goal-y.
-  stop                  Stop the active diagnostic session cleanly.
+  stop [SESSION_ID]     Stop the active diagnostic session cleanly; optionally
+                        require its ID to match before stopping it.
   repair [SESSION_ID]   Quarantine and trim a verified trailing-NUL text suffix.
   upload [SESSION_ID]   Push a stopped session to Aphra-neck/G02_log.
 
@@ -3392,8 +3533,13 @@ main() {
   local command="${1:-}"
   case "${command}" in
     start)
-      [[ $# -eq 1 ]] || die "start takes no arguments"
-      start_session
+      if [[ $# -eq 1 ]]; then
+        start_session
+      elif [[ $# -eq 3 && "${2}" == --result-file && -n "${3}" ]]; then
+        start_session "${3}"
+      else
+        die "start accepts only an optional --result-file PATH"
+      fi
       ;;
     status)
       [[ $# -eq 1 ]] || die "status takes no arguments"
@@ -3408,8 +3554,8 @@ main() {
       planner_series "$@"
       ;;
     stop)
-      [[ $# -eq 1 ]] || die "stop takes no arguments"
-      stop_session
+      [[ $# -le 2 ]] || die "stop accepts at most one session ID"
+      stop_session "${2:-}"
       ;;
     repair)
       [[ $# -le 2 ]] || die "repair accepts at most one session ID"

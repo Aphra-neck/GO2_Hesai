@@ -202,6 +202,179 @@ TEST(LatticePlanner, FlatObstacleModeTreatsUnknownAsFreeAndUsesFixedElevation)
   }
 }
 
+TEST(LatticePlanner, FlatObstacleModeDoesNotUndercostRoundedDiagonalStep)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  auto map = makeFlatObstacleMap(0.2F, 30, 30);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 16;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.flat_obstacle.footprint_length = 0.1;
+  config.flat_obstacle.footprint_width = 0.1;
+  config.flat_obstacle.obstacle_clearance = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({2.1, 2.1, 0.25 * kPi}, {2.3, 2.3, 0.25 * kPi});
+
+  ASSERT_TRUE(result.success);
+  ASSERT_EQ(result.states.size(), 2U);
+  constexpr double kActualDiagonalDistance = 0.28284271247461901;
+  EXPECT_GE(result.path_cost, kActualDiagonalDistance);
+}
+
+TEST(LatticePlanner, FlatObstacleModeRejectsTranslationThatRoundsToNoMovement)
+{
+  auto map = makeFlatObstacleMap(1.0F, 8, 8);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 8;
+  config.motion_step = 0.1;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.max_expansions = 100;
+  config.flat_obstacle.footprint_length = 0.2;
+  config.flat_obstacle.footprint_width = 0.2;
+  config.flat_obstacle.obstacle_clearance = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({2.5, 2.5, 0.0}, {3.5, 2.5, 0.0});
+
+  EXPECT_FALSE(result.success);
+  EXPECT_LE(result.expansions, config.yaw_bins);
+}
+
+TEST(LatticePlanner, FlatObstacleModeTurnsTowardClearPathBeforeTranslating)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  auto map = makeFlatObstacleMap(0.2F, 40, 30);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 16;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({2.1, 2.1, kPi}, {4.1, 2.1, kPi});
+
+  ASSERT_TRUE(result.success);
+  ASSERT_GE(result.states.size(), 3U);
+  std::size_t first_translation = 1U;
+  while (first_translation < result.states.size() &&
+    result.states[first_translation].x == result.states[first_translation - 1U].x &&
+    result.states[first_translation].y == result.states[first_translation - 1U].y)
+  {
+    ++first_translation;
+  }
+  ASSERT_LT(first_translation, result.states.size());
+  EXPECT_GT(first_translation, 1U);
+
+  const auto & before = result.states[first_translation - 1U];
+  const auto & after = result.states[first_translation];
+  const double travel_yaw = std::atan2(
+    static_cast<double>(after.y - before.y),
+    static_cast<double>(after.x - before.x));
+  const double body_yaw = planner.yawAngle(before.yaw);
+  const double heading_error = std::abs(std::remainder(travel_yaw - body_yaw, 2.0 * kPi));
+  EXPECT_NEAR(heading_error, 0.0, 1.0e-9);
+}
+
+TEST(LatticePlanner, FlatObstacleModeFacesNextSegmentAtRightAngleCorner)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  auto map = makeFlatObstacleMap(1.0F, 10, 8);
+  std::fill(map->traversability.begin(), map->traversability.end(), 0.0F);
+  const auto clear_cell = [&map](std::size_t x, std::size_t y) {
+      map->traversability[y * map->width + x] = map->unknown_value;
+    };
+  for (std::size_t x = 2; x <= 6; ++x) {clear_cell(x, 2);}
+  for (std::size_t y = 2; y <= 4; ++y) {clear_cell(6, y);}
+
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 8;
+  config.motion_step = 1.0;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.flat_obstacle.footprint_length = 0.2;
+  config.flat_obstacle.footprint_width = 0.2;
+  config.flat_obstacle.obstacle_clearance = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({2.5, 2.5, 0.0}, {6.5, 4.5, 0.0});
+
+  ASSERT_TRUE(result.success);
+  auto first_north = result.states.end();
+  for (auto state = result.states.begin() + 1; state != result.states.end(); ++state) {
+    const auto & before = *(state - 1);
+    if (state->y > before.y) {
+      first_north = state;
+      break;
+    }
+  }
+  ASSERT_NE(first_north, result.states.end());
+  const auto & before_north = *(first_north - 1);
+  EXPECT_EQ(before_north.x, 6);
+  EXPECT_EQ(before_north.y, 2);
+  EXPECT_NEAR(planner.yawAngle(before_north.yaw), 0.5 * kPi, 1.0e-9);
+
+  bool rotated_at_corner = false;
+  for (auto state = result.states.begin(); state != first_north - 1; ++state) {
+    if (state->x == before_north.x && state->y == before_north.y &&
+      state->yaw != before_north.yaw)
+    {
+      rotated_at_corner = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(rotated_at_corner);
+}
+
+TEST(LatticePlanner, FlatObstacleModeRetainsOneStepOmnidirectionalAdjustment)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  auto map = makeFlatObstacleMap(1.0F, 8, 8);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 8;
+  config.motion_step = 1.0;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.flat_obstacle.footprint_length = 0.2;
+  config.flat_obstacle.footprint_width = 0.2;
+  config.flat_obstacle.obstacle_clearance = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({2.5, 2.5, 0.0}, {2.5, 3.5, 0.0});
+
+  ASSERT_TRUE(result.success);
+  std::size_t translation_count = 0U;
+  double translation_heading_error = 0.0;
+  for (std::size_t index = 1; index < result.states.size(); ++index) {
+    const auto & before = result.states[index - 1U];
+    const auto & after = result.states[index];
+    if (before.x == after.x && before.y == after.y) {continue;}
+    ++translation_count;
+    const double travel_yaw = std::atan2(
+      static_cast<double>(after.y - before.y),
+      static_cast<double>(after.x - before.x));
+    const double body_yaw = planner.yawAngle(before.yaw);
+    translation_heading_error =
+      std::abs(std::remainder(travel_yaw - body_yaw, 2.0 * kPi));
+  }
+  EXPECT_EQ(translation_count, 1U);
+  EXPECT_GT(translation_heading_error, 1.0e-9);
+  EXPECT_LE(translation_heading_error, 0.5 * kPi);
+}
+
 TEST(LatticePlanner, FlatObstacleModeAppliesFootprintClearanceAtEndpoints)
 {
   auto map = makeFlatObstacleMap(0.05F, 80, 80);

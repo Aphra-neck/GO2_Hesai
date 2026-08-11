@@ -4,9 +4,11 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 LOG_DIR="${SLAM_LOG_DIR:-${HOME}/slam_logs}"
+DIAGNOSTIC_ROOT="${GO2_LOG_ROOT:-${HOME}/go2_logs}"
 NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 IMU_RATE="${GO2_IMU_RATE:-200.0}"
 LIO_DENSE_OUTPUT="${GO2_LIO_DENSE_OUTPUT:-false}"
+AUTO_FINALIZE_DIAGNOSTICS="${GO2_LOG_AUTO_FINALIZE:-true}"
 UNITREE_SDK_LIBRARY_DIR="${UNITREE_SDK_LIBRARY_DIR:-/usr/local/lib}"
 source "${SCRIPT_DIR}/ros2_environment.sh"
 
@@ -18,6 +20,17 @@ case "${LIO_DENSE_OUTPUT}" in
     ;;
 esac
 export GO2_LIO_DENSE_OUTPUT="${LIO_DENSE_OUTPUT}"
+
+case "${AUTO_FINALIZE_DIAGNOSTICS}" in
+  true|false) ;;
+  *)
+    echo \
+      "GO2_LOG_AUTO_FINALIZE must be true or false: ${AUTO_FINALIZE_DIAGNOSTICS}" \
+      >&2
+    exit 1
+    ;;
+esac
+
 if ! command -v setsid >/dev/null 2>&1; then
   echo "The setsid command is required to manage ROS 2 child processes." >&2
   exit 1
@@ -52,24 +65,87 @@ if [[ "${RMW_IMPLEMENTATION}" == "rmw_cyclonedds_cpp" ]]; then
   exit 1
 fi
 
+checked_pgrep() {
+  local pattern="$1"
+  local matches='' status=0
+  if matches="$(pgrep -af -- "${pattern}" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "${status}" in
+    0)
+      [[ -n "${matches}" ]] || return 2
+      printf '%s\n' "${matches}"
+      ;;
+    1)
+      [[ -z "${matches}" ]] || return 2
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+lowcmd_publisher_count() {
+  command -v ros2 >/dev/null 2>&1 || {
+    echo "ROS 2 command is unavailable while checking /lowcmd publishers." >&2
+    return 1
+  }
+
+  local lowcmd_info='' lowcmd_status=0 publisher_count=''
+  if lowcmd_info="$(
+      timeout 8 ros2 topic info --no-daemon --spin-time 3 /lowcmd 2>&1
+    )"; then
+    lowcmd_status=0
+  else
+    lowcmd_status=$?
+  fi
+  if (( lowcmd_status != 0 )); then
+    if (( lowcmd_status == 1 )) &&
+      [[ "${lowcmd_info}" == "Unknown topic '/lowcmd'" ]]; then
+      printf '0\n'
+      return 0
+    fi
+    [[ -z "${lowcmd_info}" ]] || printf '%s\n' "${lowcmd_info}" >&2
+    return 1
+  fi
+
+  publisher_count="$(
+    awk -F': *' '$1 == "Publisher count" {print $2; exit}' <<< "${lowcmd_info}"
+  )"
+  [[ "${publisher_count}" =~ ^[0-9]+$ ]] || {
+    [[ -z "${lowcmd_info}" ]] || printf '%s\n' "${lowcmd_info}" >&2
+    return 1
+  }
+  printf '%s\n' "${publisher_count}"
+}
+
 if ! ros2 pkg prefix "${RMW_IMPLEMENTATION}" >/dev/null 2>&1; then
   echo "ROS 2 RMW package is not installed: ${RMW_IMPLEMENTATION}" >&2
   echo "Install it with: sudo apt install ros-humble-rmw-fastrtps-cpp" >&2
   exit 1
 fi
 
-if pgrep -f -- "utree_go2_rl_controller|rl_controller_node" >/dev/null 2>&1; then
+if ! rl_processes="$(
+    checked_pgrep "utree_go2_rl_controller|rl_controller_node"
+  )"; then
+  echo "The RL controller process query failed; refusing to start this pipeline." >&2
+  exit 1
+fi
+if [[ -n "${rl_processes}" ]]; then
   echo "An RL low-level controller is running. Stop it before starting this pipeline." >&2
-  pgrep -af -- "utree_go2_rl_controller|rl_controller_node" >&2 || true
+  echo "${rl_processes}" >&2
   exit 1
 fi
 
-lowcmd_info="$(
-  ros2 topic info --no-daemon --spin-time 3 /lowcmd 2>/dev/null || true
-)"
-if grep -Eq "Publisher count: [1-9][0-9]*" <<<"${lowcmd_info}"; then
+if ! lowcmd_publishers="$(lowcmd_publisher_count)"; then
+  echo "The /lowcmd publisher check failed; refusing to start this pipeline." >&2
+  exit 1
+fi
+if (( lowcmd_publishers > 0 )); then
   echo "A /lowcmd publisher is active. Stop it before starting this pipeline." >&2
-  printf '%s\n' "${lowcmd_info}" >&2
+  echo "Publisher count: ${lowcmd_publishers}" >&2
   exit 1
 fi
 
@@ -77,9 +153,14 @@ assert_not_running() {
   local name="$1"
   local executable_path="$2"
 
-  if pgrep -f -- "${executable_path}" >/dev/null 2>&1; then
+  local processes=''
+  if ! processes="$(checked_pgrep "${executable_path}")"; then
+    echo "${name} process query failed; refusing to start SLAM." >&2
+    exit 1
+  fi
+  if [[ -n "${processes}" ]]; then
     echo "${name} is already running. Stop the existing process before starting SLAM." >&2
-    pgrep -af -- "${executable_path}" >&2 || true
+    echo "${processes}" >&2
     exit 1
   fi
 }
@@ -98,16 +179,18 @@ if [[ ! -x "${WORKSPACE_DIR}/tools/go2-log" ]]; then
   echo "Diagnostics command is missing or not executable: ${WORKSPACE_DIR}/tools/go2-log" >&2
   exit 1
 fi
-"${WORKSPACE_DIR}/tools/go2-log" start
 
-declare -a CHILD_PIDS=()
+declare -a CHILD_SESSION_PIDS=()
+declare -a CHILD_WAITER_PIDS=()
 LAST_STARTED_PID=""
+DIAGNOSTIC_SESSION_OWNED=false
+DIAGNOSTIC_SESSION_ID=""
+DIAGNOSTIC_START_RESULT_FILE=""
 
-cleanup() {
-  trap - EXIT INT TERM
-  if (( ${#CHILD_PIDS[@]} > 0 )); then
+cleanup_children() {
+  if (( ${#CHILD_SESSION_PIDS[@]} > 0 )); then
     local pid
-    for pid in "${CHILD_PIDS[@]}"; do
+    for pid in "${CHILD_SESSION_PIDS[@]}"; do
       if [[ "${pid}" =~ ^[1-9][0-9]*$ ]] && (( pid > 1 )); then
         kill -TERM -- "-${pid}" 2>/dev/null || true
       fi
@@ -116,7 +199,7 @@ cleanup() {
     local deadline=$((SECONDS + 3))
     while (( SECONDS < deadline )); do
       local running=false
-      for pid in "${CHILD_PIDS[@]}"; do
+      for pid in "${CHILD_SESSION_PIDS[@]}"; do
         if kill -0 -- "-${pid}" 2>/dev/null; then
           running=true
           break
@@ -128,22 +211,164 @@ cleanup() {
       sleep 0.1
     done
 
-    for pid in "${CHILD_PIDS[@]}"; do
+    for pid in "${CHILD_SESSION_PIDS[@]}"; do
       if kill -0 -- "-${pid}" 2>/dev/null; then
         kill -KILL -- "-${pid}" 2>/dev/null || true
       fi
     done
-    wait "${CHILD_PIDS[@]}" 2>/dev/null || true
+    if (( ${#CHILD_WAITER_PIDS[@]} > 0 )); then
+      wait "${CHILD_WAITER_PIDS[@]}" 2>/dev/null || true
+    fi
   fi
 }
-trap cleanup EXIT INT TERM
+
+finalize_owned_diagnostics() {
+  [[ "${AUTO_FINALIZE_DIAGNOSTICS}" == true ]] || return 0
+  [[ "${DIAGNOSTIC_SESSION_OWNED}" == true ]] || return 0
+
+  echo "Finalizing diagnostic session: ${DIAGNOSTIC_SESSION_ID}"
+  local blockers=''
+  if ! blockers="$(
+      checked_pgrep \
+        'hesai_ros_driver_node|go2_imu_bridge_node|super_lio_node|terrain_mapper_node|body_lattice_planner_node|body_odom_adapter_node|go2_sdk2_bridge_node|flat_obstacle_map_recorder.py|utree_go2_rl_controller|rl_controller_node'
+    )"; then
+    echo \
+      "Automatic diagnostic finalization skipped because the robot process query failed; active session retained: ${DIAGNOSTIC_SESSION_ID}" \
+      >&2
+    return 0
+  fi
+  if [[ -n "${blockers}" ]]; then
+    echo "${blockers}" >&2
+    echo \
+      "Automatic diagnostic finalization skipped because robot processes are still running; active session retained: ${DIAGNOSTIC_SESSION_ID}" \
+      >&2
+    return 0
+  fi
+
+  local lowcmd_publishers=''
+  if ! lowcmd_publishers="$(lowcmd_publisher_count)"; then
+    echo \
+      "Automatic diagnostic finalization skipped because the /lowcmd publisher check failed; active session retained: ${DIAGNOSTIC_SESSION_ID}" \
+      >&2
+    return 0
+  fi
+  if (( lowcmd_publishers > 0 )); then
+    echo "Publisher count: ${lowcmd_publishers}" >&2
+    echo \
+      "Automatic diagnostic finalization skipped because an active /lowcmd publisher was detected; active session retained: ${DIAGNOSTIC_SESSION_ID}" \
+      >&2
+    return 0
+  fi
+
+  if ! "${WORKSPACE_DIR}/tools/go2-log" stop "${DIAGNOSTIC_SESSION_ID}"; then
+    echo \
+      "Diagnostic stop failed; session retained for an explicit retry: ${DIAGNOSTIC_SESSION_ID}" \
+      >&2
+    return 0
+  fi
+
+  if ! "${WORKSPACE_DIR}/tools/go2-log" repair "${DIAGNOSTIC_SESSION_ID}"; then
+    echo \
+      "Diagnostic repair/validation failed; session retained: ${DIAGNOSTIC_SESSION_ID}" \
+      >&2
+    return 0
+  fi
+  if ! "${WORKSPACE_DIR}/tools/go2-log" upload "${DIAGNOSTIC_SESSION_ID}"; then
+    echo \
+      "Diagnostic upload failed; session retained: ${DIAGNOSTIC_SESSION_ID}" \
+      >&2
+    return 0
+  fi
+}
+
+cleanup() {
+  local original_status="${1:-0}"
+  trap - EXIT INT TERM
+  set +e
+  [[ -z "${DIAGNOSTIC_START_RESULT_FILE}" ]] ||
+    rm -f -- "${DIAGNOSTIC_START_RESULT_FILE}"
+  cleanup_children
+  finalize_owned_diagnostics
+  exit "${original_status}"
+}
+trap 'cleanup "$?"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+DIAGNOSTIC_START_RESULT_FILE="$(
+  mktemp -- "${LOG_DIR}/.go2-log-start-result.XXXXXX"
+)"
+if ! "${WORKSPACE_DIR}/tools/go2-log" start \
+  --result-file "${DIAGNOSTIC_START_RESULT_FILE}"; then
+  rm -f -- "${DIAGNOSTIC_START_RESULT_FILE}"
+  DIAGNOSTIC_START_RESULT_FILE=""
+  exit 1
+fi
+start_result_format=''
+start_result_ownership=''
+start_result_session_id=''
+start_result_session_dir=''
+while IFS='=' read -r key value; do
+  case "${key}" in
+    format) start_result_format="${value}" ;;
+    ownership) start_result_ownership="${value}" ;;
+    session_id) start_result_session_id="${value}" ;;
+    session_dir) start_result_session_dir="${value}" ;;
+  esac
+done < "${DIAGNOSTIC_START_RESULT_FILE}"
+rm -f -- "${DIAGNOSTIC_START_RESULT_FILE}"
+DIAGNOSTIC_START_RESULT_FILE=""
+
+if [[ "${start_result_format}" != go2-log-start-v1 ||
+      ! "${start_result_ownership}" =~ ^(created|existing)$ ||
+      -z "${start_result_session_id}" ||
+      "${start_result_session_id}" == */* ||
+      "${start_result_session_dir}" != \
+        "${DIAGNOSTIC_ROOT}/sessions/${start_result_session_id}" ]]; then
+  echo "go2-log returned an invalid machine-readable start result." >&2
+  exit 1
+fi
+if [[ "${start_result_ownership}" == created ]]; then
+  DIAGNOSTIC_SESSION_OWNED=true
+  DIAGNOSTIC_SESSION_ID="${start_result_session_id}"
+fi
 
 start_background() {
   local name="$1"
   shift
-  setsid "$@" >"${LOG_DIR}/${name}.log" 2>&1 &
-  LAST_STARTED_PID="$!"
-  CHILD_PIDS+=("${LAST_STARTED_PID}")
+  local session_pid_file="${LOG_DIR}/.${name}.session-pid.$$"
+  local waiter_pid=""
+  local session_pid=""
+  rm -f -- "${session_pid_file}"
+  setsid --fork --wait bash -c '
+    session_pid_file="$1"
+    shift
+    printf "%s\n" "$$" > "${session_pid_file}"
+    exec "$@"
+  ' bash "${session_pid_file}" "$@" >"${LOG_DIR}/${name}.log" 2>&1 &
+  waiter_pid="$!"
+
+  for _ in {1..100}; do
+    if [[ -s "${session_pid_file}" ]]; then
+      IFS= read -r session_pid < "${session_pid_file}" || true
+      break
+    fi
+    if ! kill -0 "${waiter_pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.01
+  done
+  rm -f -- "${session_pid_file}"
+
+  if [[ ! "${session_pid}" =~ ^[1-9][0-9]*$ ]] || (( session_pid <= 1 )); then
+    wait "${waiter_pid}" 2>/dev/null || true
+    echo "Failed to capture the process session for ${name}." >&2
+    return 1
+  fi
+
+  LAST_STARTED_PID="${waiter_pid}"
+  CHILD_SESSION_PIDS+=("${session_pid}")
+  CHILD_WAITER_PIDS+=("${waiter_pid}")
 }
 
 wait_for_message() {
@@ -186,6 +411,7 @@ echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Unitree DDS libraries: ${UNITREE_SDK_LIBRARY_DIR}"
 echo " LIO dense cloud output: ${LIO_DENSE_OUTPUT}"
+echo " Diagnostic auto-finalize on exit: ${AUTO_FINALIZE_DIAGNOSTICS}"
 echo "======================================"
 
 echo "[1/3] Starting Hesai LiDAR driver..."
@@ -206,7 +432,7 @@ echo "/imu/data is active."
 
 echo "[3/3] Starting Super-LIO..."
 echo "Logs: ${LOG_DIR}"
-echo "Diagnostics: ${HOME}/go2_logs/sessions"
+echo "Diagnostics: ${DIAGNOSTIC_ROOT}/sessions"
 echo "Check pose: ros2 topic echo /lio/odom"
 
 ros2 launch super_lio hesai.py \

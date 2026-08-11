@@ -5,7 +5,61 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 UNITREE_SDK_LIBRARY_DIR="${UNITREE_SDK_LIBRARY_DIR:-/usr/local/lib}"
+MAX_VX=0.1
+MAX_VY=0.05
+MAX_YAW_RATE=0.2
 source "${SCRIPT_DIR}/ros2_environment.sh"
+
+checked_pgrep() {
+  local pattern="$1"
+  local matches='' status=0
+  if matches="$(pgrep -af -- "${pattern}" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "${status}" in
+    0)
+      [[ -n "${matches}" ]] || return 2
+      printf '%s\n' "${matches}"
+      ;;
+    1)
+      [[ -z "${matches}" ]] || return 2
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+lowcmd_publisher_count() {
+  local lowcmd_info='' lowcmd_status=0 publisher_count=''
+  if lowcmd_info="$(
+      timeout 8 ros2 topic info --no-daemon --spin-time 3 /lowcmd 2>&1
+    )"; then
+    lowcmd_status=0
+  else
+    lowcmd_status=$?
+  fi
+  if (( lowcmd_status != 0 )); then
+    if (( lowcmd_status == 1 )) &&
+      [[ "${lowcmd_info}" == "Unknown topic '/lowcmd'" ]]; then
+      printf '0\n'
+      return 0
+    fi
+    [[ -z "${lowcmd_info}" ]] || printf '%s\n' "${lowcmd_info}" >&2
+    return 1
+  fi
+
+  publisher_count="$(
+    awk -F': *' '$1 == "Publisher count" {print $2; exit}' <<< "${lowcmd_info}"
+  )"
+  [[ "${publisher_count}" =~ ^[0-9]+$ ]] || {
+    [[ -z "${lowcmd_info}" ]] || printf '%s\n' "${lowcmd_info}" >&2
+    return 1
+  }
+  printf '%s\n' "${publisher_count}"
+}
 
 if ! ip link show dev "${NETWORK_INTERFACE}" >/dev/null 2>&1; then
   echo "Go2 network interface does not exist: ${NETWORK_INTERFACE}" >&2
@@ -36,30 +90,43 @@ if [[ "${RMW_IMPLEMENTATION}" == "rmw_cyclonedds_cpp" ]]; then
   exit 1
 fi
 
-if pgrep -f -- "utree_go2_rl_controller|rl_controller_node" >/dev/null 2>&1; then
+if ! rl_processes="$(
+    checked_pgrep "utree_go2_rl_controller|rl_controller_node"
+  )"; then
+  echo "The RL controller process query failed; refusing to start the SDK2 bridge." >&2
+  exit 1
+fi
+if [[ -n "${rl_processes}" ]]; then
   echo "An RL low-level controller is running. Do not combine it with SportClient control." >&2
-  pgrep -af -- "utree_go2_rl_controller|rl_controller_node" >&2 || true
+  echo "${rl_processes}" >&2
   exit 1
 fi
 
-lowcmd_info="$(
-  ros2 topic info --no-daemon --spin-time 3 /lowcmd 2>/dev/null || true
-)"
-if grep -Eq "Publisher count: [1-9][0-9]*" <<<"${lowcmd_info}"; then
+if ! lowcmd_publishers="$(lowcmd_publisher_count)"; then
+  echo "The /lowcmd publisher check failed; refusing to start the SDK2 bridge." >&2
+  exit 1
+fi
+if (( lowcmd_publishers > 0 )); then
   echo "A /lowcmd publisher is active. Refusing to start the SDK2 SportClient bridge." >&2
-  printf '%s\n' "${lowcmd_info}" >&2
+  echo "Publisher count: ${lowcmd_publishers}" >&2
   exit 1
 fi
 
-if pgrep -f -- "/utree_go2_sdk2_bridge/go2_sdk2_bridge_node" >/dev/null 2>&1; then
+if ! bridge_processes="$(
+    checked_pgrep "/utree_go2_sdk2_bridge/go2_sdk2_bridge_node"
+  )"; then
+  echo "The SDK2 bridge process query failed; refusing to start another bridge." >&2
+  exit 1
+fi
+if [[ -n "${bridge_processes}" ]]; then
   echo "The Go2 SDK2 bridge is already running." >&2
-  pgrep -af -- "/utree_go2_sdk2_bridge/go2_sdk2_bridge_node" >&2 || true
+  echo "${bridge_processes}" >&2
   exit 1
 fi
 
 if ! timeout 10 ros2 topic echo --once --qos-profile sensor_data \
   /lio/body_odom nav_msgs/msg/Odometry >/dev/null 2>&1; then
-  echo "No corrected body odometry on /lio/body_odom. Start terrain navigation first." >&2
+  echo "No corrected body odometry on /lio/body_odom. Start flat-obstacle navigation first." >&2
   exit 1
 fi
 
@@ -76,10 +143,17 @@ echo " ROS domain: ${ROS_DOMAIN_ID} (Unitree SDK domain: 0)"
 echo " ROS RMW: ${RMW_IMPLEMENTATION}"
 echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
-echo " Motion: disabled until explicitly enabled"
+echo " Motion: disarmed until one explicit operator authorization"
+echo " Validated velocity limits: vx=${MAX_VX} m/s, vy=${MAX_VY} m/s, yaw=${MAX_YAW_RATE} rad/s"
 echo "======================================"
-echo "After verifying /body_path and /lio/body_odom, enable with:"
+echo "In another Jetson terminal, verify the scene and arm once with:"
+echo "cd ${WORKSPACE_DIR}"
+echo "source ./shell/ros2_environment.sh"
 echo "ros2 service call /go2_sdk2_bridge/enable_motion std_srvs/srv/SetBool '{data: true}'"
+echo "Normal goal completion keeps this authorization and waits for the next fresh path."
 
 ros2 launch utree_go2_sdk2_bridge go2_sdk2_bridge.launch.py \
-  "network_interface:=${NETWORK_INTERFACE}"
+  "network_interface:=${NETWORK_INTERFACE}" \
+  "max_vx:=${MAX_VX}" \
+  "max_vy:=${MAX_VY}" \
+  "max_yaw_rate:=${MAX_YAW_RATE}"

@@ -11,6 +11,7 @@ HEALTH_PID=''
 TIMING_PID=''
 ZOMBIE_SUPERVISOR_PID=''
 ZOMBIE_WRITER_PGID=''
+START_RESULT_PID=''
 
 cleanup() {
   if [[ "${COLLECTOR_PID}" =~ ^[1-9][0-9]*$ ]]; then
@@ -35,6 +36,10 @@ cleanup() {
   if [[ "${ZOMBIE_SUPERVISOR_PID}" =~ ^[1-9][0-9]*$ ]]; then
     kill -TERM "${ZOMBIE_SUPERVISOR_PID}" 2>/dev/null || true
     wait "${ZOMBIE_SUPERVISOR_PID}" 2>/dev/null || true
+  fi
+  if [[ "${START_RESULT_PID}" =~ ^[1-9][0-9]*$ ]]; then
+    kill -TERM "${START_RESULT_PID}" 2>/dev/null || true
+    wait "${START_RESULT_PID}" 2>/dev/null || true
   fi
   rm -rf -- "${FIXTURE_ROOT}"
 }
@@ -314,6 +319,32 @@ printf '%s\n' "${COLLECTOR_PID}" > "${stop_target_file}"
 wait "${COLLECTOR_PID}"
 COLLECTOR_PID=''
 test ! -s "${stop_graph_trace}"
+
+expected_stop_id="20260101T001075Z-test-host-76"
+expected_stop_dir="${FIXTURE_ROOT}/runtime/sessions/${expected_stop_id}"
+replacement_stop_id="20260101T001076Z-test-host-77"
+replacement_stop_dir="${FIXTURE_ROOT}/runtime/sessions/${replacement_stop_id}"
+mkdir -p -- "${expected_stop_dir}" "${replacement_stop_dir}"
+printf '%s\n' "${replacement_stop_dir}" \
+  > "${FIXTURE_ROOT}/runtime/active_session"
+
+set +e
+stop_mismatch_output="$(
+  GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+  GO2_WORKSPACE="${REPO_ROOT}" \
+    "${GO2_LOG}" stop "${expected_stop_id}" 2>&1
+)"
+stop_mismatch_status=$?
+set -e
+if (( stop_mismatch_status == 0 )) ||
+  [[ "${stop_mismatch_output}" != *"refusing to stop unexpected active diagnostic session"* ]]; then
+  printf 'FAIL: expected session-bound stop to reject a replacement session:\n%s\n' \
+    "${stop_mismatch_output}" >&2
+  exit 1
+fi
+test "$(< "${FIXTURE_ROOT}/runtime/active_session")" = \
+  "${replacement_stop_dir}"
+rm -f -- "${FIXTURE_ROOT}/runtime/active_session"
 
 failure_id="20260101T001100Z-test-host-8"
 failure_dir="${FIXTURE_ROOT}/runtime/sessions/${failure_id}"
@@ -695,5 +726,295 @@ fi
 kill -TERM "${TIMING_PID}"
 wait "${TIMING_PID}" 2>/dev/null || true
 TIMING_PID=''
+
+# `start --result-file` must report the decision made while holding the
+# command lock, without changing the existing human-readable stdout.
+start_result_id="20260101T001500Z-test-host-13"
+start_result_dir="${FIXTURE_ROOT}/runtime/sessions/${start_result_id}"
+start_result_file="${FIXTURE_ROOT}/existing-start-result.txt"
+mkdir -p -- "${start_result_dir}"
+bash -c "exec -a 'go2-log _collect ${start_result_dir}' sleep 60" &
+START_RESULT_PID="$!"
+printf '%s\n' "${START_RESULT_PID}" > "${start_result_dir}/collector.pid"
+printf '%s\n' "${start_result_dir}" > "${FIXTURE_ROOT}/runtime/active_session"
+start_result_output="$(
+  GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+  GO2_WORKSPACE="${REPO_ROOT}" \
+    "${GO2_LOG}" start --result-file "${start_result_file}"
+)"
+[[ "${start_result_output}" == *"Diagnostic session is already running"* ]]
+grep -Fxq 'format=go2-log-start-v1' "${start_result_file}"
+grep -Fxq 'ownership=existing' "${start_result_file}"
+grep -Fxq "session_id=${start_result_id}" "${start_result_file}"
+grep -Fxq "session_dir=${start_result_dir}" "${start_result_file}"
+kill -TERM "${START_RESULT_PID}"
+wait "${START_RESULT_PID}" 2>/dev/null || true
+START_RESULT_PID=''
+rm -f -- "${FIXTURE_ROOT}/runtime/active_session"
+
+created_result_root="${FIXTURE_ROOT}/created-result-runtime"
+created_result_file="${FIXTURE_ROOT}/created-start-result.txt"
+GO2_LOG_ROOT="${created_result_root}" \
+GO2_WORKSPACE="${REPO_ROOT}" \
+  bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    source_ros_environment() { :; }
+    cleanup_uploaded_sessions() { :; }
+    capture_static_context() { :; }
+    running_diagnostic_writers() { return 0; }
+    ros2() { :; }
+    python3() { :; }
+    nohup() {
+      local session_dir="${3}"
+      exec -a "go2-log _collect ${session_dir}" sleep 60
+    }
+    start_session "$2"
+    test -s "$2"
+    grep -Fxq "format=go2-log-start-v1" "$2"
+    grep -Fxq "ownership=created" "$2"
+    active_session="$(< "${ACTIVE_FILE}")"
+    grep -Fxq "session_id=$(basename -- "${active_session}")" "$2"
+    grep -Fxq "session_dir=${active_session}" "$2"
+    collector_pid="$(< "${active_session}/collector.pid")"
+    kill -TERM "${collector_pid}"
+    wait "${collector_pid}" 2>/dev/null || true
+    rm -f -- "${ACTIVE_FILE}"
+  ' _ "${GO2_LOG}" "${created_result_file}"
+
+kill -TERM "${HEALTH_PID}"
+wait "${HEALTH_PID}" 2>/dev/null || true
+HEALTH_PID=''
+
+# Manual repair/upload must fail closed for an arbitrary /lowcmd publisher,
+# an inconclusive graph query, or a failed robot-process query.
+idle_guard_bin="${FIXTURE_ROOT}/idle-guard-bin"
+idle_guard_id="20260101T001600Z-test-host-14"
+idle_guard_dir="${FIXTURE_ROOT}/runtime/sessions/${idle_guard_id}"
+mkdir -p -- "${idle_guard_bin}" "${idle_guard_dir}"
+cat > "${idle_guard_bin}/pgrep" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *'[h]esai_ros_driver_node'* &&
+      "${GO2_IDLE_PGREP_MODE:-none}" == error ]]; then
+  exit 2
+fi
+if [[ "$*" == *'_collect|_rosout|_timing'* &&
+      "${GO2_IDLE_PGREP_MODE:-none}" == writer_error ]]; then
+  exit 2
+fi
+exit 1
+SH
+cat > "${idle_guard_bin}/ros2" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" != 'topic info --no-daemon --spin-time 3 /lowcmd' ]]; then
+  echo "unexpected ros2 command: $*" >&2
+  exit 97
+fi
+call_count=0
+if [[ -n "${GO2_IDLE_LOWCMD_CALLS_FILE:-}" ]]; then
+  if [[ -s "${GO2_IDLE_LOWCMD_CALLS_FILE}" ]]; then
+    call_count="$(< "${GO2_IDLE_LOWCMD_CALLS_FILE}")"
+  fi
+  call_count=$((call_count + 1))
+  printf '%s\n' "${call_count}" > "${GO2_IDLE_LOWCMD_CALLS_FILE}"
+fi
+case "${GO2_IDLE_LOWCMD_MODE:-none}" in
+  active)
+    echo 'Publisher count: 1'
+    exit 0
+    ;;
+  none)
+    echo 'Publisher count: 0'
+    exit 0
+    ;;
+  unknown)
+    echo "Unknown topic '/lowcmd'"
+    exit 1
+    ;;
+  error)
+    echo 'DDS graph unavailable' >&2
+    exit 2
+    ;;
+  mixed_unknown)
+    echo "Unknown topic '/lowcmd'"
+    echo 'DDS graph timed out after reporting an unknown topic' >&2
+    exit 124
+    ;;
+  second_active)
+    if (( call_count > 1 )); then
+      echo 'Publisher count: 1'
+    else
+      echo 'Publisher count: 0'
+    fi
+    exit 0
+    ;;
+esac
+exit 98
+SH
+chmod +x "${idle_guard_bin}/pgrep" "${idle_guard_bin}/ros2"
+
+idle_guard_calls="${FIXTURE_ROOT}/idle-guard-lowcmd-calls.txt"
+: > "${idle_guard_calls}"
+PATH="${idle_guard_bin}:/usr/bin:/bin" \
+GO2_IDLE_LOWCMD_MODE=second_active \
+GO2_IDLE_LOWCMD_CALLS_FILE="${idle_guard_calls}" \
+GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+GO2_WORKSPACE="${REPO_ROOT}" \
+  bash -c '
+    set -Eeuo pipefail
+    source "$1"
+    assert_robot_idle "diagnostic upload preflight"
+    if assert_robot_idle "Git push"; then
+      echo "FAIL: second idle check accepted a newly active /lowcmd publisher" >&2
+      exit 1
+    fi
+  ' _ "${GO2_LOG}"
+test "$(< "${idle_guard_calls}")" -eq 2
+
+writer_guard_root="${FIXTURE_ROOT}/writer-guard-runtime"
+set +e
+writer_guard_output="$(
+  PATH="${idle_guard_bin}:/usr/bin:/bin" \
+  GO2_IDLE_PGREP_MODE=writer_error \
+  GO2_LOG_ROOT="${writer_guard_root}" \
+  GO2_WORKSPACE="${REPO_ROOT}" \
+    "${GO2_LOG}" start 2>&1
+)"
+writer_guard_status=$?
+set -e
+if (( writer_guard_status == 0 )) ||
+  [[ "${writer_guard_output}" != *"diagnostic writer process query failed"* ]]; then
+  printf 'FAIL: expected start to fail closed when writer pgrep fails:\n%s\n' \
+    "${writer_guard_output}" >&2
+  exit 1
+fi
+test ! -e "${writer_guard_root}/active_session"
+
+printf '%s\n' "${idle_guard_dir}" > "${FIXTURE_ROOT}/runtime/active_session"
+set +e
+writer_guard_output="$(
+  PATH="${idle_guard_bin}:/usr/bin:/bin" \
+  GO2_IDLE_PGREP_MODE=writer_error \
+  GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+  GO2_WORKSPACE="${REPO_ROOT}" \
+    "${GO2_LOG}" stop 2>&1
+)"
+writer_guard_status=$?
+set -e
+if (( writer_guard_status == 0 )) ||
+  [[ "${writer_guard_output}" != *"diagnostic writer process query failed"* ]]; then
+  printf 'FAIL: expected stop to fail closed when writer pgrep fails:\n%s\n' \
+    "${writer_guard_output}" >&2
+  exit 1
+fi
+test -e "${FIXTURE_ROOT}/runtime/active_session"
+rm -f -- "${FIXTURE_ROOT}/runtime/active_session"
+
+for guarded_command in repair upload; do
+  set +e
+  writer_guard_output="$(
+    PATH="${idle_guard_bin}:/usr/bin:/bin" \
+    GO2_IDLE_PGREP_MODE=writer_error \
+    GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+    GO2_WORKSPACE="${REPO_ROOT}" \
+      "${GO2_LOG}" "${guarded_command}" "${idle_guard_id}" 2>&1
+  )"
+  writer_guard_status=$?
+  set -e
+  if (( writer_guard_status == 0 )) ||
+    [[ "${writer_guard_output}" != *"diagnostic writer process query failed"* ]]; then
+    printf 'FAIL: expected %s to fail closed when writer pgrep fails:\n%s\n' \
+      "${guarded_command}" "${writer_guard_output}" >&2
+    exit 1
+  fi
+done
+
+for guarded_command in repair upload; do
+  set +e
+  guard_output="$(
+    PATH="${idle_guard_bin}:/usr/bin:/bin" \
+    GO2_IDLE_LOWCMD_MODE=active \
+    GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+    GO2_WORKSPACE="${REPO_ROOT}" \
+      "${GO2_LOG}" "${guarded_command}" "${idle_guard_id}" 2>&1
+  )"
+  guard_status=$?
+  set -e
+  if (( guard_status == 0 )) ||
+    [[ "${guard_output}" != *"/lowcmd has 1 publisher"* ]]; then
+    printf 'FAIL: expected %s to reject an active /lowcmd publisher:\n%s\n' \
+      "${guarded_command}" "${guard_output}" >&2
+    exit 1
+  fi
+done
+
+set +e
+guard_output="$(
+  PATH="${idle_guard_bin}:/usr/bin:/bin" \
+  GO2_IDLE_PGREP_MODE=error \
+  GO2_IDLE_LOWCMD_MODE=none \
+  GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+  GO2_WORKSPACE="${REPO_ROOT}" \
+    "${GO2_LOG}" upload "${idle_guard_id}" 2>&1
+)"
+guard_status=$?
+set -e
+if (( guard_status == 0 )) ||
+  [[ "${guard_output}" != *"robot process query failed"* ]]; then
+  printf 'FAIL: expected upload to fail closed when pgrep fails:\n%s\n' \
+    "${guard_output}" >&2
+  exit 1
+fi
+
+set +e
+guard_output="$(
+  PATH="${idle_guard_bin}:/usr/bin:/bin" \
+  GO2_IDLE_LOWCMD_MODE=mixed_unknown \
+  GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+  GO2_WORKSPACE="${REPO_ROOT}" \
+    "${GO2_LOG}" upload "${idle_guard_id}" 2>&1
+)"
+guard_status=$?
+set -e
+if (( guard_status == 0 )) ||
+  [[ "${guard_output}" != *"/lowcmd publisher query failed"* ]]; then
+  printf 'FAIL: mixed unknown-topic output must remain fail-closed:\n%s\n' \
+    "${guard_output}" >&2
+  exit 1
+fi
+
+set +e
+guard_output="$(
+  PATH="${idle_guard_bin}:/usr/bin:/bin" \
+  GO2_IDLE_LOWCMD_MODE=error \
+  GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+  GO2_WORKSPACE="${REPO_ROOT}" \
+    "${GO2_LOG}" upload "${idle_guard_id}" 2>&1
+)"
+guard_status=$?
+set -e
+if (( guard_status == 0 )) ||
+  [[ "${guard_output}" != *"/lowcmd publisher query failed"* ]]; then
+  printf 'FAIL: expected upload to fail closed when /lowcmd query fails:\n%s\n' \
+    "${guard_output}" >&2
+  exit 1
+fi
+
+set +e
+guard_output="$(
+  PATH="${idle_guard_bin}:/usr/bin:/bin" \
+  GO2_IDLE_LOWCMD_MODE=unknown \
+  GO2_LOG_ROOT="${FIXTURE_ROOT}/runtime" \
+  GO2_WORKSPACE="${REPO_ROOT}" \
+    "${GO2_LOG}" upload "${idle_guard_id}" 2>&1
+)"
+guard_status=$?
+set -e
+if (( guard_status == 0 )) ||
+  [[ "${guard_output}" == *"/lowcmd publisher query failed"* ]]; then
+  printf 'FAIL: Unknown topic must be treated as zero /lowcmd publishers:\n%s\n' \
+    "${guard_output}" >&2
+  exit 1
+fi
 
 echo "PASS: durable rates, bounded health summaries, and stale writer cleanup are enforced"

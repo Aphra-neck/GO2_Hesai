@@ -41,7 +41,8 @@ private:
   void clearGoal(const char * reason);
   nav_msgs::msg::Path makePath(
     const PlanningResult & result, const WorldState & exact_start,
-    const builtin_interfaces::msg::Time & source_stamp) const;
+    const builtin_interfaces::msg::Time & source_stamp,
+    const builtin_interfaces::msg::Time & goal_stamp) const;
 
   std::string map_topic_;
   std::string odom_topic_;

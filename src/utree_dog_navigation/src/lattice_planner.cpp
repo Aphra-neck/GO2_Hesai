@@ -273,6 +273,7 @@ PlanningResult LatticePlanner::plan(
     {
       reached_key = item.key;
       result.success = true;
+      result.path_cost = current_g;
       break;
     }
 
@@ -981,7 +982,13 @@ double LatticePlanner::heuristic(const GridState & state, const GridState & goal
 {
   const double distance = std::hypot(state.x - goal.x, state.y - goal.y) * map_->resolution;
   const int raw_yaw = std::abs(state.yaw - goal.yaw);
-  return distance + 0.05 * std::min(raw_yaw, config_.yaw_bins - raw_yaw);
+  const int yaw_distance = std::min(raw_yaw, config_.yaw_bins - raw_yaw);
+  if (config_.planning_mode == PlanningMode::kFlatObstacle) {
+    const double minimum_translation_factor = std::min({
+      1.0, config_.reverse_cost_factor, config_.lateral_cost_factor, 1.1, 1.3});
+    return distance * minimum_translation_factor + config_.yaw_change_cost * yaw_distance;
+  }
+  return distance + 0.05 * yaw_distance;
 }
 
 bool LatticePlanner::transition(
@@ -1001,11 +1008,11 @@ bool LatticePlanner::transition(
     return true;
   }
   const double yaw = yawAngle(current.grid.yaw);
+  const double cosine = std::cos(yaw);
+  const double sine = std::sin(yaw);
   const double scale = config_.motion_step / map_->resolution;
-  const double dx = (std::cos(yaw) * motion.forward -
-    std::sin(yaw) * motion.lateral) * scale;
-  const double dy = (std::sin(yaw) * motion.forward +
-    std::cos(yaw) * motion.lateral) * scale;
+  const double dx = (cosine * motion.forward - sine * motion.lateral) * scale;
+  const double dy = (sine * motion.forward + cosine * motion.lateral) * scale;
   if (!std::isfinite(scale) || !std::isfinite(dx) || !std::isfinite(dy) ||
     std::abs(dx) > kMaximumIntegerSafeDistance ||
     std::abs(dy) > kMaximumIntegerSafeDistance)
@@ -1031,7 +1038,21 @@ bool LatticePlanner::transition(
   if (config_.planning_mode == PlanningMode::kFlatObstacle) {
     if (!flatTransitionCollisionFree(current.grid, next.grid)) {return false;}
     next.inferred_prefix = false;
-    transition_cost = std::hypot(dx, dy) * map_->resolution * motion.factor;
+    const double grid_dx = static_cast<double>(next.grid.x - current.grid.x);
+    const double grid_dy = static_cast<double>(next.grid.y - current.grid.y);
+    const double grid_distance = std::hypot(grid_dx, grid_dy);
+    if (!std::isfinite(grid_distance) || grid_distance <= kDistanceTolerance) {
+      return false;
+    }
+    const double forward_alignment = std::clamp(
+      (cosine * grid_dx + sine * grid_dy) / grid_distance, -1.0, 1.0);
+    // Penalize sustained motion away from the body's forward tangent. The
+    // chord metric is cheap, accounts for grid rounding, and leaves short
+    // omnidirectional corrections available when turning would cost more.
+    const double heading_misalignment_cost = config_.yaw_change_cost *
+      static_cast<double>(config_.yaw_bins) * 0.25 * (1.0 - forward_alignment);
+    transition_cost = grid_distance * map_->resolution * motion.factor +
+      heading_misalignment_cost;
     return true;
   }
 

@@ -2,9 +2,19 @@
 
 ## 项目简介
 
-本仓库的 `ROS2` 分支用于在 Unitree Go2 的 Jetson 载荷计算机上，将 Hesai
+本仓库的 `ROS2-2D-navigation` 分支用于在 Unitree Go2 的 Jetson 载荷计算机上，将 Hesai
 XT-16 激光雷达和 Go2 内部 IMU 接入 ROS 2 Humble，并通过 Super-LIO 输出里程计
 和点云地图。
+
+### 二维导航阶段状态（2026-08-11）
+
+`ROS2-2D-navigation` 阶段已经在 Jetson 实机完成以下闭环验证：XT-16 与
+Super-LIO 世界系点云、带三维射线清除的确认障碍地图、二维投影与机身 footprint
+膨胀、WSL2 分布式 RViz、`/body_path` 规划，以及 SDK2 低速路径执行。二维模式会在
+点云或里程计过期时撤销路径，运动桥仍需每次进程启动后由操作员显式授权一次。
+
+该结论只覆盖操作员确认的平地、机器狗站立状态和当前低速实测范围。terrain 模式、
+楼梯/坡地以及未来接入 Go2 下装雷达后的融合仍属于下一阶段，不能由本次结果外推。
 
 目标环境：
 
@@ -14,11 +24,11 @@ XT-16 激光雷达和 Go2 内部 IMU 接入 ROS 2 Humble，并通过 Super-LIO �
 - 雷达：Hesai PandarXT-16
 - IMU 来源：Unitree SDK2 DDS 话题 `rt/lowstate`
 
-> 本文档只适用于 `ROS2` 分支。ROS 1 版本请查看 `main` 分支。
+> 本文档只适用于 `ROS2-2D-navigation` 分支。ROS 1 版本请查看 `main` 分支。
 
 ## 快速编译
 
-### 1. 获取 ROS2 分支
+### 1. 获取 ROS2 二维导航分支
 
 本仓库自身已经包含 `src/` 分层，因此应先创建一个全新的空工作空间，再把仓库
 直接克隆到工作空间根目录。不要再额外创建 `GO2_Hesai/` 子目录。
@@ -35,7 +45,7 @@ cd ~/catkin_ws
 
 git -c http.proxy=http://192.168.151.143:7890 \
   -c https.proxy=http://192.168.151.143:7890 \
-  clone --branch ROS2 --single-branch \
+  clone --branch ROS2-2D-navigation --single-branch \
   https://github.com/Aphra-neck/GO2_Hesai.git .
 ```
 
@@ -56,14 +66,14 @@ git -c http.proxy=http://192.168.151.143:7890 \
 ```
 
 如果这个独立工作空间已经克隆过仓库，先确认机器人节点和诊断会话均已停止，再拉取并增量
-构建 ROS2 分支：
+构建 ROS2 二维导航分支：
 
 ```bash
 cd ~/catkin_ws
-test "$(git branch --show-current)" = ROS2 || exit 1
+test "$(git branch --show-current)" = ROS2-2D-navigation || exit 1
 git -c http.proxy=http://192.168.151.143:7890 \
   -c https.proxy=http://192.168.151.143:7890 \
-  pull --ff-only origin ROS2
+  pull --ff-only origin ROS2-2D-navigation
 
 source /opt/ros/humble/setup.bash
 MAKEFLAGS=-j2 colcon build \
@@ -83,7 +93,8 @@ source install/setup.bash
 这些代理设置只作用于单条 Git 命令，不写入全局配置。如果现场网络可直接访问
 GitHub，可以省略两个 `-c ...proxy=...` 参数。
 
-代码修改、commit 和 push 只在本地开发 checkout 中完成，目标为 `origin/ROS2`；
+代码修改、commit 和 push 只在本地开发 checkout 中完成，目标为
+`origin/ROS2-2D-navigation`；
 Jetson 的 `~/catkin_ws` 只使用上面的 `pull --ff-only` 更新。确认机器人静止且 SLAM、
 规划、SDK2 bridge 和日志上传均已停止后，本地 Windows PowerShell 可执行：
 
@@ -92,7 +103,7 @@ Set-Location C:\path\to\GO2_Hesai
 git status --short --branch
 git -c http.proxy=http://192.168.151.143:7890 `
   -c https.proxy=http://192.168.151.143:7890 `
-  push origin ROS2
+  push origin ROS2-2D-navigation
 ```
 
 公开仓库的 push 仍需要当前开发机具有写权限；使用已有 Git 凭据，不把 token 写进
@@ -109,13 +120,13 @@ git branch -vv
 第一条命令必须输出：
 
 ```text
-ROS2
+ROS2-2D-navigation
 ```
 
 `git status --short --branch` 应以类似下面的内容开头：
 
 ```text
-## ROS2...origin/ROS2
+## ROS2-2D-navigation...origin/ROS2-2D-navigation
 ```
 
 ### 2. 安装编译依赖
@@ -235,8 +246,8 @@ Go2 LowState
 
 /lio/body_odom + /lio/cloud_world + /goal_pose
   -> utree_dog_navigation
-  -> /terrain_map
-  -> /terrain_costmap
+  -> /flat_obstacle_filtered_map_3d (world XYZ confirmed/cleared obstacles)
+  -> /flat_obstacle_inflated (2D footprint clearance)
   -> /body_path
 
 /body_path + /lio/body_odom
@@ -401,15 +412,15 @@ ROS 2 Humble 已安装；若任一前提缺失，先按 Microsoft WSL 与 ROS 2 
 
 ```bash
 mkdir -p ~/go2_rviz/config/fastdds ~/go2_rviz/rviz
-GO2_RVIZ_CONFIG_REF=f36bc5f556fbc6ac6bcc4bcdfb2f9e068ca529d0
+GO2_RVIZ_CONFIG_REF=ea744e856e6296a52c2ee9dd825d02a01489901b
 
 curl --fail --location \
   "https://raw.githubusercontent.com/Aphra-neck/GO2_Hesai/${GO2_RVIZ_CONFIG_REF}/config/fastdds/wsl2_mirrored.xml" \
   -o ~/go2_rviz/config/fastdds/wsl2_mirrored.xml
 
 curl --fail --location \
-  "https://raw.githubusercontent.com/Aphra-neck/GO2_Hesai/${GO2_RVIZ_CONFIG_REF}/src/utree_dog_navigation/rviz/hesai_navigation.rviz" \
-  -o ~/go2_rviz/rviz/hesai_navigation.rviz
+  "https://raw.githubusercontent.com/Aphra-neck/GO2_Hesai/${GO2_RVIZ_CONFIG_REF}/src/utree_dog_navigation/rviz/flat_obstacle_navigation.rviz" \
+  -o ~/go2_rviz/rviz/flat_obstacle_navigation.rviz
 ```
 
 `GO2_RVIZ_CONFIG_REF` 固定到本次实机验证通过的配置提交，避免 WSL2 与 Jetson 因
@@ -431,7 +442,8 @@ grep -n '<address>' ~/go2_rviz/config/fastdds/wsl2_mirrored.xml
 
 ### 0. 启动前检查
 
-- 机器人处于安全静止状态。
+- 机器狗已经正常站立并保持静止；禁止在趴下或起身过程中启动二维规划。
+- 官方遥控器安全员已经就位，周边留有低速测试空间。
 - 不运行 RL `/lowcmd` 控制器。
 - 不启动 `utree_go2_sdk2_bridge`。
 - 不运行旧的 Discovery Server。
@@ -440,24 +452,37 @@ grep -n '<address>' ~/go2_rviz/config/fastdds/wsl2_mirrored.xml
 Jetson 检查残留进程：
 
 ```bash
-pgrep -af \
+pipeline_process_status=0
+pipeline_processes="$(pgrep -af \
   'hesai_ros_driver|go2_imu_bridge|super_lio|utree_dog_navigation|go2_sdk2_bridge|rl_controller|rviz2|fastdds.*discovery' \
-  || true
+  2>&1)" || pipeline_process_status=$?
+
+case "${pipeline_process_status}" in
+  0) echo "ERROR: pipeline processes are still running"; echo "${pipeline_processes}" ;;
+  1) echo "OK: no pipeline process remains" ;;
+  *) echo "ERROR: process query failed (${pipeline_process_status})"; echo "${pipeline_processes}" ;;
+esac
 ```
 
-如果输出旧进程，先回到其原终端按 `Ctrl+C`，不要重复启动第二套节点。
+该检查不会退出当前终端。只有输出 `OK` 才继续；如果输出旧进程，先回到其原终端按
+`Ctrl+C`，不要重复启动第二套节点；查询本身失败也必须先处理，不能当作没有进程。
 
 ### 1. Jetson 终端 1：启动无界面 SLAM
 
-当前 XT-16 平地集成的点云输出候选模式是 `dense=true`，但它不再代表普通起点吸附必然通过。
-2026-08-07 的站立静止会话证明，XT-16 近场盲环可以让普通起点门禁连续失败；后续只能在本轮
-实时门禁通过后继续，不能沿用旧会话的结论。该模式仍只用于静止和短距离无运动规划验证，
-不代表允许启动 SDK2 bridge。日常启动使用：
+当前已实机验证的 XT-16 二维平地流程使用 `dense=true`。该开关只选择 Super-LIO 发布给规划与
+可视化的完整去畸变帧，本身不构成运动授权；每次启动仍必须检查新鲜里程计、三维确认障碍、
+二维膨胀层和实际 `/body_path`，最后由操作员单独 arm SDK2 bridge。日常启动使用：
 
 ```bash
 cd ~/catkin_ws
 GO2_LIO_DENSE_OUTPUT=true ./shell/start_slam.sh
 ```
+
+保持该终端运行。该脚本启动的 Super-LIO 固定使用 `rviz:=false`。正常停止时最后在
+这个终端按一次 `Ctrl+C`；脚本会先结束自己的传感器/SLAM 子进程，再自动执行本轮日志的
+`stop -> repair -> upload`。只有该脚本自己创建的诊断会话才会被自动收尾；如果规划、
+SDK2 bridge、其他机器人进程或 `/lowcmd` publisher 仍在运行，整个自动收尾会被跳过，
+活动诊断会话保持采集，待所有机器人进程停止后再人工处理。
 
 #### 首次部署或相关配置变更后的 dense A/B
 
@@ -509,19 +534,15 @@ publisher 时启动。日常命令不需要在外层 source ROS 或重复 export
 
 ### 2. Jetson 终端 2：启动无界面规划
 
-等待 SLAM 出现 `Map init done`，再新开 Jetson 终端：
-
-```bash
-cd ~/catkin_ws
-./shell/start_navigation.sh
-```
-
-二维平地障碍模式要求机器狗已经正常站立并保持静止，必须显式确认后启动：
+等待 SLAM 出现 `Map init done`，确认机器狗仍然站立、静止，再新开 Jetson 终端。
+当前二维日常流程必须显式使用 `flat_obstacle`，不要省略模式与平地确认：
 
 ```bash
 cd ~/catkin_ws
 GO2_PLANNING_MODE=flat_obstacle \
 GO2_FLAT_GROUND_CONFIRMED=true \
+GO2_MAP_CAPTURE=false \
+PLANNING_RVIZ=false \
 ./shell/start_navigation.sh
 ```
 
@@ -535,7 +556,7 @@ cd ~/catkin_ws
 GO2_PLANNING_MODE=flat_obstacle \
 GO2_FLAT_GROUND_CONFIRMED=true \
 GO2_MAP_CAPTURE=true \
-PLANNING_RVIZ=true \
+PLANNING_RVIZ=false \
 ./shell/start_navigation.sh
 ```
 
@@ -576,8 +597,8 @@ scp -r unitree@192.168.151.213:/home/unitree/go2_map_exports/<session> `
 该脚本默认 `PLANNING_RVIZ=false`。只有临时改回 Jetson 本地可视化时才使用
 `PLANNING_RVIZ=true ./shell/start_navigation.sh`；分布式日常流程不要设置它。
 
-`verified-flat-start` 同样默认关闭。仅在机器人正常站立、保持静止并执行当前平地无运动验证时，
-可以显式启动本次规划私有的近场补全与 Jetson 本地规划 RViz：
+`verified-flat-start` 同样默认关闭。只有后续重新研究 terrain 近场盲环，且机器人正常站立、
+保持静止并执行无运动验证时，才可显式启动该规划私有的近场补全与 Jetson 本地规划 RViz：
 
 ```bash
 cd ~/catkin_ws
@@ -656,17 +677,24 @@ export ROS_LOCALHOST_ONLY=0
 test -r "$FASTRTPS_DEFAULT_PROFILES_FILE" || exit 1
 
 ros2 daemon stop
-rviz2 -d "$HOME/go2_rviz/rviz/hesai_navigation.rviz"
+rviz2 -d "$HOME/go2_rviz/rviz/flat_obstacle_navigation.rviz"
 ```
 
 RViz 配置固定使用：
 
 - Fixed Frame：`world`
 - `/lio/cloud_world`：Best Effort、Volatile、Decay Time `10` 秒，显示默认关闭
+- `/flat_obstacle_filtered_map_3d`：Reliable、Volatile，红色三维确认障碍，默认开启
+- `/flat_obstacle_filtered_points`：Best Effort、Volatile，橙色当前帧过滤结果，默认关闭
+- `/flat_obstacle_inflated`：Reliable、Transient Local，紫色二维膨胀安全区，默认开启
+- `/flat_obstacle_raw`：Reliable、Transient Local，未膨胀二维障碍，默认关闭
 - `/lio/body_odom`
-- `/terrain_costmap`：Reliable、Transient Local
 - `/body_path`：Reliable、Transient Local
 - Set Goal：发布 `/goal_pose`
+
+红色点不是另一套独立建图：它们来自 Super-LIO 世界点云，经高度/范围裁剪、多帧确认和
+世界系三维清除后形成；紫色单元是这些确认障碍投影到二维后按 Go2 footprint 膨胀的结果。
+`GO2_MAP_CAPTURE` 只控制 PCD 诊断写盘，不参与障碍判断，因此开关它不应改变 RViz 地图或路径。
 
 WSLg 可能输出一条 GLSL sampler 警告。只要 RViz 进程仍存活且点云可见，该警告
 与 DDS 无关；如果仅代价地图贴图异常，再单独排查 WSLg 渲染。
@@ -675,7 +703,8 @@ WSLg 可能输出一条 GLSL sampler 警告。只要 RViz 进程仍存活且点�
 
 `Super-LIO World Cloud` 现在默认关闭。2026-08-07 的 OFF -> ON -> OFF 静止对照中，手动开启该
 显示会让 Jetson `/lio/odom` 从约 `8 Hz` 立即下降到约 `4 Hz`，再次关闭后恢复到约 `8 Hz`。
-因此日常规划不要打开世界点云；`/lio/body_odom`、`/terrain_costmap` 和 `/body_path` 保持显示即可。
+因此日常规划不要打开世界点云；`/lio/body_odom`、红色三维确认障碍、紫色二维膨胀层和
+`/body_path` 保持显示即可。
 
 首次 dense A/B 必须关闭 `Super-LIO World Cloud` 显示。选定 dense 模式并通过平地起点门禁后，
 如果要判断 WSL2 RViz 点云显示是否加重 Jetson/DDS 负载，使用三个完全独立的静止会话：
@@ -687,7 +716,9 @@ WSLg 可能输出一条 GLSL sampler 警告。只要 RViz 进程仍存活且点�
 三轮只切换 RViz 中 `Super-LIO World Cloud` 的 `Enabled` 复选框。不要修改 Best Effort、
 Volatile、Depth `5` 或 Decay Time `10`，不要发目标，也不要启动 SDK2 bridge 或 RL controller。
 每轮保持相同代码、dense 模式、机器人姿态和场景，至少覆盖三个日志采集周期。每轮结束后先停止
-规划与 SLAM，再停止并上传该轮独立日志；机器人节点运行期间不要执行 Git 或日志上传。
+规划，再在 SLAM 终端按一次 `Ctrl+C` 并等待该轮自动日志收尾；只有自动收尾被关闭、复用已有
+会话或终端明确报告跳过/失败时才人工执行 stop/repair/upload。机器人节点运行期间不要执行 Git
+或日志上传。
 
 ### 4. 从 WSL2 验证实时数据
 
@@ -707,14 +738,44 @@ timeout 15 ros2 topic echo --no-daemon --once --qos-profile sensor_data \
   /lio/body_odom nav_msgs/msg/Odometry --field header
 
 timeout 15 ros2 topic echo --no-daemon --once \
+  --qos-reliability reliable --qos-durability volatile \
+  /flat_obstacle_filtered_map_3d sensor_msgs/msg/PointCloud2 --field header
+
+timeout 15 ros2 topic echo --no-daemon --once \
   --qos-reliability reliable --qos-durability transient_local \
-  /terrain_costmap nav_msgs/msg/OccupancyGrid --field header
+  /flat_obstacle_inflated nav_msgs/msg/GridCells --field header
 ```
 
-四个消息的 `frame_id` 都应为 `world`，且 `/lio/cloud_world` 的 `width` 必须大于
-`0`。这同时验证发现、payload 传输和非空点云，而不只是看到话题名。
+上述消息的 `frame_id` 都应为 `world`，且 `/lio/cloud_world` 的 `width` 必须大于
+`0`。二维模式仍发布 `/terrain_map` 作为 mapper 到 planner 的内部输入；WSL2 无需安装
+自定义消息插件来显示它，操作员使用上面的标准 PointCloud2/GridCells 图层。规划节点全部
+启动后若仍看到 `Unknown topic '/terrain_map'`，应检查 mapper 状态和 DDS 发现，不能当作正常现象。
+这些检查同时验证发现、payload 传输和非空点云，而不只是看到话题名。
 
 ### 5. 只验证规划，不执行运动
+
+当前 `flat_obstacle` 日常流程以三维确认障碍层、二维膨胀层和非空 `/body_path` 为
+直接操作门禁；内部 `/terrain_map` 仍供 planner 和诊断器使用，但 terrain 拓扑统计不能
+替代二维障碍层的现场核对。先确认以下三个 topic 都有发布者，再从 WSL2 RViz 发一个
+近距离目标并检查非空路径：
+
+```bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+
+ros2 topic info /flat_obstacle_filtered_map_3d
+ros2 topic info /flat_obstacle_inflated
+ros2 topic info /body_path
+
+timeout 15 ros2 topic echo --no-daemon --once \
+  --qos-reliability reliable --qos-durability transient_local \
+  /body_path nav_msgs/msg/Path --field poses
+```
+
+当前 `flat_obstacle` 日常流程不再运行 10 组 `planner-series`，也不启用
+`verified-flat-start`。出现路径或地图异常时，只做一次有针对性的 `planner-check` 留证；
+该诊断结果用于定位内部 `/terrain_map`，不能替代 RViz 中三维障碍、二维膨胀层和实际路径的
+现场核对，也不能单独批准运动。后面的 10 组 A/B 只保留为 terrain 阶段的历史复现实验。
 
 设置目标前，确保机器人静止并准备好遥控器急停。不要启动 SDK2 bridge 或 RL controller；
 下面的 `planner-check` 会自动检查相关进程、ROS 图和 `/lowcmd` 发布者，无法明确确认安全
@@ -751,8 +812,9 @@ echo "wsl_delay_exit=$?"
 结果给出本机基线，WSL2 结果还包含跨主机 clock skew 和传输延迟。收到样本后被 `timeout`
 结束时退出 `124` 是正常的，但必须实际打印 delay 统计，不得出现低于 `-0.2 s` 的负延迟，
 正延迟应保持在 `0.5 s` odom 新鲜度预算内。没有样本或越界时停止在这里。即使预检通过，
-收到 RViz 目标后的 `planner-check` live timestamp 结论仍是最终 fail-closed 门禁；出现
-`goal_stale` 或 `goal_stamp_from_future` 时路径不获批准，也绝不启动运动。
+运行中的 planner 仍会对每个 RViz 目标执行同样的 timestamp 检查；出现 `goal_stale` 或
+`goal_stamp_from_future` 日志、或没有生成新鲜路径时都不启动运动。只有异常定位时才额外运行
+一次 `planner-check`，它不是二维日常流程必须重复的第二套门禁。
 
 `start_slam.sh` 已启动诊断会话。在第三个 Jetson 终端使用统一日志入口，不要直接运行
 底层 Python 检查器：
@@ -762,7 +824,8 @@ cd ~/catkin_ws
 ./tools/go2-log status
 ```
 
-`planner-check` 自动加载项目 ROS/Fast DDS 环境，确认 SDK2/RL 控制进程未运行且
+需要定位 terrain 输入或二维模式的内部地图时，`planner-check` 会自动加载项目 ROS/Fast DDS
+环境，确认 SDK2/RL 控制进程未运行且
 `/lowcmd` 无发布者，并从运行中的 mapper/planner 读取 mapper 与 planner 各自的坡度阈值、
 观测帧数、粗糙度、通行度、台阶高度和吸附半径。任一安全检查、ROS 图查询或参数读取失败
 都会 fail closed，不会用默认值伪造结果。检查结果原子追加到当前会话的
@@ -774,14 +837,19 @@ cd ~/catkin_ws
 ./tools/go2-log planner-check --no-goal
 ```
 
-首次部署或相关配置变更后的平地 A/B，先采集连续的起点和地图摘要，不需要在 RViz 发点。
-日常候选 `dense=true` 每次启动后也必须先运行同一门禁，确认本轮数据仍可用：
+当前二维流程若只需确认输入是否存在，可运行上面这一次 `--no-goal` 检查；不要因此再扩展为
+10 组采样。只有将来重新进入 terrain/verified-flat-start 研究并需要复现旧基线时，才使用
+下面的连续起点与 dense A/B 实验。
 
 平地门禁只允许机器人四足正常承重站立、机身处于标称工作高度并保持静止。趴伏、坐姿、起身或
 姿态切换期间会改变雷达离地高度、机身遮挡和近场地面几何，采集结果无效，不能用于判断规划器
 是否通过。SDK2 bridge 和 RL controller 在整个检查期间必须保持关闭。
 
-#### 站立 XT-16 近场盲环与 verified-flat-start
+#### Terrain 历史诊断：站立 XT-16 近场盲环与 verified-flat-start
+
+本小节不是当前 `flat_obstacle` 的启动步骤，也不是二维运动门禁；日常运行直接跳到本节后面的
+一次目标检查。这里保留旧 terrain 输入为何失败以及如何复现实验的证据，供后续接入 Go2 下装
+雷达并切回 terrain 模式时使用。
 
 会话 `20260807T092515Z-unitree-jetson-payload-3123` 在 RViz 世界点云关闭、机器人站立静止时，
 连续 10 次得到 `start_has_no_valid_cell_in_snap_radius`。`0.55 m` 起点圆内的 24 个格全部为
@@ -809,6 +877,8 @@ terrain mapper 的 self-filter 曾直接在 `world` 轴上应用 length/width，
 即使这些检查全部通过，盲环中的真实障碍仍未被传感器观测。该功能当前只批准静止、短距离、
 无运动的规划链路验证；不能据此启动 SDK2 bridge，也不能把生成的 `/body_path` 当作运动批准。
 
+历史复现实验命令如下，不要在当前二维日常启动中执行：
+
 ```bash
 ./tools/go2-log planner-series --no-goal --samples 10 --interval 1.0
 ```
@@ -818,7 +888,7 @@ terrain mapper 的 self-filter 曾直接在 `world` 轴上应用 length/width，
 `1` 时立即停止。比较 `GO2_LIO_DENSE_OUTPUT=false/true` 时，除该开关外保持场景、
 机器人姿态、`pub_step=1` 和规划配置完全一致。
 
-平地起点门禁必须同时满足以下条件，缺一项都不要发目标：
+重新研究 terrain 模式时，该历史起点门禁必须同时满足以下条件，缺一项都不要发目标：
 
 - `planner-series` 最终退出码为 `0`；
 - 普通模式的 10 个样本全部为 `diagnosis=start_ready_waiting_for_goal`；显式启用
@@ -832,23 +902,24 @@ terrain mapper 的 self-filter 曾直接在 `world` 轴上应用 length/width，
   `verified_flat_start.connected_support_cells>=1`；
 - 没有 capture error、frame mismatch、stale 或 timestamp future 诊断。
 
-首次/变更后 A/B 的 `dense=false` 和 `dense=true` 两轮都必须采集。第一轮结束后，先在规划终端和 SLAM
-终端分别按 `Ctrl+C`，确认相关机器人节点全部退出，再执行 `./tools/go2-log stop`。第二轮
+仅在重新研究 terrain 模式时，首次/变更后 A/B 的 `dense=false` 和 `dense=true` 两轮都必须
+采集。第一轮结束后，先在规划终端
+按 `Ctrl+C`，再在 SLAM 终端按 `Ctrl+C` 并等待自动日志收尾完成。第二轮
 必须创建新的诊断会话；`go2-log` 会拒绝在同一活动会话内切换 dense 模式，避免两组证据
 混在一起。所有机器人进程停止前不要上传日志。
 
-完成两轮后，只能选择通过上述门禁的模式进入目标验证。两轮都通过时优先使用
+terrain A/B 完成两轮后，只能选择通过上述门禁的模式进入目标验证。两轮都通过时优先使用
 `dense=false`，因为它的 Jetson 与 DDS 负载更低；只有 `dense=true` 通过时才使用完整帧。
 两轮都未通过时停止在这里，关闭节点并上传两场日志，不要发目标。若选定模式不是当前
 正在运行的第二轮模式，先正常停止第二轮和日志会话，再用选定模式新开一轮，并重新通过
 一次 `planner-series` 门禁。
 
-`dense=true` 仍是现阶段点云输出候选，但最新站立会话的普通 `0.55 m` 起点门禁为 10/10 失败。
-任何模式都必须以当前会话的 `planner-series` 结果为准；只有显式 verified-flat-start 门禁通过时，
-才能继续本轮平地、静止、短距离无运动目标验证。如果后续 A/B 结果改变，必须保留独立日志并
-更新本节，不能在运行中的会话里临时切换模式。
+在该 terrain 历史实验中，`dense=true` 是当时的点云输出候选，但最新站立会话的普通
+`0.55 m` 起点门禁为 10/10 失败。terrain 模式必须以对应会话的 `planner-series` 结果为准；
+只有显式 verified-flat-start 门禁通过时，才能继续该轮静止、短距离、无运动目标验证。如果
+后续 A/B 结果改变，必须保留独立日志并更新本节，不能在运行中的会话里临时切换模式。
 
-选定模式通过门禁且仍在运行后，才执行目标检查：
+当前二维模式出现异常时只执行下面的一次目标检查；terrain 研究则要先通过上面的专用门禁：
 
 ```bash
 ./tools/go2-log planner-check --goal-timeout 60
@@ -915,25 +986,93 @@ echo "path_echo_exit=$?"
 `same_continuous_ground_component_not_planner_approval` 只说明起点和目标位于同一个
 四邻域有效地形区域，且相邻格高程有限、台阶高度未超限。这个拓扑结果不复现
 规划器的航向格和 `0.20 m` motion primitive，也不检查 footprint 或整段碰撞，因此既不
-保证规划成功，也不是运动安全批准。在完成障碍穿越、footprint、地图边界和 stale path
-验收前，不要进入自动运动。
+保证规划成功，也不是运动安全批准。当前二维低速运动只能在本 README 顶部记录的阶段门禁
+已经通过、并再次满足下一节的现场检查与显式 arm 后进行；不能仅凭该拓扑结论运动。
 
-### 6. 停止顺序
+### 6. Jetson 终端 3/4：启动并一次授权 SDK2 bridge
+
+只有在 RViz 障碍层与测试目标路径均符合现场、官方遥控器安全员已就位且没有
+`/lowcmd` 发布者时才进入运动。Jetson 终端 3 启动 bridge：
+
+```bash
+cd ~/catkin_ws
+./shell/start_sdk2_bridge.sh
+```
+
+保持终端 3 运行。bridge 每次进程启动后都默认为 disarmed；不能通过参数绕过人工授权。
+新开 Jetson 终端 4，必须先加载 ROS 2 环境，再显式 arm 一次：
+
+```bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+
+ros2 service call /go2_sdk2_bridge/enable_motion \
+  std_srvs/srv/SetBool '{data: true}'
+```
+
+授权可以发生在新路径到达前；此时 bridge 停车并等待。此后每次在 RViz 发布一个新的有效
+目标，规划器生成新鲜 `/body_path` 后会自动执行，不需要为每个目标重复调用 `data: true`。
+正常到达目标或收到规划器显式发布的新鲜空路径时，bridge 会停车但保留本次授权并等待
+下一条新路径。路径缓存超时、里程计超时或其他安全故障会立即停车并解除授权，排除原因后
+必须重新显式 arm，不能让中断前的旧目标自动恢复。
+配置参数 `enabled` 是只读的启动保护并始终为 `false`，不代表运行期 armed 状态；以 service
+响应和 bridge 终端中的 `armed`/`waiting for a path` 日志为准。
+
+本阶段实机验证并锁定的速度硬上限为 `vx=0.10 m/s`、`vy=0.05 m/s`、
+`yaw_rate=0.20 rad/s`；YAML、launch、启动脚本和节点内部上限保持一致，运行期不能调高。
+局部航向误差达到 `45 deg` 时进入只转不平移，降到 `15 deg` 以内才恢复平移，避免阈值附近
+反复切换。
+
+里程计缺失/过期、非法或异常时间戳路径、SDK2 停车失败、检测到 `/lowcmd` 发布者，或人工
+调用 `data: false` 都会 disarm；处理原因后必须重新显式授权。任何时候都可人工禁用并停车：
+
+```bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+
+ros2 service call /go2_sdk2_bridge/enable_motion \
+  std_srvs/srv/SetBool '{data: false}'
+```
+
+二维规划优先让机头朝向局部路径段：长距离反向/横向运动会承担持续航向代价，直角转折在
+真正到达拐点后使用下一段航向；运动桥在航向误差较大时只转向，进入对齐范围后才恢复平移。
+bridge 对每条新路径维护有界、单调的进度，不会因 U 形回折段离机器人更近就跳到未来段；
+偏离当前段或原地转向点超过 `0.05 m`、或产生非规划的负 `vx` 时会停车并解除授权。多级
+原地转向按规划姿态逐级执行。这里跟随局部路径切线而不是始终朝最终目标，因此不会破坏
+必须先前进再转弯的绕障路径；单个栅格的小幅全向修正仍保留。不要通过修改
+`world -> imu -> base_link` 的 `-90 deg` 关系调这个行为。
+
+到达终点后，bridge 会锁存本轮原始 `/goal_pose` 的时间戳 generation；规划器因地图更新对
+同一轮目标重复规划或重新吸附到相邻格时仍不会再次启动。操作员在 RViz 新发的目标具有新的
+generation，即使几何终点与上次完全相同，也会在保持 armed 的情况下作为新任务自动执行，
+不需要先 `data: false` 再 `data: true`。
+
+### 7. 停止顺序
 
 1. 如果 SDK2 bridge 曾启用，先调用 `enable_motion` 的 `false` 分支并确认停车。
 2. 在 SDK2 bridge 终端按 `Ctrl+C`，等待执行器退出。
-3. 在 Jetson 规划终端按 `Ctrl+C`，等待规划节点退出。
-4. 在 Jetson SLAM 终端只按一次 `Ctrl+C`。如果启用了地图保存，保持终端和电源
-   可用，直到出现 `Final map saved to:` 且进程正常退出。
+3. 在 Jetson 规划终端按 `Ctrl+C`，等待规划节点退出；若设置了 `GO2_MAP_CAPTURE=true`，
+   还要等 PCD recorder 写完 `result.json`。
+4. 在 Jetson SLAM 终端只按一次 `Ctrl+C`。只有另行启用了 Super-LIO 的
+   `lio.map.save_map=true` 时才等待 `Final map saved to:`；无论是否保存 SLAM 地图，都要
+   等待诊断 stop/repair/upload 结果。
 5. 关闭 WSL2 RViz。
-6. 确认没有运行进程后，再停止和上传日志。日志采集器不会随 launch 自动停止。
+6. 确认没有残留机器人进程。正常情况下无需再次手动处理日志；如果自动收尾被跳过或失败，
+   会话会被保留，再按提示手动重试。
 
 ```bash
-pgrep -af \
+pipeline_process_status=0
+pipeline_processes="$(pgrep -af \
   'hesai_ros_driver|go2_imu_bridge|super_lio|utree_dog_navigation|go2_sdk2_bridge|rl_controller' \
-  || true
-./tools/go2-log stop
-./tools/go2-log upload
+  2>&1)" || pipeline_process_status=$?
+
+case "${pipeline_process_status}" in
+  0) echo "ERROR: pipeline processes are still running"; echo "${pipeline_processes}" ;;
+  1) echo "OK: no pipeline process remains" ;;
+  *) echo "ERROR: process query failed (${pipeline_process_status})"; echo "${pipeline_processes}" ;;
+esac
+
+./tools/go2-log status
 ```
 
 ### 环境变量
@@ -947,7 +1086,8 @@ pgrep -af \
 | `ROS_LOCALHOST_ONLY` | `0` | 允许跨主机 ROS 2 通信 |
 | `GO2_NETWORK_INTERFACE` | `enP8p1s0` | Unitree SDK2 LowState 网卡 |
 | `GO2_IMU_RATE` | `200.0` | IMU 最大发布频率，单位 Hz |
-| `GO2_LIO_DENSE_OUTPUT` | 脚本默认 `false` | 当前日常候选须显式设为 `true`；首次/变更后 A/B 分别测试 `false` 与 `true` |
+| `GO2_LIO_DENSE_OUTPUT` | 脚本默认 `false` | 当前二维日常流程显式设为 `true`；只有相关感知配置变更或重做 terrain 实验时才运行 false/true A/B |
+| `GO2_LOG_AUTO_FINALIZE` | `true` | `start_slam.sh` 正常退出时自动收尾并上传它自己创建的诊断会话；设为 `false` 时改为人工处理 |
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
 | `UNITREE_SDK_LIBRARY_DIR` | `/usr/local/lib` | Unitree SDK 配套 DDS 动态库目录 |
 | `GO2_BODY_YAW_OFFSET_RAD` | `-1.5707963267948966` | IMU 到 `base_link` 的 yaw 校正 |
@@ -988,8 +1128,8 @@ GO2_BODY_YAW_OFFSET_RAD=-1.525243233318 ./shell/start_navigation.sh
 
 ### SDK2 路径执行器
 
-SDK2 bridge 不属于当前日常启动流程。以下所有门槛必须有日志和测试记录后，才可在
-第三个 Jetson 终端直接运行启动脚本；它会自动使用与 SLAM/规划相同的 Fast DDS
+SDK2 bridge 已进入当前二维低速实测流程，但仍是默认 disarmed 的独立安全边界。以下门槛
+满足后才可在第三个 Jetson 终端运行启动脚本；它会自动使用与 SLAM/规划相同的 Fast DDS
 环境：
 
 - 无头感知加远程 RViz 时，IMU、雷达、里程计和世界点云达到性能基线。
@@ -998,31 +1138,44 @@ SDK2 bridge 不属于当前日常启动流程。以下所有门槛必须有日�
 - 规划失败、输入过期或非法 frame 会发布/处理空路径并清除旧目标。
 - `/lowcmd` 互斥、遥控器接管、实体急停和低速 field-test 参数已准备完成。
 
-在这些门槛通过前，不启动 bridge，也不调用 `enable_motion` 的 `true` 分支。
+在这些门槛通过前，不启动 bridge，也不调用 `enable_motion` 的 `true` 分支。二维阶段通过
+不代表 terrain、楼梯或更高速度已经获准。
 
 首次实机运动必须有独立遥控器安全员，手始终放在官方接管/急停控制上；不能把 ROS
 service 或 DDS 链路当作唯一停车手段。若 disable service 无响应，立即用遥控器接管
 或执行实体急停，不等待软件恢复。
 
 ```bash
+cd ~/catkin_ws
 ./shell/start_sdk2_bridge.sh
 ```
 
 脚本会拒绝与 RL `/lowcmd` 控制器并行运行；节点运行期间也会持续检查
-`/lowcmd` 发布者，一旦发现便立即禁用 SportClient 并停车。节点启动后仍为禁用状态；确认
-`/body_path`、`/lio/body_odom` 和机器人周边安全后，才可显式启用：
+`/lowcmd` 发布者，一旦发现便立即禁用 SportClient 并停车。节点启动后仍为 disarmed；确认
+`/body_path`、`/lio/body_odom` 和机器人周边安全后，才可显式 arm：
 
 `enabled:=true` 启动配置会被拒绝，不能绕过人工授权。路径、里程计或控制参数包含
 非有限值、非法四元数或不一致坐标系时，节点也会保持禁用并尝试停车。
 
 ```bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+
 ros2 service call /go2_sdk2_bridge/enable_motion \
   std_srvs/srv/SetBool '{data: true}'
 ```
 
+该调用只需在 bridge 进程启动后执行一次。正常到达、规划器显式空路径或等待新目标时会
+停车并保持 armed；后续新 goal generation 的新鲜路径会自动恢复执行，即使操作员再次选择
+相同的几何终点也无需重复 arm。路径或里程计超时、非法输入、路径跟踪偏差及其他安全故障会
+disarm，必须排除故障后重新调用。
+
 随时禁用并停车：
 
 ```bash
+cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+
 ros2 service call /go2_sdk2_bridge/enable_motion \
   std_srvs/srv/SetBool '{data: false}'
 ```
@@ -1062,13 +1215,22 @@ cd ~/catkin_ws
 sudo install -m 0755 tools/go2-log /usr/local/bin/go2-log
 ```
 
-先停止 SLAM、规划和 SDK2 bridge，再停止并上传诊断会话：
+正常停止顺序必须是 bridge、规划、最后 SLAM。`start_slam.sh` 在 `Ctrl+C` 后会自动停止、
+修复并上传它自己创建的诊断会话；为让上传通过，按 `Ctrl+C` 前必须先确认其他机器人进程
+已退出。只有关闭自动收尾、复用了已有会话，或终端明确报告跳过/失败时才手动执行：
 
 ```bash
 cd ~/catkin_ws
+source ./shell/ros2_environment.sh
+
 ./tools/go2-log stop
-./tools/go2-log upload
+./tools/go2-log repair
+GO2_LOG_PROXY=http://192.168.151.143:7890 ./tools/go2-log upload
 ```
+
+自动收尾用于防止新的会话继续积压，但不会在下一次启动时擅自上传历史会话。旧的 stale
+状态或已经达到 `20` 个未上传会话时，`start_slam.sh` 仍会 fail closed；保持所有机器人
+进程停止，先按上面的人工流程修复并上传至少一个会话，再重新启动。失败的上传不会删除数据。
 
 如果旧会话因采集器文本文件末尾出现 NUL 字节而被 `upload` 拒绝，保持所有机器人
 进程停止，显式修复该会话后再上传：
@@ -1423,8 +1585,8 @@ Humble 的 `ros2 topic hz` 不能显式选择订阅 QoS，因此它只作为频�
 
 `Stereo is NOT SUPPORTED` 本身无害。只要 RViz 持续运行且点云可见，WSLg 的 GLSL
 sampler 警告也不是 DDS 故障。如果默认 RViz 正常但项目配置崩溃，确认当前是
-Ubuntu 22.04 + Humble，清除 Foxy/Noetic overlay，并重新下载 ROS2 分支的最新
-`hesai_navigation.rviz`。
+Ubuntu 22.04 + Humble，清除 Foxy/Noetic overlay，并重新下载
+`ROS2-2D-navigation` 分支固定提交的 `flat_obstacle_navigation.rviz`。
 
 ### 找不到 `unitree_sdk2`
 

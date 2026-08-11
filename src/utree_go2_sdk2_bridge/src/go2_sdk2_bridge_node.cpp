@@ -40,11 +40,22 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   lookahead_distance_ = declare_parameter("lookahead_distance", 0.6);
   goal_position_tolerance_ = declare_parameter("goal_position_tolerance", 0.15);
   goal_yaw_tolerance_ = declare_parameter("goal_yaw_tolerance", 0.20);
+  heading_alignment_enter_angle_ =
+    declare_parameter("heading_alignment_enter_angle", 0.7853981633974483);
+  heading_alignment_exit_angle_ =
+    declare_parameter("heading_alignment_exit_angle", 0.2617993877991494);
   linear_gain_ = declare_parameter("linear_gain", 1.0);
   yaw_gain_ = declare_parameter("yaw_gain", 1.5);
-  max_vx_ = declare_parameter("max_vx", 0.6);
-  max_vy_ = declare_parameter("max_vy", 0.35);
-  max_yaw_rate_ = declare_parameter("max_yaw_rate", 0.8);
+  rcl_interfaces::msg::ParameterDescriptor velocity_limit_descriptor;
+  velocity_limit_descriptor.description =
+    "Read-only validated flat-ground stage safety limit";
+  velocity_limit_descriptor.read_only = true;
+  max_vx_ = declare_parameter<double>(
+    "max_vx", kValidatedMaxVx, velocity_limit_descriptor);
+  max_vy_ = declare_parameter<double>(
+    "max_vy", kValidatedMaxVy, velocity_limit_descriptor);
+  max_yaw_rate_ = declare_parameter<double>(
+    "max_yaw_rate", kValidatedMaxYawRate, velocity_limit_descriptor);
   world_frame_ = declare_parameter("world_frame", "world");
   body_frame_ = declare_parameter("body_frame", "base_link");
   const std::string path_topic = declare_parameter("path_topic", "/body_path");
@@ -67,14 +78,13 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   }
   const ControlParameters parameters{
     command_rate_, path_timeout_, odom_timeout_, timestamp_future_tolerance_,
-    lookahead_distance_, goal_position_tolerance_, goal_yaw_tolerance_, linear_gain_,
-    yaw_gain_, max_vx_, max_vy_, max_yaw_rate_};
+    lookahead_distance_, goal_position_tolerance_, goal_yaw_tolerance_,
+    heading_alignment_enter_angle_, heading_alignment_exit_angle_,
+    linear_gain_, yaw_gain_, max_vx_, max_vy_, max_yaw_rate_};
   const std::string parameter_error = validateControlParameters(parameters);
   if (!parameter_error.empty()) {
     throw std::invalid_argument(parameter_error);
   }
-  enabled_ = false;
-
   // SDK2 owns its DDS participant. Initialize it once before constructing SportClient.
   unitree::robot::ChannelFactory::Instance()->Init(domain_id_, network_interface_);
   sport_client_ = std::make_unique<unitree::robot::go2::SportClient>();
@@ -160,9 +170,27 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
         msg->header.frame_id.c_str(), world_frame_.c_str());
       return;
     }
+    const rclcpp::Time current_time = now();
+    const rclcpp::Time message_time(msg->header.stamp, current_time.get_clock_type());
+    if (!messageStampFresh(message_time, current_time, path_timeout_)) {
+      const double age = messageAgeSeconds(message_time, current_time);
+      failSafe("stale or future path timestamp");
+      RCLCPP_ERROR(
+        get_logger(),
+        "Rejected path with age %.3f s; accepted range is [-%.3f, %.3f] s",
+        age, timestamp_future_tolerance_, path_timeout_);
+      return;
+    }
     if (msg->poses.empty()) {
-      failSafe("empty path");
-      RCLCPP_ERROR(get_logger(), "Rejected empty body path");
+      // A transient planning failure must not unlock an endpoint already completed.
+      path_progress_tracker_.reset();
+      waitForNewPath("empty path");
+      if (motion_authorization_.armed()) {
+        RCLCPP_INFO(
+          get_logger(), "Body path cleared; waiting for a new path while remaining armed");
+      } else {
+        RCLCPP_WARN(get_logger(), "Body path cleared while motion is disarmed");
+      }
       return;
     }
     for (std::size_t index = 0; index < msg->poses.size(); ++index) {
@@ -183,18 +211,27 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
         return;
       }
     }
-    const rclcpp::Time current_time = now();
-    const rclcpp::Time message_time(msg->header.stamp, current_time.get_clock_type());
-    if (!messageStampFresh(message_time, current_time, path_timeout_)) {
-      const double age = messageAgeSeconds(message_time, current_time);
-      failSafe("stale or future path timestamp");
+    const auto goal_generation = pathGoalGeneration(msg->poses);
+    if (!goal_generation) {
+      failSafe("invalid path goal generation");
       RCLCPP_ERROR(
         get_logger(),
-        "Rejected path with age %.3f s; accepted range is [-%.3f, %.3f] s",
-        age, timestamp_future_tolerance_, path_timeout_);
+        "Rejected body path because pose stamps do not contain one valid goal generation");
+      return;
+    }
+    if (!completed_goal_latch_.accept(*goal_generation)) {
+      path_progress_tracker_.reset();
+      waitForNewPath("repeated or superseded goal generation");
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Ignored body path for completed or superseded goal generation %lld",
+        static_cast<long long>(*goal_generation));
       return;
     }
     path_ = msg;
+    path_goal_generation_ = *goal_generation;
+    path_progress_tracker_.reset();
+    motion_authorization_.pathAvailable();
   } catch (const std::exception & exception) {
     failSafe("exception while validating path");
     RCLCPP_ERROR(get_logger(), "Rejected path after exception: %s", exception.what());
@@ -246,6 +283,17 @@ void Go2Sdk2BridgeNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr ms
         age, timestamp_future_tolerance_, odom_timeout_);
       return;
     }
+    if (odom_) {
+      const rclcpp::Time previous_time(odom_->header.stamp, current_time.get_clock_type());
+      if (message_time <= previous_time) {
+        failSafe("nonmonotonic odometry timestamp");
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "Rejected nonmonotonic odometry timestamp: delta %.6f s",
+          (message_time - previous_time).seconds());
+        return;
+      }
+    }
     odom_ = msg;
   } catch (const std::exception & exception) {
     failSafe("exception while validating odometry");
@@ -266,9 +314,14 @@ void Go2Sdk2BridgeNode::enableCallback(
       return;
     }
     if (!request->data) {
-      enabled_ = false;
-      stopRobot("motion disabled by service");
-      response->success = !command_active_;
+      motion_authorization_.disarm();
+      path_.reset();
+      path_goal_generation_.reset();
+      path_progress_tracker_.reset();
+      completed_goal_latch_.clear();
+      heading_alignment_active_ = false;
+      const bool stopped = stopRobot("motion disabled by service");
+      response->success = stopped;
       response->message = command_active_ ?
         "Disable requested, but StopMove is not yet confirmed" : "Go2 motion disabled";
       return;
@@ -279,20 +332,41 @@ void Go2Sdk2BridgeNode::enableCallback(
       response->message = "Cannot enable: a /lowcmd publisher is active";
       return;
     }
-    if (command_active_) {
+    if (!motion_authorization_.armed() && command_active_) {
       response->success = false;
       response->message = "Cannot enable: waiting for StopMove confirmation";
       return;
     }
-    if (!cachedInputsValid() || !inputsFresh(now())) {
-      failSafe("invalid or stale inputs while enabling motion");
+    const rclcpp::Time current_time = now();
+    if (!cachedOdomValid() || !odomFresh(current_time)) {
+      failSafe("invalid or stale odometry while enabling motion");
       response->success = false;
-      response->message = "Cannot enable: body_path or odometry is invalid/missing/stale";
+      response->message = "Cannot arm: odometry is invalid, missing, or stale";
       return;
     }
-    enabled_ = true;
+    if (path_ && !cachedPathValid()) {
+      failSafe("invalid path while enabling motion");
+      response->success = false;
+      response->message = "Cannot arm: cached body path is invalid";
+      return;
+    }
+    if (path_ && !pathFresh(current_time)) {
+      if (!waitForNewPath("path timeout while enabling motion")) {
+        response->success = false;
+        response->message = "Cannot arm: StopMove is not confirmed";
+        return;
+      }
+    }
+    if (motion_authorization_.armed()) {
+      response->success = true;
+      response->message = motion_authorization_.executionAuthorized() ?
+        "Go2 motion is already armed" : "Go2 motion is already armed and waiting for a path";
+      return;
+    }
+    motion_authorization_.arm(path_ != nullptr);
     response->success = true;
-    response->message = "Go2 motion enabled";
+    response->message = path_ ?
+      "Go2 motion armed" : "Go2 motion armed; waiting for a fresh body path";
   } catch (const std::exception & exception) {
     failSafe("exception while changing motion state");
     if (response) {
@@ -332,18 +406,38 @@ void Go2Sdk2BridgeNode::controlTickImpl()
       "A /lowcmd publisher is active; SportClient motion is disabled");
     return;
   }
-  if (!enabled_) {
+  if (!motion_authorization_.armed()) {
     stopRobot("retrying unconfirmed stop while motion is disabled");
     return;
   }
   const rclcpp::Time current_time = now();
-  if (!cachedInputsValid()) {
-    failSafe("path or odometry became invalid");
-    RCLCPP_ERROR(get_logger(), "Cached path or odometry failed safety validation");
+  if (!cachedOdomValid()) {
+    failSafe("odometry became invalid");
+    RCLCPP_ERROR(get_logger(), "Cached odometry failed safety validation");
     return;
   }
-  if (!inputsFresh(current_time)) {
-    failSafe("path or odometry timeout");
+  if (!odomFresh(current_time)) {
+    failSafe("odometry timeout");
+    return;
+  }
+  if (!path_) {
+    waitForNewPath("waiting for a path");
+    return;
+  }
+  if (!cachedPathValid()) {
+    failSafe("path became invalid");
+    RCLCPP_ERROR(get_logger(), "Cached path failed safety validation");
+    return;
+  }
+  if (!pathFresh(current_time)) {
+    failSafe("path timeout");
+    return;
+  }
+  if (!motion_authorization_.executionAuthorized()) {
+    motion_authorization_.pathAvailable();
+  }
+  if (!motion_authorization_.executionAuthorized()) {
+    failSafe("path execution was not authorized");
     return;
   }
 
@@ -368,30 +462,75 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   if (goal_distance <= goal_position_tolerance_ &&
     std::abs(goal_yaw_error) <= goal_yaw_tolerance_)
   {
-    enabled_ = false;
-    stopRobot("goal reached");
+    if (!path_goal_generation_) {
+      failSafe("missing path goal generation at completion");
+      return;
+    }
+    completed_goal_latch_.markCompleted(*path_goal_generation_);
+    waitForNewPath("goal reached");
     return;
   }
 
-  const auto & target = path_->poses[selectLookaheadPose()].pose;
-  const double world_dx = target.position.x - current.position.x;
-  const double world_dy = target.position.y - current.position.y;
+  const auto tracking_target = path_progress_tracker_.update(
+    path_->poses, current.position.x, current.position.y, *current_yaw,
+    lookahead_distance_, heading_alignment_exit_angle_);
+  if (!tracking_target) {
+    failSafe("path progress could not be confirmed");
+    RCLCPP_ERROR(
+      get_logger(), "Stopped because bounded monotonic path progress could not be confirmed");
+    return;
+  }
+
+  const double world_dx = tracking_target->target_x - current.position.x;
+  const double world_dy = tracking_target->target_y - current.position.y;
   const double cos_yaw = std::cos(*current_yaw);
   const double sin_yaw = std::sin(*current_yaw);
   const double body_dx = cos_yaw * world_dx + sin_yaw * world_dy;
   const double body_dy = -sin_yaw * world_dx + cos_yaw * world_dy;
-  const auto target_yaw = quaternionYaw(target.orientation);
-  if (!target_yaw) {
+  const auto local_heading_yaw = quaternionYaw(
+    path_->poses[tracking_target->heading_pose].pose.orientation);
+  if (!local_heading_yaw) {
     failSafe("invalid target quaternion during command calculation");
     return;
   }
-  const double target_yaw_error = normalizeAngle(*target_yaw - *current_yaw);
+  const auto target_yaw_error = selectAlignmentYawError(
+    normalizeAngle(*local_heading_yaw - *current_yaw), goal_yaw_error,
+    goal_distance, goal_position_tolerance_);
+  if (!target_yaw_error) {
+    failSafe("invalid target heading selection");
+    return;
+  }
 
-  const double raw_vx = linear_gain_ * body_dx;
+  const auto gate_active = updateHeadingAlignmentGate(
+    heading_alignment_active_, *target_yaw_error,
+    heading_alignment_enter_angle_, heading_alignment_exit_angle_);
+  if (!gate_active) {
+    failSafe("invalid heading alignment calculation");
+    return;
+  }
+  const auto rotate_in_place = requireRotateInPlace(
+    *gate_active, tracking_target->explicit_rotation_waypoint, *target_yaw_error,
+    heading_alignment_exit_angle_, goal_distance, goal_position_tolerance_);
+  if (!rotate_in_place) {
+    failSafe("invalid rotate-in-place decision");
+    return;
+  }
+  heading_alignment_active_ = *rotate_in_place;
+
+  const auto raw_vx = rejectUnexpectedReverseCommand(
+    *rotate_in_place ? 0.0 : linear_gain_ * body_dx,
+    tracking_target->reverse_motion);
+  if (!raw_vx) {
+    failSafe("unplanned reverse command");
+    RCLCPP_ERROR(
+      get_logger(), "Rejected negative vx because the active path segment is not reverse");
+    return;
+  }
   const double raw_vy = linear_gain_ * body_dy;
-  const double raw_yaw_rate = yaw_gain_ * target_yaw_error;
-  const auto command = makeBoundedCommand(
-    raw_vx, raw_vy, raw_yaw_rate, max_vx_, max_vy_, max_yaw_rate_);
+  const double raw_yaw_rate = yaw_gain_ * (*target_yaw_error);
+  const auto command = makeHeadingAwareCommand(
+    *raw_vx, raw_vy, raw_yaw_rate, heading_alignment_active_,
+    max_vx_, max_vy_, max_yaw_rate_);
   if (!command) {
     failSafe("non-finite or invalid velocity command");
     RCLCPP_ERROR(get_logger(), "Rejected unsafe velocity command before SportClient::Move");
@@ -430,15 +569,34 @@ void Go2Sdk2BridgeNode::controlTickImpl()
 
 void Go2Sdk2BridgeNode::failSafe(const char * reason)
 {
-  enabled_ = false;
+  motion_authorization_.disarm();
   path_.reset();
+  path_goal_generation_.reset();
   odom_.reset();
+  path_progress_tracker_.reset();
+  completed_goal_latch_.clear();
+  heading_alignment_active_ = false;
   stopRobot(reason);
 }
 
-void Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
+bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
 {
-  if (!command_active_) {return;}
+  path_.reset();
+  path_goal_generation_.reset();
+  path_progress_tracker_.reset();
+  motion_authorization_.waitForPath();
+  heading_alignment_active_ = false;
+  const bool stopped = stopRobot(reason);
+  if (!stopped) {
+    motion_authorization_.disarm();
+    odom_.reset();
+  }
+  return stopped;
+}
+
+bool Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
+{
+  if (!command_active_) {return true;}
   try {
     const int32_t status = sport_client_->StopMove();
     if (status != 0) {
@@ -446,10 +604,11 @@ void Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
         get_logger(), *get_clock(), 3000,
         "SportClient::StopMove failed with status %d (%s); will retry",
         status, reason);
-      return;
+      return false;
     }
     command_active_ = false;
     RCLCPP_WARN(get_logger(), "Go2 stopped: %s", reason);
+    return true;
   } catch (const std::exception & exception) {
     try {
       RCLCPP_ERROR_THROTTLE(
@@ -458,6 +617,7 @@ void Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
     } catch (...) {
       std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw: %s\n", exception.what());
     }
+    return false;
   } catch (...) {
     try {
       RCLCPP_ERROR_THROTTLE(
@@ -466,15 +626,13 @@ void Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
     } catch (...) {
       std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw an unknown exception\n");
     }
+    return false;
   }
 }
 
-bool Go2Sdk2BridgeNode::cachedInputsValid() const
+bool Go2Sdk2BridgeNode::cachedPathValid() const
 {
-  if (!path_ || !odom_ || path_->poses.empty() ||
-    path_->header.frame_id != world_frame_ || odom_->header.frame_id != world_frame_ ||
-    odom_->child_frame_id != body_frame_ ||
-    !isFinitePose(odom_->pose.pose))
+  if (!path_ || path_->poses.empty() || path_->header.frame_id != world_frame_)
   {
     return false;
   }
@@ -486,13 +644,23 @@ bool Go2Sdk2BridgeNode::cachedInputsValid() const
     });
 }
 
-bool Go2Sdk2BridgeNode::inputsFresh(const rclcpp::Time & current_time) const
+bool Go2Sdk2BridgeNode::cachedOdomValid() const
+{
+  return odom_ && odom_->header.frame_id == world_frame_ &&
+         odom_->child_frame_id == body_frame_ && isFinitePose(odom_->pose.pose);
+}
+
+bool Go2Sdk2BridgeNode::pathFresh(const rclcpp::Time & current_time) const
 {
   const auto clock_type = current_time.get_clock_type();
-  return path_ && odom_ &&
-         messageStampFresh(
-           rclcpp::Time(path_->header.stamp, clock_type), current_time, path_timeout_) &&
-         messageStampFresh(
+  return path_ && messageStampFresh(
+           rclcpp::Time(path_->header.stamp, clock_type), current_time, path_timeout_);
+}
+
+bool Go2Sdk2BridgeNode::odomFresh(const rclcpp::Time & current_time) const
+{
+  const auto clock_type = current_time.get_clock_type();
+  return odom_ && messageStampFresh(
            rclcpp::Time(odom_->header.stamp, clock_type), current_time, odom_timeout_);
 }
 
@@ -515,29 +683,6 @@ bool Go2Sdk2BridgeNode::messageStampFresh(
 bool Go2Sdk2BridgeNode::lowcmdPublisherPresent()
 {
   return count_publishers("/lowcmd") > 0U;
-}
-
-std::size_t Go2Sdk2BridgeNode::selectLookaheadPose() const
-{
-  const auto & position = odom_->pose.pose.position;
-  std::size_t closest = 0;
-  double closest_distance = std::numeric_limits<double>::infinity();
-  for (std::size_t i = 0; i < path_->poses.size(); ++i) {
-    const auto & point = path_->poses[i].pose.position;
-    const double distance = std::hypot(point.x - position.x, point.y - position.y);
-    if (distance < closest_distance) {
-      closest = i;
-      closest_distance = distance;
-    }
-  }
-  double accumulated = 0.0;
-  for (std::size_t i = closest + 1; i < path_->poses.size(); ++i) {
-    const auto & previous = path_->poses[i - 1].pose.position;
-    const auto & current = path_->poses[i].pose.position;
-    accumulated += std::hypot(current.x - previous.x, current.y - previous.y);
-    if (accumulated >= lookahead_distance_) {return i;}
-  }
-  return path_->poses.size() - 1;
 }
 
 }  // namespace utree_go2_sdk2_bridge
