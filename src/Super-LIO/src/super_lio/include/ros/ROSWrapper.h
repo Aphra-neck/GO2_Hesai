@@ -40,6 +40,7 @@
 #include "basic/logs.h"
 #include "basic/Manifold.h"
 #include "common/ds.h"
+#include "common/measurement_synchronizer.h"
 #include "common/runtime_timing.h"
 
 #include "lio/ESKF.h"
@@ -75,7 +76,7 @@ public:
     imu_buffer_.clear();
     lidar_pushed_ = false;
     last_timestamp_imu_ = -1.0;
-    last_timestamp_lidar_ = -1.0;
+    measurement_synchronizer_ = MeasurementSynchronizer{};
   }
 
   void pub_odom(const NavState&);
@@ -148,7 +149,7 @@ private:
   std::deque<LidarData> lidar_buffer_;
   bool lidar_pushed_ = false;
   double last_timestamp_imu_ = -1.0;
-  double last_timestamp_lidar_ = -1.0;
+  MeasurementSynchronizer measurement_synchronizer_;
 
   InputCallbackTiming imu_callback_timing_;
   InputCallbackTiming lidar_callback_timing_;

@@ -2,6 +2,7 @@
 #include "lio/super_lio.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <utility>
 #include <sys/resource.h>
@@ -242,9 +243,22 @@ void SuperLIO::stateProcess(){
       timing_ms = timingElapsedMs(start_ns, timingNowNs());
     };
 
+  const double state_time_before_propagation = kf_->GetTime();
   evaluate_stage(
     [this]() { Propagation_Undistort(); }, "[Undistort]",
     runtime_timing_sample_.undistort_ms);
+  const double state_time_after_propagation = kf_->GetTime();
+  if (!std::isfinite(state_time_after_propagation) ||
+    state_time_after_propagation <= state_time_before_propagation)
+  {
+    LOG_EVERY_N(WARNING, 10)
+      << "[super_lio_sync] Dropped scan before map update/output because "
+      << "ESKF time did not advance: before="
+      << state_time_before_propagation << " after="
+      << state_time_after_propagation << " lidar_end="
+      << measures_.lidar.end_time << " imu_count=" << measures_.imu.size();
+    return;
+  }
   evaluate_stage(
     [this]() { DownSample(); }, "[DownSample]",
     runtime_timing_sample_.downsample_ms);
@@ -410,12 +424,19 @@ inline double get_cpu_time_seconds() {
 
 
 void SuperLIO::Propagation_Undistort(){
+  const double state_time_before_propagation = kf_->GetTime();
   propagate_states_.clear();
   propagate_states_.emplace_back(kf_->GetDynamicState());
   kf_->SetObsTime(measures_.lidar.end_time);
   for (auto &imu : measures_.imu) {
     kf_->Predict(imu);
     propagate_states_.emplace_back(kf_->GetDynamicState());
+  }
+
+  if (!std::isfinite(kf_->GetTime()) ||
+    kf_->GetTime() <= state_time_before_propagation)
+  {
+    return;
   }
 
   static const M3 TLI_R = g_lidar_imu.R_;

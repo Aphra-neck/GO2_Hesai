@@ -117,6 +117,12 @@ target_link_libraries(relocation_node
 )
 
 if(BUILD_TESTING)
+  ament_add_gtest(
+    test_measurement_synchronizer
+    test/test_measurement_synchronizer.cpp
+  )
+  target_include_directories(test_measurement_synchronizer PRIVATE include)
+
   ament_add_gtest(test_runtime_timing test/test_runtime_timing.cpp)
   target_include_directories(test_runtime_timing PRIVATE include)
 endif()

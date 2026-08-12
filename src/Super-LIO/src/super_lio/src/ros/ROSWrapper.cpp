@@ -747,18 +747,25 @@ bool ROSWrapper::sync_measure(
     populateSyncTiming(timing_sample);
     return false;
   }
-  if (imu_buffer_.empty()) {
-    setSyncWait(SyncWaitReason::NoImu);
-    populateSyncTiming(timing_sample);
-    return false;
-  }
 
   if (!lidar_pushed_) {
     meas.lidar = lidar_buffer_.front();
     lidar_pushed_ = true;
   }
 
-  if(last_timestamp_lidar_ > meas.lidar.end_time){
+  meas.imu.clear();
+  const MeasurementSyncResult sync_result = measurement_synchronizer_.evaluate(
+    meas.lidar.end_time, imu_buffer_,
+    [](const IMUData& imu) { return imu.secs; });
+
+  if (sync_result.action == MeasurementSyncAction::WaitForImu) {
+    setSyncWait(
+      imu_buffer_.empty() ? SyncWaitReason::NoImu : SyncWaitReason::ImuBehind);
+    populateSyncTiming(timing_sample);
+    return false;
+  }
+
+  if (sync_result.action == MeasurementSyncAction::DropNonmonotonicLidar) {
     lidar_buffer_.pop_front();
     lidar_pushed_ = false;
     setSyncWait(SyncWaitReason::NonmonotonicLidar);
@@ -766,24 +773,30 @@ bool ROSWrapper::sync_measure(
     return false;
   }
 
-  if (last_timestamp_imu_ < meas.lidar.end_time) {
-    setSyncWait(SyncWaitReason::ImuBehind);
+  for (std::size_t index = 0;
+    index < sync_result.consume_imu_count; ++index)
+  {
+    if (index >= sync_result.first_measurement_imu_index) {
+      meas.imu.push_back(imu_buffer_.front());
+    }
+    imu_buffer_.pop_front();
+  }
+
+  lidar_buffer_.pop_front();
+  lidar_pushed_ = false;
+
+  if (sync_result.action == MeasurementSyncAction::DropWithoutStateAdvance) {
+    meas.imu.clear();
+    LOG_EVERY_N(WARNING, 10)
+      << "[super_lio_sync] Dropped lidar frame without a new IMU sample in "
+      << "its closed scan interval: lidar_end=" << meas.lidar.end_time
+      << " latest_imu=" << last_timestamp_imu_
+      << " (logging every 10 drops)";
+    setSyncWait(SyncWaitReason::Ready);
     populateSyncTiming(timing_sample);
     return false;
   }
 
-  double imu_time = imu_buffer_.front().secs;
-  meas.imu.clear();
-  while ((!imu_buffer_.empty()) && (imu_time < meas.lidar.end_time)) {
-    imu_time = imu_buffer_.front().secs;
-    if (imu_time > meas.lidar.end_time) break;
-    meas.imu.push_back(imu_buffer_.front());
-    imu_buffer_.pop_front();
-  }
-
-  last_timestamp_lidar_ = meas.lidar.end_time;
-  lidar_buffer_.pop_front();
-  lidar_pushed_ = false;
   setSyncWait(SyncWaitReason::Ready);
   populateSyncTiming(timing_sample);
   timing_sample.lidar_source_stamp_sec = meas.lidar.start_time;
