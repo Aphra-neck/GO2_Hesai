@@ -68,9 +68,9 @@ private:
   bool heading_alignment_active_{false};
   double linear_gain_{1.0};
   double yaw_gain_{1.5};
-  double max_vx_{kValidatedMaxVx};
-  double max_vy_{kValidatedMaxVy};
-  double max_yaw_rate_{kValidatedMaxYawRate};
+  double max_vx_{};
+  double max_vy_{};
+  double max_yaw_rate_{};
   PathProgressTracker path_progress_tracker_;
   CompletedGoalLatch completed_goal_latch_;
   std::optional<std::int64_t> path_goal_generation_;

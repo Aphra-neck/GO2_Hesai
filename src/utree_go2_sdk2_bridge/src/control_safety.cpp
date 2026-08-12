@@ -65,7 +65,8 @@ void MotionAuthorization::disarm()
 
 std::string validateControlParameters(const ControlParameters & parameters)
 {
-  // These are hard rejection limits for the validated flat-ground stage.
+  // These are hard rejection limits, not operating recommendations. Runtime
+  // defaults live in the package YAML and remain below the SDK capability envelope.
   if (!inClosedRange(parameters.command_rate, 1.0, 200.0)) {
     return "command_rate must be finite and in [1, 200] Hz";
   }
@@ -103,14 +104,14 @@ std::string validateControlParameters(const ControlParameters & parameters)
   if (!inClosedRange(parameters.yaw_gain, 0.0, 20.0)) {
     return "yaw_gain must be finite and in [0, 20]";
   }
-  if (!inPositiveRange(parameters.max_vx, kValidatedMaxVx)) {
-    return "max_vx must be finite and in (0, 0.1] m/s";
+  if (!inPositiveRange(parameters.max_vx, kSdkMaxSymmetricVx)) {
+    return "max_vx must be finite and in (0, 2.5] m/s because it bounds both directions";
   }
-  if (!inPositiveRange(parameters.max_vy, kValidatedMaxVy)) {
-    return "max_vy must be finite and in (0, 0.05] m/s";
+  if (!inPositiveRange(parameters.max_vy, kSdkMaxAbsVy)) {
+    return "max_vy must be finite and in (0, 1] m/s";
   }
-  if (!inPositiveRange(parameters.max_yaw_rate, kValidatedMaxYawRate)) {
-    return "max_yaw_rate must be finite and in (0, 0.2] rad/s";
+  if (!inPositiveRange(parameters.max_yaw_rate, kSdkMaxAbsYawRate)) {
+    return "max_yaw_rate must be finite and in (0, 4] rad/s";
   }
   return {};
 }
@@ -302,7 +303,7 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       }
       return PathTrackingTarget{
         final.x, final.y, pose_index_, segment_fraction_, poses.size() - 1U,
-        false, false};
+        false, PlannedTranslationDirection::kForward};
     }
 
     const auto & start = poses[pose_index_].pose.position;
@@ -333,7 +334,8 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       }
       if (std::abs(yaw_error) > heading_alignment_tolerance) {
         return PathTrackingTarget{
-          start.x, start.y, pose_index_, 0.0, pose_index_ + 1U, true, false};
+          start.x, start.y, pose_index_, 0.0, pose_index_ + 1U, true,
+          PlannedTranslationDirection::kForward};
       }
       ++pose_index_;
       segment_fraction_ = 0.0;
@@ -434,28 +436,38 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
     if (!std::isfinite(forward_alignment)) {
       return std::nullopt;
     }
+    const PlannedTranslationDirection translation_direction =
+      std::abs(forward_alignment) <= kLateralForwardAlignmentTolerance ?
+      PlannedTranslationDirection::kLateral :
+      (forward_alignment < 0.0 ? PlannedTranslationDirection::kReverse :
+      PlannedTranslationDirection::kForward);
     return PathTrackingTarget{
       start.x + direction_x * target_progress,
       start.y + direction_y * target_progress,
       pose_index_, segment_fraction_, pose_index_, false,
-      forward_alignment < -same_direction_tolerance};
+      translation_direction};
   }
   return std::nullopt;
 }
 
-std::optional<double> rejectUnexpectedReverseCommand(
-  double raw_vx, bool reverse_motion, double tolerance)
+std::optional<double> filterLongitudinalCommand(
+  double raw_vx, PlannedTranslationDirection translation_direction, double tolerance)
 {
   if (!std::isfinite(raw_vx) || !std::isfinite(tolerance) || tolerance < 0.0) {
     return std::nullopt;
   }
-  if (reverse_motion) {
-    return raw_vx;
+  switch (translation_direction) {
+    case PlannedTranslationDirection::kLateral:
+      return 0.0;
+    case PlannedTranslationDirection::kReverse:
+      return raw_vx;
+    case PlannedTranslationDirection::kForward:
+      if (raw_vx < -tolerance) {
+        return std::nullopt;
+      }
+      return std::max(0.0, raw_vx);
   }
-  if (raw_vx < -tolerance) {
-    return std::nullopt;
-  }
-  return std::max(0.0, raw_vx);
+  return std::nullopt;
 }
 
 std::optional<std::int64_t> pathGoalGeneration(

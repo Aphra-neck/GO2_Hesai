@@ -1018,8 +1018,13 @@ ros2 service call /go2_sdk2_bridge/enable_motion \
 配置参数 `enabled` 是只读的启动保护并始终为 `false`，不代表运行期 armed 状态；以 service
 响应和 bridge 终端中的 `armed`/`waiting for a path` 日志为准。
 
-本阶段实机验证并锁定的速度硬上限为 `vx=0.10 m/s`、`vy=0.05 m/s`、
-`yaw_rate=0.20 rad/s`；YAML、launch、启动脚本和节点内部上限保持一致，运行期不能调高。
+标准 YAML 的速度上限为 `vx=0.60 m/s`、`vy=0.35 m/s`、
+`yaw_rate=0.80 rad/s`。launch 默认只加载 YAML，不再重复覆盖这些值；启动脚本会逐项打印
+最终值及来源。需要为单次运行调整时，只能在启动前显式设置 `GO2_MAX_VX`、
+`GO2_MAX_VY` 或 `GO2_MAX_YAW_RATE`，未设置的项继续采用 YAML。节点运行后这些参数保持只读。
+由于 `max_vx` 同时限制前进和后退，配置能力边界取 SDK 较小的反向极限 `2.5 m/s`；
+`max_vy` 和 `max_yaw_rate` 的能力边界分别为 `1.0 m/s` 与 `4.0 rad/s`。这些边界只是拒绝
+非法配置的 SDK 接口范围，不是建议现场直接使用的速度。
 局部航向误差达到 `45 deg` 时进入只转不平移，降到 `15 deg` 以内才恢复平移，避免阈值附近
 反复切换。
 
@@ -1090,6 +1095,10 @@ esac
 | `GO2_LOG_AUTO_FINALIZE` | `true` | `start_slam.sh` 正常退出时自动收尾并上传它自己创建的诊断会话；设为 `false` 时改为人工处理 |
 | `SLAM_LOG_DIR` | `~/slam_logs` | Hesai 和 IMU bridge 日志目录 |
 | `UNITREE_SDK_LIBRARY_DIR` | `/usr/local/lib` | Unitree SDK 配套 DDS 动态库目录 |
+| `GO2_SDK2_BRIDGE_CONFIG` | 仓库内 `go2_sdk2_bridge.yaml` | SDK2 bridge 参数文件；标准速度默认值只在该 YAML 中维护 |
+| `GO2_MAX_VX` | 未设置 | 仅为本次 bridge 启动显式覆盖 `max_vx`，启动摘要会标明来源 |
+| `GO2_MAX_VY` | 未设置 | 仅为本次 bridge 启动显式覆盖 `max_vy`，启动摘要会标明来源 |
+| `GO2_MAX_YAW_RATE` | 未设置 | 仅为本次 bridge 启动显式覆盖 `max_yaw_rate`，启动摘要会标明来源 |
 | `GO2_BODY_YAW_OFFSET_RAD` | `-1.5707963267948966` | IMU 到 `base_link` 的 yaw 校正 |
 | `GO2_LIDAR_OFFSET_X/Y/Z` | `0.171 / 0 / 0.0908` | 同时驱动 XT-16 静态 TF 与三维清除射线原点，仅安装外参复测后修改 |
 | `PLANNING_RVIZ` | `false` | 仅显式设为 `true` 时在 Jetson 启动规划 RViz |

@@ -20,6 +20,6 @@ go2_sdk2_bridge:
     heading_alignment_exit_angle: 0.2617993877991494
     linear_gain: 1.0
     yaw_gain: 1.5
-    max_vx: 0.1
-    max_vy: 0.05
-    max_yaw_rate: 0.2
+    max_vx: 0.6
+    max_vy: 0.35
+    max_yaw_rate: 0.8

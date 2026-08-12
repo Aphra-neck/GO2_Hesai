@@ -13,7 +13,7 @@ ControlParameters validParameters()
   return ControlParameters{
     20.0, 1.0, 0.5, 0.2, 0.6, 0.15, 0.2,
     0.7853981633974483, 0.2617993877991494,
-    1.0, 1.5, 0.1, 0.05, 0.2};
+    1.0, 1.5, 0.6, 0.35, 0.8};
 }
 
 geometry_msgs::msg::Pose validPose()
@@ -77,18 +77,27 @@ TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 }
 
-TEST(ControlParameters, RejectsValuesAboveTheValidatedFlatStageCaps)
+TEST(ControlParameters, AcceptsValuesWithinTheSdkCapabilityEnvelope)
 {
   auto parameters = validParameters();
-  parameters.max_vx = 0.100001;
+  parameters.max_vx = 2.5;
+  parameters.max_vy = 1.0;
+  parameters.max_yaw_rate = 4.0;
+  EXPECT_TRUE(validateControlParameters(parameters).empty());
+}
+
+TEST(ControlParameters, RejectsValuesAboveTheSdkCapabilityEnvelope)
+{
+  auto parameters = validParameters();
+  parameters.max_vx = 2.500001;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 
   parameters = validParameters();
-  parameters.max_vy = 0.050001;
+  parameters.max_vy = 1.000001;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 
   parameters = validParameters();
-  parameters.max_yaw_rate = 0.200001;
+  parameters.max_yaw_rate = 4.000001;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 }
 
@@ -304,10 +313,12 @@ TEST(PathProgress, OvershotCornerRotatesThenTargetsForwardWithoutBackingUp)
   const auto forward = tracker.update(poses, 0.42, 0.0, half_pi, 0.3, 0.2617993877991494);
   ASSERT_TRUE(forward.has_value());
   EXPECT_FALSE(forward->explicit_rotation_waypoint);
-  EXPECT_FALSE(forward->reverse_motion);
+  EXPECT_EQ(
+    forward->translation_direction, PlannedTranslationDirection::kForward);
   const double body_dx = forward->target_y;
   ASSERT_GT(body_dx, 0.0);
-  const auto filtered = rejectUnexpectedReverseCommand(body_dx, forward->reverse_motion);
+  const auto filtered = filterLongitudinalCommand(
+    body_dx, forward->translation_direction);
   ASSERT_TRUE(filtered.has_value());
   EXPECT_GT(*filtered, 0.0);
 }
@@ -375,13 +386,16 @@ TEST(PathProgress, RejectsLateralJumpAfterReachingTheFinalPose)
 
 TEST(CommandValidation, RejectsUnexpectedReverseButAllowsAnExplicitReverseSegment)
 {
-  EXPECT_FALSE(rejectUnexpectedReverseCommand(-0.02, false).has_value());
+  EXPECT_FALSE(filterLongitudinalCommand(
+      -0.02, PlannedTranslationDirection::kForward).has_value());
 
-  const auto numerical_noise = rejectUnexpectedReverseCommand(-1.0e-5, false);
+  const auto numerical_noise = filterLongitudinalCommand(
+    -1.0e-5, PlannedTranslationDirection::kForward);
   ASSERT_TRUE(numerical_noise.has_value());
   EXPECT_DOUBLE_EQ(*numerical_noise, 0.0);
 
-  const auto planned_reverse = rejectUnexpectedReverseCommand(-0.02, true);
+  const auto planned_reverse = filterLongitudinalCommand(
+    -0.02, PlannedTranslationDirection::kReverse);
   ASSERT_TRUE(planned_reverse.has_value());
   EXPECT_DOUBLE_EQ(*planned_reverse, -0.02);
 }
@@ -395,10 +409,82 @@ TEST(PathProgress, MarksAPlannerReversePrimitiveExplicitly)
   const auto target = tracker.update(poses, 0.0, 0.0, 0.0, 0.2, 0.1);
 
   ASSERT_TRUE(target.has_value());
-  EXPECT_TRUE(target->reverse_motion);
-  const auto command = rejectUnexpectedReverseCommand(target->target_x, true);
+  EXPECT_EQ(
+    target->translation_direction, PlannedTranslationDirection::kReverse);
+  const auto command = filterLongitudinalCommand(
+    target->target_x, target->translation_direction);
   ASSERT_TRUE(command.has_value());
   EXPECT_LT(*command, 0.0);
+}
+
+TEST(PathProgress, TreatsANearlyLateralSegmentWithoutLongitudinalMotion)
+{
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(0.0, 0.0, 0.0), pathPose(-0.015, 0.20, 0.0)};
+  PathProgressTracker tracker;
+
+  const auto target = tracker.update(poses, 0.0, 0.0, 0.0, 0.3, 0.2617993877991494);
+
+  ASSERT_TRUE(target.has_value());
+  EXPECT_EQ(
+    target->translation_direction, PlannedTranslationDirection::kLateral);
+  const auto command = filterLongitudinalCommand(
+    target->target_x, target->translation_direction);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_DOUBLE_EQ(*command, 0.0);
+}
+
+TEST(PathProgress, KeepsSmallDirectionJitterAroundNinetyDegreesLateral)
+{
+  for (const double x : {-0.02, 0.02}) {
+    const std::vector<geometry_msgs::msg::PoseStamped> poses{
+      pathPose(0.0, 0.0, 0.0), pathPose(x, 0.20, 0.0)};
+    PathProgressTracker tracker;
+
+    const auto target = tracker.update(
+      poses, 0.0, 0.0, 0.0, 0.3, 0.2617993877991494);
+
+    ASSERT_TRUE(target.has_value());
+    EXPECT_EQ(
+      target->translation_direction, PlannedTranslationDirection::kLateral);
+    const auto command = filterLongitudinalCommand(
+      target->target_x, target->translation_direction);
+    ASSERT_TRUE(command.has_value());
+    EXPECT_DOUBLE_EQ(*command, 0.0);
+  }
+}
+
+TEST(PathProgress, PreservesLongitudinalMotionForRoundedDiagonalPrimitives)
+{
+  constexpr double yaw_bin = 3.1415926535897932 / 8.0;
+  struct Case
+  {
+    double yaw;
+    double target_y;
+    PlannedTranslationDirection expected_direction;
+  };
+  for (const auto & test_case : std::vector<Case>{
+      {yaw_bin, 0.20, PlannedTranslationDirection::kForward},
+      {-yaw_bin, 0.20, PlannedTranslationDirection::kReverse},
+      {yaw_bin, -0.20, PlannedTranslationDirection::kReverse},
+      {-yaw_bin, -0.20, PlannedTranslationDirection::kForward}})
+  {
+    const std::vector<geometry_msgs::msg::PoseStamped> poses{
+      pathPose(0.0, 0.0, test_case.yaw),
+      pathPose(0.0, test_case.target_y, test_case.yaw)};
+    PathProgressTracker tracker;
+
+    const auto target = tracker.update(
+      poses, 0.0, 0.0, test_case.yaw, 0.3, 0.2617993877991494);
+
+    ASSERT_TRUE(target.has_value());
+    EXPECT_EQ(target->translation_direction, test_case.expected_direction);
+    const double body_dx = std::sin(test_case.yaw) * target->target_y;
+    const auto command = filterLongitudinalCommand(
+      body_dx, target->translation_direction);
+    ASSERT_TRUE(command.has_value());
+    EXPECT_NE(*command, 0.0);
+  }
 }
 
 TEST(CompletedGoal, ExtractsOneGoalGenerationFromEveryPathPose)

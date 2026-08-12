@@ -48,14 +48,11 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   yaw_gain_ = declare_parameter("yaw_gain", 1.5);
   rcl_interfaces::msg::ParameterDescriptor velocity_limit_descriptor;
   velocity_limit_descriptor.description =
-    "Read-only validated flat-ground stage safety limit";
+    "Read-only operating limit loaded from YAML or an explicit launch override";
   velocity_limit_descriptor.read_only = true;
-  max_vx_ = declare_parameter<double>(
-    "max_vx", kValidatedMaxVx, velocity_limit_descriptor);
-  max_vy_ = declare_parameter<double>(
-    "max_vy", kValidatedMaxVy, velocity_limit_descriptor);
-  max_yaw_rate_ = declare_parameter<double>(
-    "max_yaw_rate", kValidatedMaxYawRate, velocity_limit_descriptor);
+  max_vx_ = declare_parameter<double>("max_vx", velocity_limit_descriptor);
+  max_vy_ = declare_parameter<double>("max_vy", velocity_limit_descriptor);
+  max_yaw_rate_ = declare_parameter<double>("max_yaw_rate", velocity_limit_descriptor);
   world_frame_ = declare_parameter("world_frame", "world");
   body_frame_ = declare_parameter("body_frame", "base_link");
   const std::string path_topic = declare_parameter("path_topic", "/body_path");
@@ -517,9 +514,9 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   }
   heading_alignment_active_ = *rotate_in_place;
 
-  const auto raw_vx = rejectUnexpectedReverseCommand(
+  const auto raw_vx = filterLongitudinalCommand(
     *rotate_in_place ? 0.0 : linear_gain_ * body_dx,
-    tracking_target->reverse_motion);
+    tracking_target->translation_direction);
   if (!raw_vx) {
     failSafe("unplanned reverse command");
     RCLCPP_ERROR(

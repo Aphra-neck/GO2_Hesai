@@ -38,8 +38,12 @@ ament_target_dependencies(go2_sdk2_bridge_node
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_control_safety test/test_control_safety.cpp)
   target_link_libraries(test_control_safety control_safety)
+  ament_add_pytest_test(
+    test_go2_sdk2_bridge_launch
+    test/test_go2_sdk2_bridge_launch.py)
 endif()
 
 install(TARGETS go2_sdk2_bridge_node

@@ -12,14 +12,20 @@
 namespace utree_go2_sdk2_bridge
 {
 
-inline constexpr double kValidatedMaxVx = 0.1;
-inline constexpr double kValidatedMaxVy = 0.05;
-inline constexpr double kValidatedMaxYawRate = 0.2;
+// max_vx is a symmetric magnitude, so the SDK's -2.5 m/s reverse boundary is
+// the limiting side even though its forward boundary is +3.8 m/s.
+inline constexpr double kSdkMaxSymmetricVx = 2.5;
+inline constexpr double kSdkMaxAbsVy = 1.0;
+inline constexpr double kSdkMaxAbsYawRate = 4.0;
 inline constexpr double kRotationWaypointTolerance = 0.05;
 inline constexpr double kMaximumPathProgressAdvance = 0.4;
 inline constexpr double kMaximumPathCrossTrack = 0.05;
 inline constexpr double kSignedCornerReachTolerance = 1.0e-3;
 inline constexpr double kUnexpectedReverseTolerance = 1.0e-4;
+// The 16-bin planner's closest rounded diagonal is 22.5 degrees from lateral.
+// Split that interval at 11.25 degrees so grid jitter stays lateral while the
+// diagonal primitive keeps its longitudinal component: sin(pi / 16).
+inline constexpr double kLateralForwardAlignmentTolerance = 0.19509032201612825;
 
 struct ControlParameters
 {
@@ -46,6 +52,13 @@ struct VelocityCommand
   float yaw_rate;
 };
 
+enum class PlannedTranslationDirection
+{
+  kForward,
+  kLateral,
+  kReverse,
+};
+
 struct PathTrackingTarget
 {
   double target_x;
@@ -54,7 +67,7 @@ struct PathTrackingTarget
   double progress_fraction;
   std::size_t heading_pose;
   bool explicit_rotation_waypoint;
-  bool reverse_motion;
+  PlannedTranslationDirection translation_direction;
 };
 
 // Maintains bounded, monotonic progress on one Path message. Reset it whenever
@@ -163,11 +176,11 @@ std::optional<VelocityCommand> makeHeadingAwareCommand(
   double max_vy,
   double max_yaw_rate);
 
-// A path segment whose tangent points behind its planned body yaw is an
-// explicit reverse primitive. Every other segment must emit non-negative vx.
-std::optional<double> rejectUnexpectedReverseCommand(
+// Lateral primitives emit no longitudinal command. Only an explicit reverse
+// primitive may emit negative vx; forward primitives retain the fail-closed gate.
+std::optional<double> filterLongitudinalCommand(
   double raw_vx,
-  bool reverse_motion,
+  PlannedTranslationDirection translation_direction,
   double tolerance = kUnexpectedReverseTolerance);
 
 // Every pose in one non-empty Path carries the originating /goal_pose stamp.

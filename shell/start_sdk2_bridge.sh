@@ -5,10 +5,39 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 UNITREE_SDK_LIBRARY_DIR="${UNITREE_SDK_LIBRARY_DIR:-/usr/local/lib}"
-MAX_VX=0.1
-MAX_VY=0.05
-MAX_YAW_RATE=0.2
+BRIDGE_CONFIG="${GO2_SDK2_BRIDGE_CONFIG:-${WORKSPACE_DIR}/src/utree_go2_sdk2_bridge/config/go2_sdk2_bridge.yaml}"
 source "${SCRIPT_DIR}/ros2_environment.sh"
+
+yaml_number() {
+  local name="$1"
+  awk -v name="${name}" '
+    $1 == name ":" {
+      value = $2
+      sub(/[[:space:]]*#.*/, "", value)
+      print value
+      exit
+    }
+  ' "${BRIDGE_CONFIG}"
+}
+
+velocity_limit() {
+  local environment_name="$1" yaml_name="$2" value=''
+  if [[ -v "${environment_name}" ]]; then
+    value="${!environment_name}"
+    [[ -n "${value}" ]] || {
+      echo "${environment_name} must not be empty when set." >&2
+      return 1
+    }
+    printf '%s|environment: %s\n' "${value}" "${environment_name}"
+    return 0
+  fi
+  value="$(yaml_number "${yaml_name}")"
+  [[ -n "${value}" ]] || {
+    echo "Missing ${yaml_name} in bridge config: ${BRIDGE_CONFIG}" >&2
+    return 1
+  }
+  printf '%s|YAML: %s\n' "${value}" "${BRIDGE_CONFIG}"
+}
 
 checked_pgrep() {
   local pattern="$1"
@@ -71,6 +100,17 @@ if ! ros2 pkg prefix utree_go2_sdk2_bridge >/dev/null 2>&1; then
   echo "ROS 2 package is not installed: utree_go2_sdk2_bridge" >&2
   exit 1
 fi
+
+if [[ ! -r "${BRIDGE_CONFIG}" ]]; then
+  echo "SDK2 bridge config is not readable: ${BRIDGE_CONFIG}" >&2
+  exit 1
+fi
+
+IFS='|' read -r MAX_VX MAX_VX_SOURCE < <(velocity_limit GO2_MAX_VX max_vx)
+IFS='|' read -r MAX_VY MAX_VY_SOURCE < <(velocity_limit GO2_MAX_VY max_vy)
+IFS='|' read -r MAX_YAW_RATE MAX_YAW_RATE_SOURCE < <(
+  velocity_limit GO2_MAX_YAW_RATE max_yaw_rate
+)
 
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
   LD_LIBRARY_PATH="${UNITREE_SDK_LIBRARY_DIR}:${LD_LIBRARY_PATH}"
@@ -144,7 +184,10 @@ echo " ROS RMW: ${RMW_IMPLEMENTATION}"
 echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Motion: disarmed until one explicit operator authorization"
-echo " Validated velocity limits: vx=${MAX_VX} m/s, vy=${MAX_VY} m/s, yaw=${MAX_YAW_RATE} rad/s"
+echo " Velocity limits:"
+echo "   vx=${MAX_VX} m/s [${MAX_VX_SOURCE}]"
+echo "   vy=${MAX_VY} m/s [${MAX_VY_SOURCE}]"
+echo "   yaw=${MAX_YAW_RATE} rad/s [${MAX_YAW_RATE_SOURCE}]"
 echo "======================================"
 echo "In another Jetson terminal, verify the scene and arm once with:"
 echo "cd ${WORKSPACE_DIR}"
@@ -152,8 +195,13 @@ echo "source ./shell/ros2_environment.sh"
 echo "ros2 service call /go2_sdk2_bridge/enable_motion std_srvs/srv/SetBool '{data: true}'"
 echo "Normal goal completion keeps this authorization and waits for the next fresh path."
 
+launch_arguments=(
+  "config:=${BRIDGE_CONFIG}"
+  "network_interface:=${NETWORK_INTERFACE}"
+)
+[[ -v GO2_MAX_VX ]] && launch_arguments+=("max_vx:=${GO2_MAX_VX}")
+[[ -v GO2_MAX_VY ]] && launch_arguments+=("max_vy:=${GO2_MAX_VY}")
+[[ -v GO2_MAX_YAW_RATE ]] && launch_arguments+=("max_yaw_rate:=${GO2_MAX_YAW_RATE}")
+
 ros2 launch utree_go2_sdk2_bridge go2_sdk2_bridge.launch.py \
-  "network_interface:=${NETWORK_INTERFACE}" \
-  "max_vx:=${MAX_VX}" \
-  "max_vy:=${MAX_VY}" \
-  "max_yaw_rate:=${MAX_YAW_RATE}"
+  "${launch_arguments[@]}"
