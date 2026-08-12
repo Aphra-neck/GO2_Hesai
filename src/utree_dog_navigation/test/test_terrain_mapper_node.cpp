@@ -1012,7 +1012,7 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleSourceStampRollbackPublishesEmpty3DSta
   executor_.remove_node(flat_mapper);
 }
 
-TEST_F(TerrainMapperNodeTest, FlatObstacleUnmatchedCloudTimeoutPublishesEmpty3DState)
+TEST_F(TerrainMapperNodeTest, FlatObstacleUnmatchedCloudTimeoutPreservesValidatedEpoch)
 {
   const std::string namespace_name =
     "/flat_mapper_unmatched_timeout_" + std::to_string(instance_count_);
@@ -1076,12 +1076,14 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleUnmatchedCloudTimeoutPublishesEmpty3DS
   odom.pose.pose.position.z = 0.34;
   odom.pose.pose.orientation.w = 1.0;
   const std::vector<std::array<float, 3>> obstacle{{{0.80F, 0.30F, 0.12F}}};
+  builtin_interfaces::msg::Time ready_stamp;
   for (int frame = 0; frame < 2; ++frame) {
     spinFor(20ms);
-    const builtin_interfaces::msg::Time stamp = harness_node_->now();
-    odom.header.stamp = stamp;
+    ready_stamp = harness_node_->now();
+    odom.header.stamp = ready_stamp;
     flat_odom_pub->publish(odom);
-    flat_cloud_pub->publish(makeFlatSceneCloud(stamp, 0.0, 0.0, 0.0, obstacle));
+    flat_cloud_pub->publish(makeFlatSceneCloud(
+        ready_stamp, 0.0, 0.0, 0.0, obstacle));
   }
   ASSERT_TRUE(spinUntil(
       [&maps, &filtered_points, &filtered_maps]() {
@@ -1098,58 +1100,23 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleUnmatchedCloudTimeoutPublishesEmpty3DS
   const builtin_interfaces::msg::Time unmatched_stamp = harness_node_->now();
   flat_cloud_pub->publish(makeFlatSceneCloud(
       unmatched_stamp, 0.0, 0.0, 0.0, obstacle));
-  ASSERT_TRUE(spinUntil(
-      [&maps, &filtered_points, &filtered_maps, &unmatched_stamp]() {
-        return !maps.empty() && maps.back().traversability.empty() &&
-               maps.back().header.stamp.sec == unmatched_stamp.sec &&
-               maps.back().header.stamp.nanosec == unmatched_stamp.nanosec &&
-               !filtered_points.empty() && filtered_points.back().width == 0U &&
-               !filtered_maps.empty() && filtered_maps.back().width == 0U;
-      },
-      1s));
-
-  const std::array<float, 3> recovered_obstacle{{-0.80F, 0.30F, 0.22F}};
-  const std::vector<std::array<float, 3>> recovered_obstacles{{recovered_obstacle}};
-  maps.clear();
-  filtered_points.clear();
-  filtered_maps.clear();
-  spinFor(20ms);
-  const builtin_interfaces::msg::Time first_recovery_stamp = harness_node_->now();
-  odom.header.stamp = first_recovery_stamp;
-  flat_odom_pub->publish(odom);
-  flat_cloud_pub->publish(makeFlatSceneCloud(
-      first_recovery_stamp, 0.0, 0.0, 0.0, recovered_obstacles));
-  ASSERT_TRUE(spinUntil(
-      [&maps, &filtered_points, &filtered_maps, &first_recovery_stamp]() {
-        return !maps.empty() && maps.back().traversability.empty() &&
-               maps.back().header.stamp.sec == first_recovery_stamp.sec &&
-               maps.back().header.stamp.nanosec == first_recovery_stamp.nanosec &&
-               !filtered_points.empty() && filtered_points.back().width == 1U &&
-               !filtered_maps.empty() && filtered_maps.back().width == 0U;
-      },
-      1s));
-
-  maps.clear();
-  filtered_maps.clear();
-  spinFor(20ms);
-  const builtin_interfaces::msg::Time second_recovery_stamp = harness_node_->now();
-  odom.header.stamp = second_recovery_stamp;
-  flat_odom_pub->publish(odom);
-  flat_cloud_pub->publish(makeFlatSceneCloud(
-      second_recovery_stamp, 0.0, 0.0, 0.0, recovered_obstacles));
-  ASSERT_TRUE(spinUntil(
-      [&maps, &filtered_maps, &second_recovery_stamp]() {
-        return !maps.empty() && !maps.back().traversability.empty() &&
-               maps.back().header.stamp.sec == second_recovery_stamp.sec &&
-               maps.back().header.stamp.nanosec == second_recovery_stamp.nanosec &&
-               !filtered_maps.empty() && filtered_maps.back().width == 1U;
-      },
-      1s));
-  const auto recovered_points = pointCloudPoints(filtered_maps.back());
-  ASSERT_EQ(recovered_points.size(), 1U);
-  EXPECT_NEAR(recovered_points.front()[0], recovered_obstacle[0], 1.0e-4F);
-  EXPECT_NEAR(recovered_points.front()[1], recovered_obstacle[1], 1.0e-4F);
-  EXPECT_NEAR(recovered_points.front()[2], recovered_obstacle[2], 1.0e-4F);
+  for (int frame = 0; frame < 4; ++frame) {
+    spinFor(100ms);
+    ready_stamp = harness_node_->now();
+    odom.header.stamp = ready_stamp;
+    flat_odom_pub->publish(odom);
+    flat_cloud_pub->publish(makeFlatSceneCloud(
+        ready_stamp, 0.0, 0.0, 0.0, obstacle));
+  }
+  spinFor(50ms);
+  ASSERT_FALSE(maps.empty());
+  EXPECT_FALSE(maps.back().traversability.empty());
+  EXPECT_EQ(maps.back().header.stamp.sec, ready_stamp.sec);
+  EXPECT_EQ(maps.back().header.stamp.nanosec, ready_stamp.nanosec);
+  ASSERT_FALSE(filtered_points.empty());
+  EXPECT_EQ(filtered_points.back().width, 1U);
+  ASSERT_FALSE(filtered_maps.empty());
+  EXPECT_EQ(filtered_maps.back().width, 1U);
 
   executor_.remove_node(flat_mapper);
 }

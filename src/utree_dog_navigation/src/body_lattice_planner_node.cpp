@@ -321,10 +321,12 @@ void BodyLatticePlannerNode::requestPlan()
   }
   if (!result.success) {
     const auto start_status = verifiedFlatStartStatusName(result.start_status);
+    const auto failure_reason = planningFailureReasonName(result.failure_reason);
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), 3000,
-      "Planning failed after %d state expansions (start=%.*s)", result.expansions,
-      static_cast<int>(start_status.size()), start_status.data());
+      "Planning failed after %d state expansions (start=%.*s) reason=%.*s",
+      result.expansions, static_cast<int>(start_status.size()), start_status.data(),
+      static_cast<int>(failure_reason.size()), failure_reason.data());
     clearPath("planning failed");
     return;
   }

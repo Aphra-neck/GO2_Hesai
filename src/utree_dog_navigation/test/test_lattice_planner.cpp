@@ -170,6 +170,7 @@ TEST(LatticePlanner, FindsPathAcrossFlatTraversableMap)
   const auto result = planner.plan({1.5, 1.5, 0.0}, {6.5, 1.5, 0.0});
   ASSERT_TRUE(result.success);
   ASSERT_FALSE(result.states.empty());
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kNone);
   EXPECT_EQ(result.states.front().x, 1);
   EXPECT_EQ(result.states.back().x, 6);
 }
@@ -246,6 +247,7 @@ TEST(LatticePlanner, FlatObstacleModeRejectsTranslationThatRoundsToNoMovement)
 
   EXPECT_FALSE(result.success);
   EXPECT_LE(result.expansions, config.yaw_bins);
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kSearchExhausted);
 }
 
 TEST(LatticePlanner, FlatObstacleModeTurnsTowardClearPathBeforeTranslating)
@@ -390,6 +392,7 @@ TEST(LatticePlanner, FlatObstacleModeAppliesFootprintClearanceAtEndpoints)
 
   EXPECT_FALSE(result.success);
   EXPECT_EQ(result.expansions, 0);
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kExactStartCollision);
 }
 
 TEST(LatticePlanner, FlatObstacleModeValidatesExactStartPoseBeforeGridCenter)
@@ -410,7 +413,30 @@ TEST(LatticePlanner, FlatObstacleModeValidatesExactStartPoseBeforeGridCenter)
 
   EXPECT_FALSE(result.success);
   EXPECT_EQ(result.expansions, 0);
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kExactStartCollision);
   EXPECT_FALSE(result.include_exact_start);
+}
+
+TEST(LatticePlanner, FlatObstacleModeReportsUnavailableGoalFootprint)
+{
+  auto map = makeFlatObstacleMap(0.1F, 50, 30);
+  markFlatObstacle(map, 30, 10);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.flat_obstacle.footprint_length = 0.2;
+  config.flat_obstacle.footprint_width = 0.2;
+  config.flat_obstacle.obstacle_clearance = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({1.05, 1.05, 0.0}, {3.05, 1.05, 0.0});
+
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.expansions, 0);
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kGoalFootprintUnavailable);
 }
 
 TEST(LatticePlanner, FlatObstacleModeChecksCompleteLongitudinalSweep)
@@ -657,6 +683,7 @@ TEST(LatticePlanner, StopsSearchWhenCancellationIsRequested)
   EXPECT_FALSE(result.success);
   EXPECT_EQ(cancellation_checks, 3);
   EXPECT_LT(result.expansions, config.max_expansions);
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kCancelled);
 }
 
 TEST(LatticePlanner, RejectsSnapCandidateOutsideEuclideanRadius)
@@ -835,6 +862,7 @@ TEST(LatticePlanner, VerifiedFlatBlindRingIsDisabledByDefault)
 
   EXPECT_FALSE(result.success);
   EXPECT_EQ(result.start_status, VerifiedFlatStartStatus::kDisabled);
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kStartTerrainUnavailable);
 }
 
 TEST(LatticePlanner, RejectsInvalidVerifiedFlatConfigurationAtConstruction)

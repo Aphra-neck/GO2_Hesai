@@ -100,6 +100,23 @@ enum class VerifiedFlatStartStatus : std::uint8_t
 
 std::string_view verifiedFlatStartStatusName(VerifiedFlatStartStatus status) noexcept;
 
+enum class PlanningFailureReason : std::uint8_t
+{
+  kNone,
+  kInvalidInput,
+  kEndpointOutsideMap,
+  kExactStartCollision,
+  kStartGridSnapCollision,
+  kGoalFootprintUnavailable,
+  kStartTerrainUnavailable,
+  kGoalTerrainUnavailable,
+  kCancelled,
+  kSearchExhausted,
+  kExpansionLimit,
+};
+
+std::string_view planningFailureReasonName(PlanningFailureReason reason) noexcept;
+
 struct PlannedGridState
 {
   int x{0};
@@ -116,6 +133,7 @@ struct PlanningResult
   bool success{false};
   int expansions{0};
   double path_cost{0.0};
+  PlanningFailureReason failure_reason{PlanningFailureReason::kNone};
   VerifiedFlatStartStatus start_status{VerifiedFlatStartStatus::kNotNeeded};
   bool include_exact_start{false};
   bool exact_start_inferred{false};

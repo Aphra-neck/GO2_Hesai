@@ -646,22 +646,17 @@ void TerrainMapperNode::prunePendingFlatClouds(
   std::chrono::steady_clock::time_point current_time)
 {
   std::size_t dropped = 0U;
-  builtin_interfaces::msg::Time newest_dropped_stamp;
   while (!pending_flat_clouds_.empty() &&
     current_time - pending_flat_clouds_.front().received_at > kPendingFlatCloudMaxWait)
   {
-    newest_dropped_stamp = pending_flat_clouds_.front().message->header.stamp;
     pending_flat_clouds_.pop_front();
     ++dropped;
   }
   if (dropped != 0U) {
-    FlatBodyPose reset_pose = last_processed_flat_pose_;
-    reset_pose.stamp = newest_dropped_stamp;
-    invalidateFlatEpoch(reset_pose);
-    RCLCPP_WARN(
-      get_logger(),
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
       "Dropped %zu flat obstacle cloud(s) without exact-timestamp body odometry; "
-      "invalidated the map epoch",
+      "kept the last validated map epoch",
       dropped);
   }
 }

@@ -98,6 +98,24 @@ std::string_view verifiedFlatStartStatusName(VerifiedFlatStartStatus status) noe
   return "unknown";
 }
 
+std::string_view planningFailureReasonName(PlanningFailureReason reason) noexcept
+{
+  switch (reason) {
+    case PlanningFailureReason::kNone: return "none";
+    case PlanningFailureReason::kInvalidInput: return "invalid_input";
+    case PlanningFailureReason::kEndpointOutsideMap: return "endpoint_outside_map";
+    case PlanningFailureReason::kExactStartCollision: return "exact_start_collision";
+    case PlanningFailureReason::kStartGridSnapCollision: return "start_grid_snap_collision";
+    case PlanningFailureReason::kGoalFootprintUnavailable: return "goal_footprint_unavailable";
+    case PlanningFailureReason::kStartTerrainUnavailable: return "start_terrain_unavailable";
+    case PlanningFailureReason::kGoalTerrainUnavailable: return "goal_terrain_unavailable";
+    case PlanningFailureReason::kCancelled: return "cancelled";
+    case PlanningFailureReason::kSearchExhausted: return "search_exhausted";
+    case PlanningFailureReason::kExpansionLimit: return "expansion_limit";
+  }
+  return "unknown";
+}
+
 LatticePlanner::LatticePlanner(LatticePlannerConfig config) : config_(std::move(config))
 {
   config_.yaw_bins = std::max(8, config_.yaw_bins);
@@ -190,13 +208,18 @@ PlanningResult LatticePlanner::plan(
 {
   PlanningResult result;
   if (!mapValid() || !finiteWorldState(start_world) || !finiteWorldState(goal_world)) {
+    result.failure_reason = PlanningFailureReason::kInvalidInput;
     return result;
   }
 
   SearchState start;
   GridState goal;
   if (!toGrid(start_world.x, start_world.y, start.grid.x, start.grid.y) ||
-    !toGrid(goal_world.x, goal_world.y, goal.x, goal.y)) {return result;}
+    !toGrid(goal_world.x, goal_world.y, goal.x, goal.y))
+  {
+    result.failure_reason = PlanningFailureReason::kEndpointOutsideMap;
+    return result;
+  }
   start.grid.yaw = yawBin(start_world.yaw);
   goal.yaw = yawBin(goal_world.yaw);
 
@@ -207,13 +230,21 @@ PlanningResult LatticePlanner::plan(
     const double grid_start_y =
       map_->origin_y + (static_cast<double>(start.grid.y) + 0.5) * map_->resolution;
     const double grid_start_yaw = yawAngle(start.grid.yaw);
-    if (!flatWorldPoseCollisionFree(start_world.x, start_world.y, start_world.yaw) ||
-      !flatPoseSweepCollisionFree(
+    if (!flatWorldPoseCollisionFree(start_world.x, start_world.y, start_world.yaw)) {
+      result.failure_reason = PlanningFailureReason::kExactStartCollision;
+      return result;
+    }
+    if (!flatPoseSweepCollisionFree(
         start_world.x, start_world.y, start_world.yaw,
-        grid_start_x, grid_start_y, grid_start_yaw) ||
-      !nearestFlatValid(
+        grid_start_x, grid_start_y, grid_start_yaw))
+    {
+      result.failure_reason = PlanningFailureReason::kStartGridSnapCollision;
+      return result;
+    }
+    if (!nearestFlatValid(
         goal_world.x, goal_world.y, config_.snap_radius, goal.yaw, goal.x, goal.y))
     {
+      result.failure_reason = PlanningFailureReason::kGoalFootprintUnavailable;
       return result;
     }
     result.include_exact_start = true;
@@ -225,17 +256,23 @@ PlanningResult LatticePlanner::plan(
     {
       if (!config_.verified_flat_start.enabled) {
         result.start_status = VerifiedFlatStartStatus::kDisabled;
+        result.failure_reason = PlanningFailureReason::kStartTerrainUnavailable;
         return result;
       }
       result.start_status = buildVerifiedFlatOverlay(start_world.x, start_world.y, overlay);
-      if (result.start_status != VerifiedFlatStartStatus::kApplied) {return result;}
+      if (result.start_status != VerifiedFlatStartStatus::kApplied) {
+        result.failure_reason = PlanningFailureReason::kStartTerrainUnavailable;
+        return result;
+      }
       if (!overlayCell(start.grid.x, start.grid.y, overlay)) {
         result.start_status = VerifiedFlatStartStatus::kNoInferredStartCell;
+        result.failure_reason = PlanningFailureReason::kStartTerrainUnavailable;
         return result;
       }
       start.inferred_prefix = true;
       if (!inferredStartConnectsToObserved(start, overlay)) {
         result.start_status = VerifiedFlatStartStatus::kNoObservedConnection;
+        result.failure_reason = PlanningFailureReason::kStartTerrainUnavailable;
         return result;
       }
       result.exact_start_inferred = true;
@@ -244,7 +281,11 @@ PlanningResult LatticePlanner::plan(
       result.exact_start_dzdy = overlay.plane_y;
     }
     if (!nearestObservedValid(
-        goal_world.x, goal_world.y, config_.snap_radius, goal.x, goal.y)) {return result;}
+        goal_world.x, goal_world.y, config_.snap_radius, goal.x, goal.y))
+    {
+      result.failure_reason = PlanningFailureReason::kGoalTerrainUnavailable;
+      return result;
+    }
   }
 
   const auto planner_motions = motions();
@@ -258,7 +299,10 @@ PlanningResult LatticePlanner::plan(
   std::uint64_t reached_key = 0;
 
   while (!open.empty() && result.expansions < config_.max_expansions) {
-    if (cancellation_requested && cancellation_requested()) {return result;}
+    if (cancellation_requested && cancellation_requested()) {
+      result.failure_reason = PlanningFailureReason::kCancelled;
+      return result;
+    }
     const QueueItem item = open.top();
     open.pop();
     auto current_record = records.find(item.key);
@@ -292,7 +336,11 @@ PlanningResult LatticePlanner::plan(
     }
   }
 
-  if (!result.success) {return result;}
+  if (!result.success) {
+    result.failure_reason = result.expansions >= config_.max_expansions && !open.empty() ?
+      PlanningFailureReason::kExpansionLimit : PlanningFailureReason::kSearchExhausted;
+    return result;
+  }
   for (std::uint64_t cursor = reached_key;;) {
     result.states.push_back(plannedState(decode(cursor), overlay));
     const auto & record = records.at(cursor);
