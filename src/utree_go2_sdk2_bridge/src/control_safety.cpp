@@ -98,6 +98,13 @@ std::string validateControlParameters(const ControlParameters & parameters)
   {
     return "heading_alignment_exit_angle must be finite and in [0, enter_angle) radians";
   }
+  if (!inPositiveRange(
+      parameters.explicit_rotation_tolerance,
+      parameters.heading_alignment_exit_angle) ||
+    parameters.explicit_rotation_tolerance >= parameters.heading_alignment_exit_angle)
+  {
+    return "explicit_rotation_tolerance must be finite and in (0, exit_angle) radians";
+  }
   if (!inClosedRange(parameters.linear_gain, 0.0, 20.0)) {
     return "linear_gain must be finite and in [0, 20]";
   }
@@ -203,7 +210,9 @@ std::optional<double> selectAlignmentYawError(
   double local_yaw_error,
   double goal_yaw_error,
   double goal_distance,
-  double goal_position_tolerance)
+  double goal_position_tolerance,
+  bool explicit_rotation_waypoint,
+  bool pending_explicit_rotation)
 {
   if (!std::isfinite(local_yaw_error) || !std::isfinite(goal_yaw_error) ||
     !inClosedRange(goal_distance, 0.0, std::numeric_limits<double>::max()) ||
@@ -211,27 +220,51 @@ std::optional<double> selectAlignmentYawError(
   {
     return std::nullopt;
   }
-  return goal_distance <= goal_position_tolerance ? goal_yaw_error : local_yaw_error;
+  return !explicit_rotation_waypoint && !pending_explicit_rotation &&
+         goal_distance <= goal_position_tolerance ?
+         goal_yaw_error : local_yaw_error;
+}
+
+std::optional<bool> goalCompletionReady(
+  double goal_distance,
+  double goal_yaw_error,
+  double goal_position_tolerance,
+  double goal_yaw_tolerance,
+  const std::optional<PathTrackingTarget> & tracking_target)
+{
+  if (!tracking_target ||
+    !inClosedRange(goal_distance, 0.0, std::numeric_limits<double>::max()) ||
+    !std::isfinite(goal_yaw_error) ||
+    !inPositiveRange(goal_position_tolerance, std::numeric_limits<double>::max()) ||
+    !inPositiveRange(goal_yaw_tolerance, kPi))
+  {
+    return std::nullopt;
+  }
+  return !tracking_target->pending_explicit_rotation &&
+         goal_distance <= goal_position_tolerance &&
+         std::abs(std::remainder(goal_yaw_error, 2.0 * kPi)) <= goal_yaw_tolerance;
 }
 
 std::optional<bool> requireRotateInPlace(
   bool hysteresis_gate_active,
   bool explicit_rotation_waypoint,
   double yaw_error,
-  double alignment_exit_angle,
+  double explicit_rotation_tolerance,
   double goal_distance,
-  double goal_position_tolerance)
+  double goal_position_tolerance,
+  bool pending_explicit_rotation)
 {
   if (!std::isfinite(yaw_error) ||
-    !inClosedRange(alignment_exit_angle, 0.0, kPi) ||
+    !inClosedRange(explicit_rotation_tolerance, 0.0, kPi) ||
     !inClosedRange(goal_distance, 0.0, std::numeric_limits<double>::max()) ||
     !inPositiveRange(goal_position_tolerance, std::numeric_limits<double>::max()))
   {
     return std::nullopt;
   }
   const double absolute_error = std::abs(std::remainder(yaw_error, 2.0 * kPi));
-  return hysteresis_gate_active || goal_distance <= goal_position_tolerance ||
-         (explicit_rotation_waypoint && absolute_error > alignment_exit_angle);
+  return hysteresis_gate_active ||
+         (!pending_explicit_rotation && goal_distance <= goal_position_tolerance) ||
+         (explicit_rotation_waypoint && absolute_error > explicit_rotation_tolerance);
 }
 
 std::optional<VelocityCommand> makeHeadingAwareCommand(
@@ -265,14 +298,14 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
   double current_y,
   double current_yaw,
   double lookahead_distance,
-  double heading_alignment_tolerance)
+  double explicit_rotation_tolerance)
 {
   constexpr double same_position_tolerance = 1.0e-6;
   constexpr double same_direction_tolerance = 1.0e-6;
   if (poses.empty() || !std::isfinite(current_x) || !std::isfinite(current_y) ||
     !std::isfinite(current_yaw) ||
     !inPositiveRange(lookahead_distance, std::numeric_limits<double>::max()) ||
-    !inClosedRange(heading_alignment_tolerance, 0.0, kPi))
+    !inClosedRange(explicit_rotation_tolerance, 0.0, kPi))
   {
     return std::nullopt;
   }
@@ -292,6 +325,19 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
     return std::nullopt;
   }
 
+  const auto has_pending_rotation = [&poses](std::size_t first_pose) {
+      for (std::size_t index = first_pose; index + 1U < poses.size(); ++index) {
+        const auto & first = poses[index].pose.position;
+        const auto & second = poses[index + 1U].pose.position;
+        if (std::hypot(second.x - first.x, second.y - first.y) <=
+          same_position_tolerance)
+        {
+          return true;
+        }
+      }
+      return false;
+    };
+
   // Each pass either consumes one reached corner/rotation or returns a target.
   // The bound prevents malformed zero-length paths from looping indefinitely.
   for (std::size_t pass = 0U; pass <= poses.size(); ++pass) {
@@ -303,7 +349,7 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       }
       return PathTrackingTarget{
         final.x, final.y, pose_index_, segment_fraction_, poses.size() - 1U,
-        false, PlannedTranslationDirection::kForward};
+        false, false, PlannedTranslationDirection::kForward};
     }
 
     const auto & start = poses[pose_index_].pose.position;
@@ -332,10 +378,10 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       if (!std::isfinite(yaw_error)) {
         return std::nullopt;
       }
-      if (std::abs(yaw_error) > heading_alignment_tolerance) {
+      if (std::abs(yaw_error) > explicit_rotation_tolerance) {
         return PathTrackingTarget{
           start.x, start.y, pose_index_, 0.0, pose_index_ + 1U, true,
-          PlannedTranslationDirection::kForward};
+          true, PlannedTranslationDirection::kForward};
       }
       ++pose_index_;
       segment_fraction_ = 0.0;
@@ -445,6 +491,7 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       start.x + direction_x * target_progress,
       start.y + direction_y * target_progress,
       pose_index_, segment_fraction_, pose_index_, false,
+      has_pending_rotation(pose_index_),
       translation_direction};
   }
   return std::nullopt;

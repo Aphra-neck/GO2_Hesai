@@ -65,6 +65,7 @@ private:
   double goal_yaw_tolerance_{0.20};
   double heading_alignment_enter_angle_{0.7853981633974483};
   double heading_alignment_exit_angle_{0.2617993877991494};
+  double explicit_rotation_tolerance_{0.05};
   bool heading_alignment_active_{false};
   double linear_gain_{1.0};
   double yaw_gain_{1.5};

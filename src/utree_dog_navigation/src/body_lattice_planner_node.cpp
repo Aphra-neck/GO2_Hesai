@@ -516,6 +516,21 @@ nav_msgs::msg::Path BodyLatticePlannerNode::makePath(
     pose.pose.position.z = planning_mode_ == PlanningMode::kFlatObstacle ?
       flat_body_height_z_ : elevation + nominal_body_height_;
     pose.pose.orientation = tf2::toMsg(orientation);
+    if (!path.poses.empty()) {
+      const auto & previous = path.poses.back().pose;
+      const double orientation_dot =
+        previous.orientation.x * pose.pose.orientation.x +
+        previous.orientation.y * pose.pose.orientation.y +
+        previous.orientation.z * pose.pose.orientation.z +
+        previous.orientation.w * pose.pose.orientation.w;
+      if (std::abs(previous.position.x - pose.pose.position.x) <= 1.0e-6 &&
+        std::abs(previous.position.y - pose.pose.position.y) <= 1.0e-6 &&
+        std::abs(previous.position.z - pose.pose.position.z) <= 1.0e-6 &&
+        std::abs(std::abs(orientation_dot) - 1.0) <= 1.0e-6)
+      {
+        return;
+      }
+    }
     path.poses.push_back(pose);
     };
 
@@ -537,6 +552,14 @@ nav_msgs::msg::Path BodyLatticePlannerNode::makePath(
         first_grid_state = 1U;
       }
     }
+  }
+
+  if (result.start_connector_translation && !result.states.empty()) {
+    const auto & start = result.states.front();
+    append_pose(
+      map.origin_x + (start.x + 0.5) * map.resolution,
+      map.origin_y + (start.y + 0.5) * map.resolution,
+      start.elevation, start.dzdx, start.dzdy, exact_start.yaw);
   }
 
   for (std::size_t index = first_grid_state; index < result.states.size(); ++index) {

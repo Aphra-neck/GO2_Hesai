@@ -112,9 +112,10 @@ body_lattice_planner:
     # bounded start-only allowance separate from goal snapping.
     start_snap_radius: 0.55
     snap_radius: 0.50
-    flat_obstacle.footprint_length: 0.90
-    flat_obstacle.footprint_width: 0.55
-    flat_obstacle.obstacle_clearance: 0.10
+    # Initial deployment uses a tight body envelope; tune dynamic leg margin later.
+    flat_obstacle.footprint_length: 0.80
+    flat_obstacle.footprint_width: 0.45
+    flat_obstacle.obstacle_clearance: 0.00
     verified_flat_start.enabled: false
     verified_flat_start.support_inner_radius: 1.0
     verified_flat_start.support_outer_radius: 2.5

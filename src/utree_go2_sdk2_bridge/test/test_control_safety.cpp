@@ -13,7 +13,7 @@ ControlParameters validParameters()
   return ControlParameters{
     20.0, 1.0, 0.5, 0.2, 0.6, 0.15, 0.2,
     0.7853981633974483, 0.2617993877991494,
-    1.0, 1.5, 0.6, 0.35, 0.8};
+    0.05, 1.0, 1.5, 0.6, 0.35, 0.8};
 }
 
 geometry_msgs::msg::Pose validPose()
@@ -70,6 +70,10 @@ TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
 
   parameters = validParameters();
   parameters.heading_alignment_exit_angle = parameters.heading_alignment_enter_angle;
+  EXPECT_FALSE(validateControlParameters(parameters).empty());
+
+  parameters = validParameters();
+  parameters.explicit_rotation_tolerance = parameters.heading_alignment_exit_angle;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 
   parameters = validParameters();
@@ -189,6 +193,54 @@ TEST(HeadingAlignment, UsesFinalGoalYawInsideTheGoalPositionTolerance)
   const auto at_goal_position = selectAlignmentYawError(0.0, 1.2, 0.10, 0.15);
   ASSERT_TRUE(at_goal_position.has_value());
   EXPECT_DOUBLE_EQ(*at_goal_position, 1.2);
+
+  const auto explicit_rotation = selectAlignmentYawError(
+    0.25, 0.0, 0.10, 0.15, true);
+  ASSERT_TRUE(explicit_rotation.has_value());
+  EXPECT_DOUBLE_EQ(*explicit_rotation, 0.25);
+}
+
+TEST(HeadingAlignment, PendingExplicitRotationPreventsEarlyGoalCompletion)
+{
+  constexpr double snap_yaw = 0.19634954084936207;
+  constexpr double explicit_tolerance = 0.05;
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(0.0, 0.0, 0.0),
+    pathPose(0.0, 0.0, snap_yaw),
+    pathPose(0.1, 0.0, snap_yaw)};
+  PathProgressTracker tracker;
+
+  const auto target = tracker.update(
+    poses, 0.0, 0.0, 0.0, 0.3, explicit_tolerance);
+  ASSERT_TRUE(target.has_value());
+  ASSERT_TRUE(target->explicit_rotation_waypoint);
+
+  const auto completion = goalCompletionReady(
+    0.1, snap_yaw, 0.15, 0.20, target);
+  ASSERT_TRUE(completion.has_value());
+  EXPECT_FALSE(*completion);
+
+  const std::optional<PathTrackingTarget> invalid_target;
+  EXPECT_FALSE(goalCompletionReady(
+      0.0, 0.0, 0.15, 0.20, invalid_target).has_value());
+
+  const auto yaw_error = selectAlignmentYawError(
+    snap_yaw, snap_yaw, 0.1, 0.15, target->explicit_rotation_waypoint);
+  ASSERT_TRUE(yaw_error.has_value());
+  EXPECT_DOUBLE_EQ(*yaw_error, snap_yaw);
+
+  const auto rotate = requireRotateInPlace(
+    false, target->explicit_rotation_waypoint, *yaw_error,
+    explicit_tolerance, 0.1, 0.15);
+  ASSERT_TRUE(rotate.has_value());
+  ASSERT_TRUE(*rotate);
+
+  const auto command = makeHeadingAwareCommand(
+    0.1, 0.0, *yaw_error, *rotate, 0.6, 0.35, 0.8);
+  ASSERT_TRUE(command.has_value());
+  EXPECT_FLOAT_EQ(command->vx, 0.0F);
+  EXPECT_FLOAT_EQ(command->vy, 0.0F);
+  EXPECT_GT(command->yaw_rate, 0.0F);
 }
 
 TEST(HeadingAlignment, ExplicitOneBinTurnStillRequiresRotateOnlyExecution)
@@ -292,6 +344,73 @@ TEST(PathProgress, RequiresSignedIncomingProgressBeforeConsumingACornerTurn)
   ASSERT_TRUE(crossed.has_value());
   EXPECT_EQ(crossed->heading_pose, 2U);
   EXPECT_TRUE(crossed->explicit_rotation_waypoint);
+}
+
+TEST(PathProgress, PreservesASmallExplicitStartSnapRotation)
+{
+  constexpr double snap_yaw = 0.19634954084936207;
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(-0.1, -0.1, 0.0),
+    pathPose(-0.1, -0.1, snap_yaw),
+    pathPose(0.1, -0.1, snap_yaw)};
+  PathProgressTracker tracker;
+
+  const auto rotate = tracker.update(
+    poses, -0.1, -0.1, 0.0, 0.3, 0.05);
+
+  ASSERT_TRUE(rotate.has_value());
+  EXPECT_TRUE(rotate->explicit_rotation_waypoint);
+  EXPECT_EQ(rotate->heading_pose, 1U);
+  EXPECT_NEAR(rotate->target_x, -0.1, 1.0e-12);
+  EXPECT_NEAR(rotate->target_y, -0.1, 1.0e-12);
+
+  const auto forward = tracker.update(
+    poses, -0.1, -0.1, snap_yaw - 0.04, 0.3, 0.05);
+  ASSERT_TRUE(forward.has_value());
+  EXPECT_FALSE(forward->explicit_rotation_waypoint);
+  EXPECT_EQ(forward->heading_pose, 1U);
+}
+
+TEST(PathProgress, ReportsPendingRotationAcrossAShortStartConnector)
+{
+  constexpr double snap_yaw = 0.19634954084936207;
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(0.0, 0.0, 0.0),
+    pathPose(0.08, 0.0, 0.0),
+    pathPose(0.08, 0.0, snap_yaw),
+    pathPose(0.10, 0.0, snap_yaw)};
+  PathProgressTracker tracker;
+
+  const auto connector = tracker.update(poses, 0.0, 0.0, 0.0, 0.03, 0.05);
+  ASSERT_TRUE(connector.has_value());
+  EXPECT_FALSE(connector->explicit_rotation_waypoint);
+  EXPECT_TRUE(connector->pending_explicit_rotation);
+  const auto connector_yaw_error = selectAlignmentYawError(
+    0.0, snap_yaw, 0.10, 0.15, connector->explicit_rotation_waypoint,
+    connector->pending_explicit_rotation);
+  ASSERT_TRUE(connector_yaw_error.has_value());
+  EXPECT_DOUBLE_EQ(*connector_yaw_error, 0.0);
+  const auto connector_rotate = requireRotateInPlace(
+    false, connector->explicit_rotation_waypoint, *connector_yaw_error,
+    0.05, 0.10, 0.15, connector->pending_explicit_rotation);
+  ASSERT_TRUE(connector_rotate.has_value());
+  EXPECT_FALSE(*connector_rotate);
+  const auto connector_command = makeHeadingAwareCommand(
+    connector->target_x, connector->target_y, *connector_yaw_error,
+    *connector_rotate, 0.6, 0.35, 0.8);
+  ASSERT_TRUE(connector_command.has_value());
+  EXPECT_GT(connector_command->vx, 0.0F);
+
+  const auto rotate = tracker.update(poses, 0.08, 0.0, 0.0, 0.03, 0.05);
+  ASSERT_TRUE(rotate.has_value());
+  EXPECT_TRUE(rotate->explicit_rotation_waypoint);
+  EXPECT_TRUE(rotate->pending_explicit_rotation);
+
+  const auto suffix = tracker.update(
+    poses, 0.08, 0.0, snap_yaw - 0.04, 0.03, 0.05);
+  ASSERT_TRUE(suffix.has_value());
+  EXPECT_FALSE(suffix->explicit_rotation_waypoint);
+  EXPECT_FALSE(suffix->pending_explicit_rotation);
 }
 
 TEST(PathProgress, OvershotCornerRotatesThenTargetsForwardWithoutBackingUp)

@@ -137,6 +137,7 @@ struct PlanningResult
   VerifiedFlatStartStatus start_status{VerifiedFlatStartStatus::kNotNeeded};
   bool include_exact_start{false};
   bool exact_start_inferred{false};
+  bool start_connector_translation{false};
   double exact_start_elevation{0.0};
   double exact_start_dzdx{0.0};
   double exact_start_dzdy{0.0};
@@ -220,10 +221,10 @@ private:
     double start_x, double start_y, double end_x, double end_y, double yaw) const;
   bool flatRotationCollisionFree(
     double world_x, double world_y, double start_yaw, double end_yaw) const;
-  bool flatPoseSweepCollisionFree(
-    double start_x, double start_y, double start_yaw,
-    double end_x, double end_y, double end_yaw) const;
   bool flatPolygonCollisionFree(const std::vector<Point2D> & polygon) const;
+  bool nearestReachableFlatStart(
+    double world_x, double world_y, double world_yaw, double snap_radius,
+    int yaw, int & x, int & y) const;
   bool nearestFlatValid(
     double world_x, double world_y, double snap_radius, int yaw, int & x, int & y) const;
   bool nearestObservedValid(

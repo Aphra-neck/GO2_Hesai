@@ -44,6 +44,8 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     declare_parameter("heading_alignment_enter_angle", 0.7853981633974483);
   heading_alignment_exit_angle_ =
     declare_parameter("heading_alignment_exit_angle", 0.2617993877991494);
+  explicit_rotation_tolerance_ =
+    declare_parameter("explicit_rotation_tolerance", 0.05);
   linear_gain_ = declare_parameter("linear_gain", 1.0);
   yaw_gain_ = declare_parameter("yaw_gain", 1.5);
   rcl_interfaces::msg::ParameterDescriptor velocity_limit_descriptor;
@@ -77,6 +79,7 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     command_rate_, path_timeout_, odom_timeout_, timestamp_future_tolerance_,
     lookahead_distance_, goal_position_tolerance_, goal_yaw_tolerance_,
     heading_alignment_enter_angle_, heading_alignment_exit_angle_,
+    explicit_rotation_tolerance_,
     linear_gain_, yaw_gain_, max_vx_, max_vy_, max_yaw_rate_};
   const std::string parameter_error = validateControlParameters(parameters);
   if (!parameter_error.empty()) {
@@ -456,9 +459,19 @@ void Go2Sdk2BridgeNode::controlTickImpl()
     failSafe("non-finite goal calculation");
     return;
   }
-  if (goal_distance <= goal_position_tolerance_ &&
-    std::abs(goal_yaw_error) <= goal_yaw_tolerance_)
-  {
+  const auto tracking_target = path_progress_tracker_.update(
+    path_->poses, current.position.x, current.position.y, *current_yaw,
+    lookahead_distance_, explicit_rotation_tolerance_);
+  const auto completion_ready = goalCompletionReady(
+    goal_distance, goal_yaw_error, goal_position_tolerance_, goal_yaw_tolerance_,
+    tracking_target);
+  if (!completion_ready) {
+    failSafe("path progress could not be confirmed");
+    RCLCPP_ERROR(
+      get_logger(), "Stopped because bounded monotonic path progress could not be confirmed");
+    return;
+  }
+  if (*completion_ready) {
     if (!path_goal_generation_) {
       failSafe("missing path goal generation at completion");
       return;
@@ -467,17 +480,6 @@ void Go2Sdk2BridgeNode::controlTickImpl()
     waitForNewPath("goal reached");
     return;
   }
-
-  const auto tracking_target = path_progress_tracker_.update(
-    path_->poses, current.position.x, current.position.y, *current_yaw,
-    lookahead_distance_, heading_alignment_exit_angle_);
-  if (!tracking_target) {
-    failSafe("path progress could not be confirmed");
-    RCLCPP_ERROR(
-      get_logger(), "Stopped because bounded monotonic path progress could not be confirmed");
-    return;
-  }
-
   const double world_dx = tracking_target->target_x - current.position.x;
   const double world_dy = tracking_target->target_y - current.position.y;
   const double cos_yaw = std::cos(*current_yaw);
@@ -492,7 +494,9 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   }
   const auto target_yaw_error = selectAlignmentYawError(
     normalizeAngle(*local_heading_yaw - *current_yaw), goal_yaw_error,
-    goal_distance, goal_position_tolerance_);
+    goal_distance, goal_position_tolerance_,
+    tracking_target->explicit_rotation_waypoint,
+    tracking_target->pending_explicit_rotation);
   if (!target_yaw_error) {
     failSafe("invalid target heading selection");
     return;
@@ -507,7 +511,8 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   }
   const auto rotate_in_place = requireRotateInPlace(
     *gate_active, tracking_target->explicit_rotation_waypoint, *target_yaw_error,
-    heading_alignment_exit_angle_, goal_distance, goal_position_tolerance_);
+    explicit_rotation_tolerance_, goal_distance, goal_position_tolerance_,
+    tracking_target->pending_explicit_rotation);
   if (!rotate_in_place) {
     failSafe("invalid rotate-in-place decision");
     return;

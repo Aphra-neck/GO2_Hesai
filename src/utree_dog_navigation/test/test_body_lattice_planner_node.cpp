@@ -899,6 +899,59 @@ TEST_F(FlatObstaclePlannerNodeTest, RetainsQuantizedStartPoseWhenExactYawDiffers
     0.0, 1.0e-9);
 }
 
+TEST_F(FlatObstaclePlannerNodeTest, PublishesExecutableStartConnectorBeforeLatticePath)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  constexpr double kExactYaw = -91.87 * kPi / 180.0;
+  const auto current_time = harness_node_->now();
+  const auto source_time = current_time - 20ms;
+  auto map = makeFlatMap(source_time);
+  map.width = 200;
+  map.height = 200;
+  map.origin_x = -20.2F;
+  map.origin_y = -20.0F;
+  map.traversability.assign(
+    static_cast<std::size_t>(map.width) * map.height, map.unknown_value);
+  map.traversability[103U * map.width + 98U] = 0.0F;
+
+  auto odom = makeOdom(source_time);
+  odom.pose.pose.position.x = -0.032;
+  odom.pose.pose.position.y = 0.025;
+  odom.pose.pose.orientation.z = std::sin(kExactYaw * 0.5);
+  odom.pose.pose.orientation.w = std::cos(kExactYaw * 0.5);
+
+  auto goal = makeGoal(current_time);
+  goal.pose.position.x = -0.1;
+  goal.pose.position.y = -0.5;
+  goal.pose.orientation.z = std::sin(-0.25 * kPi);
+  goal.pose.orientation.w = std::cos(-0.25 * kPi);
+
+  map_pub_->publish(map);
+  odom_pub_->publish(odom);
+  goal_pub_->publish(goal);
+
+  ASSERT_TRUE(spinUntil(
+      [this]() {return !paths_.empty() && !paths_.back().poses.empty();}, 2s));
+  const auto & poses = paths_.back().poses;
+  ASSERT_EQ(poses.size(), 5U);
+  EXPECT_NEAR(poses[0].pose.position.x, odom.pose.pose.position.x, 1.0e-9);
+  EXPECT_NEAR(poses[0].pose.position.y, odom.pose.pose.position.y, 1.0e-9);
+  EXPECT_NEAR(poses[1].pose.position.x, -0.1, 1.0e-6);
+  EXPECT_NEAR(poses[1].pose.position.y, -0.1, 1.0e-6);
+  EXPECT_NEAR(poses[2].pose.position.x, poses[1].pose.position.x, 1.0e-9);
+  EXPECT_NEAR(poses[2].pose.position.y, poses[1].pose.position.y, 1.0e-9);
+  EXPECT_NEAR(
+    2.0 * std::atan2(poses[1].pose.orientation.z, poses[1].pose.orientation.w),
+    kExactYaw, 1.0e-9);
+  EXPECT_NEAR(
+    2.0 * std::atan2(poses[2].pose.orientation.z, poses[2].pose.orientation.w),
+    -0.5 * kPi, 1.0e-9);
+  EXPECT_NEAR(poses[3].pose.position.x, -0.1, 1.0e-6);
+  EXPECT_NEAR(poses[3].pose.position.y, -0.3, 1.0e-6);
+  EXPECT_NEAR(poses.back().pose.position.x, goal.pose.position.x, 1.0e-6);
+  EXPECT_NEAR(poses.back().pose.position.y, goal.pose.position.y, 1.0e-6);
+}
+
 TEST_F(FlatObstaclePlannerNodeTest, StaleInputClearsCachedGoalAndRequiresNewGoal)
 {
   publishFlatPlan(0.01);

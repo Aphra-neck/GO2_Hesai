@@ -417,6 +417,107 @@ TEST(LatticePlanner, FlatObstacleModeValidatesExactStartPoseBeforeGridCenter)
   EXPECT_FALSE(result.include_exact_start);
 }
 
+TEST(LatticePlanner, FlatObstacleModeFindsExecutableStartWithinStartSnapRadius)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  auto map = makeFlatObstacleMap(0.2F, 200, 200);
+  map->origin_x = -20.2F;
+  map->origin_y = -20.0F;
+  markFlatObstacle(map, 98, 103);
+
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 16;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.55;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan(
+    {-0.032, 0.025, -91.87 * kPi / 180.0},
+    {-0.1, -0.1, -0.5 * kPi});
+
+  ASSERT_TRUE(result.success);
+  ASSERT_EQ(result.states.size(), 1U);
+  EXPECT_TRUE(result.include_exact_start);
+  EXPECT_EQ(result.states.front().x, 100);
+  EXPECT_EQ(result.states.front().y, 99);
+  EXPECT_EQ(result.states.front().yaw, 12);
+}
+
+TEST(LatticePlanner, FlatObstacleModeKeepsStartRecoveryInsideStartSnapRadius)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  auto map = makeFlatObstacleMap(0.2F, 200, 200);
+  map->origin_x = -20.2F;
+  map->origin_y = -20.0F;
+  markFlatObstacle(map, 98, 103);
+
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 16;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.14;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan(
+    {-0.032, 0.025, -91.87 * kPi / 180.0},
+    {-0.1, -0.1, -0.5 * kPi});
+
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.expansions, 0);
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kStartGridSnapCollision);
+}
+
+TEST(LatticePlanner, FlatObstacleModeRejectsBlockedStartConnectorWithFreeEndpoints)
+{
+  auto map = makeFlatObstacleMap(0.2F, 30, 30);
+  markFlatObstacle(map, 7, 7);
+
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 16;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({2.113, 2.001, 0.1}, {2.1, 2.1, 0.0});
+
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.expansions, 0);
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kStartGridSnapCollision);
+}
+
+TEST(LatticePlanner, FlatObstacleModeSelectsStableNearestReachableStart)
+{
+  auto map = makeFlatObstacleMap(0.2F, 30, 30);
+  map->origin_x = -2.0F;
+  map->origin_y = -2.0F;
+  markFlatObstacle(map, 13, 12);
+
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 16;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.2;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({0.0, 0.0, 0.0}, {-0.1, -0.1, 0.0});
+
+  ASSERT_TRUE(result.success);
+  ASSERT_EQ(result.states.size(), 1U);
+  EXPECT_EQ(result.states.front().x, 9);
+  EXPECT_EQ(result.states.front().y, 9);
+  EXPECT_EQ(result.states.front().yaw, 0);
+}
+
 TEST(LatticePlanner, FlatObstacleModeReportsUnavailableGoalFootprint)
 {
   auto map = makeFlatObstacleMap(0.1F, 50, 30);

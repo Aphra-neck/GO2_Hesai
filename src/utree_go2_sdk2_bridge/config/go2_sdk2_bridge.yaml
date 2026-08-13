@@ -18,6 +18,8 @@ go2_sdk2_bridge:
     # Rotate in place above 45 deg; resume translation only after reaching 15 deg.
     heading_alignment_enter_angle: 0.7853981633974483
     heading_alignment_exit_angle: 0.2617993877991494
+    # Explicit zero-length path rotations use a tighter completion threshold.
+    explicit_rotation_tolerance: 0.05
     linear_gain: 1.0
     yaw_gain: 1.5
     max_vx: 0.6

@@ -38,6 +38,7 @@ struct ControlParameters
   double goal_yaw_tolerance;
   double heading_alignment_enter_angle;
   double heading_alignment_exit_angle;
+  double explicit_rotation_tolerance;
   double linear_gain;
   double yaw_gain;
   double max_vx;
@@ -67,6 +68,7 @@ struct PathTrackingTarget
   double progress_fraction;
   std::size_t heading_pose;
   bool explicit_rotation_waypoint;
+  bool pending_explicit_rotation;
   PlannedTranslationDirection translation_direction;
 };
 
@@ -83,7 +85,7 @@ public:
     double current_y,
     double current_yaw,
     double lookahead_distance,
-    double heading_alignment_tolerance);
+    double explicit_rotation_tolerance);
 
 private:
   bool initialized_{false};
@@ -157,15 +159,25 @@ std::optional<double> selectAlignmentYawError(
   double local_yaw_error,
   double goal_yaw_error,
   double goal_distance,
-  double goal_position_tolerance);
+  double goal_position_tolerance,
+  bool explicit_rotation_waypoint = false,
+  bool pending_explicit_rotation = false);
+
+std::optional<bool> goalCompletionReady(
+  double goal_distance,
+  double goal_yaw_error,
+  double goal_position_tolerance,
+  double goal_yaw_tolerance,
+  const std::optional<PathTrackingTarget> & tracking_target);
 
 std::optional<bool> requireRotateInPlace(
   bool hysteresis_gate_active,
   bool explicit_rotation_waypoint,
   double yaw_error,
-  double alignment_exit_angle,
+  double explicit_rotation_tolerance,
   double goal_distance,
-  double goal_position_tolerance);
+  double goal_position_tolerance,
+  bool pending_explicit_rotation = false);
 
 std::optional<VelocityCommand> makeHeadingAwareCommand(
   double raw_vx,

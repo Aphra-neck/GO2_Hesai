@@ -225,18 +225,13 @@ PlanningResult LatticePlanner::plan(
 
   PlanningOverlay overlay;
   if (config_.planning_mode == PlanningMode::kFlatObstacle) {
-    const double grid_start_x =
-      map_->origin_x + (static_cast<double>(start.grid.x) + 0.5) * map_->resolution;
-    const double grid_start_y =
-      map_->origin_y + (static_cast<double>(start.grid.y) + 0.5) * map_->resolution;
-    const double grid_start_yaw = yawAngle(start.grid.yaw);
     if (!flatWorldPoseCollisionFree(start_world.x, start_world.y, start_world.yaw)) {
       result.failure_reason = PlanningFailureReason::kExactStartCollision;
       return result;
     }
-    if (!flatPoseSweepCollisionFree(
-        start_world.x, start_world.y, start_world.yaw,
-        grid_start_x, grid_start_y, grid_start_yaw))
+    if (!nearestReachableFlatStart(
+        start_world.x, start_world.y, start_world.yaw, config_.start_snap_radius,
+        start.grid.yaw, start.grid.x, start.grid.y))
     {
       result.failure_reason = PlanningFailureReason::kStartGridSnapCollision;
       return result;
@@ -248,6 +243,13 @@ PlanningResult LatticePlanner::plan(
       return result;
     }
     result.include_exact_start = true;
+    const double grid_start_x =
+      map_->origin_x + (static_cast<double>(start.grid.x) + 0.5) * map_->resolution;
+    const double grid_start_y =
+      map_->origin_y + (static_cast<double>(start.grid.y) + 0.5) * map_->resolution;
+    result.start_connector_translation =
+      std::hypot(grid_start_x - start_world.x, grid_start_y - start_world.y) >
+      kDistanceTolerance;
     result.exact_start_elevation = config_.flat_obstacle.surface_elevation;
   } else {
     if (!nearestObservedValid(
@@ -671,31 +673,67 @@ bool LatticePlanner::flatRotationCollisionFree(
   return true;
 }
 
-bool LatticePlanner::flatPoseSweepCollisionFree(
-  double start_x, double start_y, double start_yaw,
-  double end_x, double end_y, double end_yaw) const
+bool LatticePlanner::nearestReachableFlatStart(
+  double world_x, double world_y, double world_yaw, double snap_radius,
+  int yaw, int & x, int & y) const
 {
-  const double yaw_delta = normalizeAngle(end_yaw - start_yaw);
-  const double radius = std::hypot(
-    0.5 * config_.flat_obstacle.footprint_length + config_.flat_obstacle.obstacle_clearance,
-    0.5 * config_.flat_obstacle.footprint_width + config_.flat_obstacle.obstacle_clearance);
-  const double maximum_point_travel =
-    std::hypot(end_x - start_x, end_y - start_y) + radius * std::abs(yaw_delta);
-  const double sample_spacing = std::max(
-    0.01, std::min(0.05, 0.5 * static_cast<double>(map_->resolution)));
-  const int intervals = std::max(
-    1, static_cast<int>(std::ceil(maximum_point_travel / sample_spacing)));
-  const double padding = maximum_point_travel / (2.0 * intervals);
-  for (int sample = 0; sample <= intervals; ++sample) {
-    const double fraction = static_cast<double>(sample) / intervals;
-    if (!flatWorldPoseCollisionFree(
-        start_x + fraction * (end_x - start_x),
-        start_y + fraction * (end_y - start_y),
-        start_yaw + fraction * yaw_delta, padding))
+  const double snapped_yaw = yawAngle(yaw);
+  const auto connector_collision_free = [this, world_x, world_y, world_yaw, snapped_yaw](
+      int candidate_x, int candidate_y)
     {
-      return false;
+      const double candidate_world_x =
+        map_->origin_x + (static_cast<double>(candidate_x) + 0.5) * map_->resolution;
+      const double candidate_world_y =
+        map_->origin_y + (static_cast<double>(candidate_y) + 0.5) * map_->resolution;
+      return flatTranslationCollisionFree(
+        world_x, world_y, candidate_world_x, candidate_world_y, world_yaw) &&
+             flatRotationCollisionFree(
+        candidate_world_x, candidate_world_y, world_yaw, snapped_yaw);
+    };
+
+  // Preserve the containing-cell behavior whenever its executable connector is safe.
+  if (connector_collision_free(x, y)) {return true;}
+
+  const double radius_cells = std::ceil(snap_radius / map_->resolution);
+  const int map_max_x = static_cast<int>(map_->width) - 1;
+  const int map_max_y = static_cast<int>(map_->height) - 1;
+  const int radius = std::max(1, static_cast<int>(std::min(
+      radius_cells, static_cast<double>(std::max(map_->width, map_->height)))));
+  const int minimum_x = static_cast<int>(std::max<std::int64_t>(
+      0, static_cast<std::int64_t>(x) - radius));
+  const int maximum_x = static_cast<int>(std::min<std::int64_t>(
+      map_max_x, static_cast<std::int64_t>(x) + radius));
+  const int minimum_y = static_cast<int>(std::max<std::int64_t>(
+      0, static_cast<std::int64_t>(y) - radius));
+  const int maximum_y = static_cast<int>(std::min<std::int64_t>(
+      map_max_y, static_cast<std::int64_t>(y) + radius));
+
+  int best_x = x;
+  int best_y = y;
+  double best_distance = std::numeric_limits<double>::infinity();
+  // Ascending y/x scan order is the stable tie-break for equally near candidates.
+  for (int candidate_y = minimum_y; candidate_y <= maximum_y; ++candidate_y) {
+    for (int candidate_x = minimum_x; candidate_x <= maximum_x; ++candidate_x) {
+      const double candidate_world_x =
+        map_->origin_x + (static_cast<double>(candidate_x) + 0.5) * map_->resolution;
+      const double candidate_world_y =
+        map_->origin_y + (static_cast<double>(candidate_y) + 0.5) * map_->resolution;
+      const double distance = std::hypot(
+        candidate_world_x - world_x, candidate_world_y - world_y);
+      if (distance > snap_radius + kDistanceTolerance ||
+        distance >= best_distance - kDistanceTolerance ||
+        !connector_collision_free(candidate_x, candidate_y))
+      {
+        continue;
+      }
+      best_x = candidate_x;
+      best_y = candidate_y;
+      best_distance = distance;
     }
   }
+  if (!std::isfinite(best_distance)) {return false;}
+  x = best_x;
+  y = best_y;
   return true;
 }
 
