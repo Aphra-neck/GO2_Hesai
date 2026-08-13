@@ -297,13 +297,14 @@ void SuperLIOReLoc::UpdateMap() {
 }
 
 
-void SuperLIOReLoc::Output() {
-  auto state = kf_->GetNavState();
-  data_wrapper_->pub_odom(state);
+void SuperLIOReLoc::Output(const PreparedStatePublication& prepared) {
+  data_wrapper_->pub_odom(prepared);
 
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
-  transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
-  transformation.block<3, 1>(0, 3) = state.p.cast<float>();
+  transformation.block<3, 3>(0, 0) = prepared.rotation.cast<float>();
+  transformation(0, 3) = static_cast<float>(prepared.pose.position.x);
+  transformation(1, 3) = static_cast<float>(prepared.pose.position.y);
+  transformation(2, 3) = static_cast<float>(prepared.pose.position.z);
 
   CloudPtr world_pc(new PointCloudType());
 
@@ -316,10 +317,10 @@ void SuperLIOReLoc::Output() {
     count = 0;
     if(g_visual_dense){
       pcl::transformPointCloud(*scan_undistort_full_, *world_pc, transformation);
-      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
+      data_wrapper_->pub_cloud_world(world_pc, prepared);
     }else{
       pcl::transformPointCloud(*ds_undistort_, *world_pc, transformation);
-      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
+      data_wrapper_->pub_cloud_world(world_pc, prepared);
     }
   }
 

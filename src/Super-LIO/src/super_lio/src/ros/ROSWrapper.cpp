@@ -809,38 +809,53 @@ bool ROSWrapper::sync_measure(
 }
 
 
-void ROSWrapper::pub_odom(const NavState& state){
+bool ROSWrapper::prepareStateOutput(
+  const NavState& state, PreparedStatePublication& prepared)
+{
+  prepared = prepareStatePublication(state);
+  if (!prepared.valid()) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Skipped invalid Super-LIO output frame: reason=%s "
+      "raw_q_norm_squared=%.9f rotation_det=%.9f "
+      "rotation_orthogonality_error=%.9f",
+      statePublicationStatusName(prepared.status),
+      static_cast<double>(prepared.raw_quaternion_norm_squared),
+      static_cast<double>(prepared.rotation_determinant),
+      static_cast<double>(prepared.rotation_orthogonality_error));
+    return false;
+  }
+  return true;
+}
+
+
+void ROSWrapper::pub_odom(const PreparedStatePublication& prepared)
+{
+
   nav_msgs::msg::Odometry odom;
-  odom.header.frame_id = "world";
-
-  odom.header.stamp = toRosTime(state.timestamp);
-  odom.pose.pose.position.x = state.p[0];
-  odom.pose.pose.position.y = state.p[1];
-  odom.pose.pose.position.z = state.p[2];
-
-  V4 temp_q = state.R.coeffs();
-  odom.pose.pose.orientation.x = temp_q[0];
-  odom.pose.pose.orientation.y = temp_q[1];
-  odom.pose.pose.orientation.z = temp_q[2];
-  odom.pose.pose.orientation.w = temp_q[3];
-
-  odom.twist.twist.linear.x = state.v[0];
-  odom.twist.twist.linear.y = state.v[1];
-  odom.twist.twist.linear.z = state.v[2];
+  geometry_msgs::msg::TransformStamped tf_msg;
+  populateStateMessages(prepared, odom, tf_msg);
 
   pub_odom_->publish(odom);    // imu frame -> lidar frequency
 
-  V3 robo_position = state.R.R_ * ( - g_odom_robo.R_ * g_odom_robo.t_) + state.p;
+  V3 imu_position;
+  imu_position <<
+    static_cast<scalar>(prepared.pose.position.x),
+    static_cast<scalar>(prepared.pose.position.y),
+    static_cast<scalar>(prepared.pose.position.z);
+  V3 robo_position =
+    prepared.rotation * (-g_odom_robo.R_ * g_odom_robo.t_) + imu_position;
 
   if(g_2_robot){
     static auto pub_msg2uav_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
         "/mavros/vision_pose/pose", 10);
-    M3 robo_rotation = state.R.R_ * g_odom_robo.R_;
+    M3 robo_rotation = prepared.rotation * g_odom_robo.R_;
     msg2uav_.header.stamp = odom.header.stamp;
     msg2uav_.pose.position.x = robo_position[0];
     msg2uav_.pose.position.y = robo_position[1];
     msg2uav_.pose.position.z = robo_position[2];
     Quat robo_quat(robo_rotation);
+    robo_quat.normalize();
     msg2uav_.pose.orientation.w = robo_quat.w();
     msg2uav_.pose.orientation.x = robo_quat.x();
     msg2uav_.pose.orientation.y = robo_quat.y();
@@ -858,21 +873,6 @@ void ROSWrapper::pub_odom(const NavState& state){
     last_path_point_ = robo_position;
   }
 
-  geometry_msgs::msg::TransformStamped tf_msg;
-
-  tf_msg.header.stamp = odom.header.stamp;
-  tf_msg.header.frame_id = "world";
-  tf_msg.child_frame_id = "imu";
-
-  tf_msg.transform.translation.x = state.p[0];
-  tf_msg.transform.translation.y = state.p[1];
-  tf_msg.transform.translation.z = state.p[2];
-
-  tf_msg.transform.rotation.x = temp_q.x();
-  tf_msg.transform.rotation.y = temp_q.y();
-  tf_msg.transform.rotation.z = temp_q.z();
-  tf_msg.transform.rotation.w = temp_q.w();
-
   tf_broadcaster_->sendTransform(tf_msg);
 
   // tf_msg.child_frame_id = "god";
@@ -881,12 +881,11 @@ void ROSWrapper::pub_odom(const NavState& state){
   // tf_msg.transform.rotation.z = 0.0;
   // tf_msg.transform.rotation.w = 1.0;
   // tf_broadcaster_->sendTransform(tf_msg);
-
 }
 
 
 ROSWrapper::CloudPublishTiming ROSWrapper::pub_cloud_world(
-  const CloudPtr& pc, double time)
+  const CloudPtr& pc, const PreparedStatePublication& prepared)
 {
   CloudPublishTiming timing;
   const std::int64_t to_ros_start_ns = steadyNowNs();
@@ -894,8 +893,7 @@ ROSWrapper::CloudPublishTiming ROSWrapper::pub_cloud_world(
   pcl::toROSMsg(*pc, cloud);
   const std::int64_t publish_start_ns = steadyNowNs();
   timing.to_ros_ms = elapsedMs(to_ros_start_ns, publish_start_ns);
-  cloud.header.frame_id = "world";
-  cloud.header.stamp = toRosTime(time);
+  populateWorldPointCloudHeader(prepared, cloud);
   pub_cloud_world_->publish(cloud);
   timing.publish_ms = elapsedMs(publish_start_ns, steadyNowNs());
   return timing;
@@ -917,20 +915,17 @@ void ROSWrapper::pub_cloud2planner(const CloudPtr& pc, double time){
 void ROSWrapper::pub_cloud_body_pose(const CloudPtr& pc,
   const NavState& state)
 {
+  PreparedStatePublication prepared;
+  if (!prepareStateOutput(state, prepared)) {
+    return;
+  }
   static auto pub_cloud_body_pose_ =
     this->create_publisher<super_lio::msg::CloudPose>(
         "/lio/body/cloud_pose", 10);
   super_lio::msg::CloudPose cloud_pose;
   pcl::toROSMsg(*pc, cloud_pose.cloud);
-  cloud_pose.cloud.header.stamp = toRosTime(state.timestamp);
-  cloud_pose.pose.position.x = state.p[0];
-  cloud_pose.pose.position.y = state.p[1];
-  cloud_pose.pose.position.z = state.p[2];
-  V4 temp_q = state.R.coeffs();
-  cloud_pose.pose.orientation.x = temp_q[0];
-  cloud_pose.pose.orientation.y = temp_q[1];
-  cloud_pose.pose.orientation.z = temp_q[2];
-  cloud_pose.pose.orientation.w = temp_q[3];
+  cloud_pose.cloud.header.stamp = prepared.stamp;
+  cloud_pose.pose = prepared.pose;
 
   pub_cloud_body_pose_->publish(cloud_pose);
 }
@@ -939,20 +934,17 @@ void ROSWrapper::pub_cloud_body_pose(const CloudPtr& pc,
 void ROSWrapper::pub_cloud_world_pose(const CloudPtr& pc,
    const NavState& state)
 {
+  PreparedStatePublication prepared;
+  if (!prepareStateOutput(state, prepared)) {
+    return;
+  }
   static auto pub_cloud_world_pose_ =
     this->create_publisher<super_lio::msg::CloudPose>(
         "/lio/world/cloud_pose", 10);
   super_lio::msg::CloudPose cloud_pose;
   pcl::toROSMsg(*pc, cloud_pose.cloud);
-  cloud_pose.cloud.header.stamp = toRosTime(state.timestamp);
-  cloud_pose.pose.position.x = state.p[0];
-  cloud_pose.pose.position.y = state.p[1];
-  cloud_pose.pose.position.z = state.p[2];
-  V4 temp_q = state.R.coeffs();
-  cloud_pose.pose.orientation.x = temp_q[0];
-  cloud_pose.pose.orientation.y = temp_q[1];
-  cloud_pose.pose.orientation.z = temp_q[2];
-  cloud_pose.pose.orientation.w = temp_q[3];
+  cloud_pose.cloud.header.stamp = prepared.stamp;
+  cloud_pose.pose = prepared.pose;
   pub_cloud_world_pose_->publish(cloud_pose);
 }
 

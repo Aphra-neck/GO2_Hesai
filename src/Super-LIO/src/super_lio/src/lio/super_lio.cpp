@@ -266,20 +266,25 @@ void SuperLIO::stateProcess(){
   evaluate_stage(
     [this]() { Observe(); }, "[Observe]",
     runtime_timing_sample_.observe_ms);
+  PreparedStatePublication prepared;
+  if (!data_wrapper_->prepareStateOutput(kf_->GetNavState(), prepared)) {
+    return;
+  }
   evaluate_stage(
     [this]() { UpdateMap(); }, "[UpdateMap]",
     runtime_timing_sample_.update_map_ms);
-  Output();
-  caceData();
+  Output(prepared);
+  caceData(prepared);
 }
 
 
-void SuperLIO::caceData(){
+void SuperLIO::caceData(const PreparedStatePublication& prepared){
   if(!g_save_map) return;
-  auto state = kf_->GetNavState();
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
-  transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
-  transformation.block<3, 1>(0, 3) = state.p.cast<float>();
+  transformation.block<3, 3>(0, 0) = prepared.rotation.cast<float>();
+  transformation(0, 3) = static_cast<float>(prepared.pose.position.x);
+  transformation(1, 3) = static_cast<float>(prepared.pose.position.y);
+  transformation(2, 3) = static_cast<float>(prepared.pose.position.z);
 
   if(g_if_filter){
     pcl::transformPointCloud(*ds_undistort_, *world_pc_, transformation);
@@ -629,16 +634,17 @@ void SuperLIO::UpdateMap() {
 }
 
 
-void SuperLIO::Output(){
-  auto state = kf_->GetNavState();
+void SuperLIO::Output(const PreparedStatePublication& prepared){
   std::int64_t stage_start_ns = timingNowNs();
-  data_wrapper_->pub_odom(state);
+  data_wrapper_->pub_odom(prepared);
   runtime_timing_sample_.odom_publish_ms =
     timingElapsedMs(stage_start_ns, timingNowNs());
 
   Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
-  transformation.block<3, 3>(0, 0) = state.R.R_.cast<float>();
-  transformation.block<3, 1>(0, 3) = state.p.cast<float>();
+  transformation.block<3, 3>(0, 0) = prepared.rotation.cast<float>();
+  transformation(0, 3) = static_cast<float>(prepared.pose.position.x);
+  transformation(1, 3) = static_cast<float>(prepared.pose.position.y);
+  transformation(2, 3) = static_cast<float>(prepared.pose.position.z);
 
   CloudPtr world_pc(new PointCloudType());
   
@@ -658,7 +664,7 @@ void SuperLIO::Output(){
     runtime_timing_sample_.cloud_transform_ms =
       timingElapsedMs(stage_start_ns, timingNowNs());
     const auto cloud_timing =
-      data_wrapper_->pub_cloud_world(world_pc, state.timestamp);
+      data_wrapper_->pub_cloud_world(world_pc, prepared);
     runtime_timing_sample_.cloud_to_ros_ms = cloud_timing.to_ros_ms;
     runtime_timing_sample_.cloud_publish_ms = cloud_timing.publish_ms;
   }

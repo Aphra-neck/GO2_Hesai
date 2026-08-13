@@ -27,6 +27,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
+find_package(builtin_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -77,6 +78,7 @@ file(GLOB_RECURSE LIO_LIB_HEADERS "include/lio/*.hpp" "include/lio/*.h")
 add_library(lio ${LIO_LIB_SRC} ${LIO_LIB_HEADERS})
 
 set(SUPER_LIO_ROS_DEPENDENCIES
+  builtin_interfaces
   rclcpp
   std_msgs
   geometry_msgs
@@ -125,6 +127,18 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_runtime_timing test/test_runtime_timing.cpp)
   target_include_directories(test_runtime_timing PRIVATE include)
+
+  ament_add_gtest(test_state_publication test/test_state_publication.cpp)
+  target_include_directories(test_state_publication PRIVATE include)
+  ament_target_dependencies(
+    test_state_publication
+    basic
+    builtin_interfaces
+    geometry_msgs
+    nav_msgs
+    sensor_msgs
+    std_msgs
+  )
 endif()
 
 install(TARGETS

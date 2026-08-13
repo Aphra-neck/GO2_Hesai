@@ -48,8 +48,8 @@ protected:
   void DownSample();
   void Observe();
   virtual void UpdateMap();
-  virtual void Output();
-  void caceData();
+  virtual void Output(const PreparedStatePublication& prepared);
+  void caceData(const PreparedStatePublication& prepared);
   void ProcessCaceMap();
 
   using StateFn = void (SuperLIO::*)();

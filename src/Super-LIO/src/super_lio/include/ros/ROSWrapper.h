@@ -42,6 +42,7 @@
 #include "common/ds.h"
 #include "common/measurement_synchronizer.h"
 #include "common/runtime_timing.h"
+#include "common/state_publication.h"
 
 #include "lio/ESKF.h"
 #include "OctVoxMap/OctVoxMap.hpp"
@@ -79,8 +80,11 @@ public:
     measurement_synchronizer_ = MeasurementSynchronizer{};
   }
 
-  void pub_odom(const NavState&);
-  CloudPublishTiming pub_cloud_world(const BASIC::CloudPtr& pc, double time);
+  bool prepareStateOutput(
+    const NavState&, PreparedStatePublication& prepared);
+  void pub_odom(const PreparedStatePublication& prepared);
+  CloudPublishTiming pub_cloud_world(
+    const BASIC::CloudPtr& pc, const PreparedStatePublication& prepared);
   void pub_cloud2planner(const BASIC::CloudPtr& pc, double time);
   void pub_cloud_world_pose(const BASIC::CloudPtr& pc,
                             const NavState& state);
