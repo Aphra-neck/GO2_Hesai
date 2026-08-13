@@ -8,6 +8,7 @@ import unittest
 
 PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAUNCH_FILE = os.path.join(PACKAGE_ROOT, "launch", "go2_sdk2_bridge.launch.py")
+NODE_SOURCE = os.path.join(PACKAGE_ROOT, "src", "go2_sdk2_bridge_node.cpp")
 
 
 class _Entity:
@@ -105,6 +106,42 @@ def _launch_node(description, context):
 
 
 class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
+    def test_execution_path_subscription_does_not_replay_history(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        subscription = source[
+            source.index("path_sub_ = create_subscription") : source.index(
+                "odom_sub_ = create_subscription"
+            )
+        ]
+
+        self.assertIn(
+            "rclcpp::QoS(1).reliable().durability_volatile()", subscription
+        )
+        self.assertNotIn("transient_local()", subscription)
+
+    def test_empty_path_clear_precedes_executable_path_freshness(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        callback = source[
+            source.index("void Go2Sdk2BridgeNode::pathCallback") : source.index(
+                "void Go2Sdk2BridgeNode::odomCallback"
+            )
+        ]
+
+        empty_path = callback.index("if (msg->poses.empty())")
+        freshness = callback.index(
+            "if (!messageStampFresh(message_time, current_time, path_timeout_))"
+        )
+        empty_path_branch = callback[empty_path:freshness]
+        stale_path_failsafe = callback.index(
+            'failSafe("stale or future path timestamp")'
+        )
+        self.assertLess(empty_path, freshness)
+        self.assertIn('waitForNewPath("empty path")', empty_path_branch)
+        self.assertIn("return;", empty_path_branch)
+        self.assertLess(freshness, stale_path_failsafe)
+
     def test_velocity_arguments_do_not_override_yaml_by_default(self):
         description = _load_launch_description()
         for name in ("max_vx", "max_vy", "max_yaw_rate"):

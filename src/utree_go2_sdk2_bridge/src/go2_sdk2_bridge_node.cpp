@@ -92,7 +92,10 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   sport_client_->Init();
 
   path_sub_ = create_subscription<nav_msgs::msg::Path>(
-    path_topic, rclcpp::QoS(1).reliable().transient_local(),
+    // Execute only paths published after this bridge subscription is matched.
+    // The planner remains transient-local for RViz, but replaying its cached path
+    // here can disarm a freshly armed bridge before the operator sends a new goal.
+    path_topic, rclcpp::QoS(1).reliable().durability_volatile(),
     std::bind(&Go2Sdk2BridgeNode::pathCallback, this, std::placeholders::_1));
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
     odom_topic, rclcpp::SensorDataQoS(),
@@ -170,6 +173,19 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
         msg->header.frame_id.c_str(), world_frame_.c_str());
       return;
     }
+    if (msg->poses.empty()) {
+      // An empty path cannot command motion. Stop and wait even if the clear
+      // sentinel was delayed, without consuming the operator's authorization.
+      path_progress_tracker_.reset();
+      waitForNewPath("empty path");
+      if (motion_authorization_.armed()) {
+        RCLCPP_INFO(
+          get_logger(), "Body path cleared; waiting for a new path while remaining armed");
+      } else {
+        RCLCPP_WARN(get_logger(), "Body path cleared while motion is disarmed");
+      }
+      return;
+    }
     const rclcpp::Time current_time = now();
     const rclcpp::Time message_time(msg->header.stamp, current_time.get_clock_type());
     if (!messageStampFresh(message_time, current_time, path_timeout_)) {
@@ -179,18 +195,6 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
         get_logger(),
         "Rejected path with age %.3f s; accepted range is [-%.3f, %.3f] s",
         age, timestamp_future_tolerance_, path_timeout_);
-      return;
-    }
-    if (msg->poses.empty()) {
-      // A transient planning failure must not unlock an endpoint already completed.
-      path_progress_tracker_.reset();
-      waitForNewPath("empty path");
-      if (motion_authorization_.armed()) {
-        RCLCPP_INFO(
-          get_logger(), "Body path cleared; waiting for a new path while remaining armed");
-      } else {
-        RCLCPP_WARN(get_logger(), "Body path cleared while motion is disarmed");
-      }
       return;
     }
     for (std::size_t index = 0; index < msg->poses.size(); ++index) {
