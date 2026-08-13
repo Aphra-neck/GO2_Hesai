@@ -473,6 +473,66 @@ TEST(FlatObstacleLayer, GroundFitUsesFloorUnderDenseElevatedReturns)
   EXPECT_NEAR(update.ground_plane.intercept, 0.0, 0.01);
 }
 
+TEST(FlatObstacleLayer, GroundFitUsesDominantSurfaceWhenSecondaryReturnsExceedInlierDistance)
+{
+  FlatObstacleLayer layer(layerConfig());
+  std::vector<TerrainPoint> points;
+  for (int x_index = -12; x_index <= 11; ++x_index) {
+    const double x = 0.2 * (static_cast<double>(x_index) + 0.5) + 0.001;
+    for (int y_index = -4; y_index <= 3; ++y_index) {
+      const double y = 0.2 * (static_cast<double>(y_index) + 0.5) + 0.001;
+      const int raw_code = (3 * x_index + 7 * y_index) % 10;
+      const int code = (raw_code + 10) % 10;
+      const double z = code < 6 ? 0.0 : (code < 9 ? 0.10 : -0.08);
+      points.push_back({x, y, z});
+    }
+  }
+
+  const auto update = layer.update(frame(points, 1.0, false));
+
+  ASSERT_TRUE(update.accepted);
+  ASSERT_NE(update.status, FlatObstacleLayerStatus::kGroundFitFailed) << update.reason;
+  EXPECT_EQ(update.ground_plane.candidate_points, 180U);
+  EXPECT_EQ(update.ground_plane.inlier_points, 108U);
+  EXPECT_NEAR(update.ground_plane.slope_x, 0.0, 1.0e-6);
+  EXPECT_NEAR(update.ground_plane.slope_y, 0.0, 1.0e-6);
+  EXPECT_NEAR(update.ground_plane.intercept, 0.0, 1.0e-6);
+  EXPECT_LE(update.ground_plane.rmse, layerConfig().ground_fit.max_rmse);
+  EXPECT_GE(
+    static_cast<double>(update.ground_plane.inlier_points) /
+    static_cast<double>(update.ground_plane.candidate_points),
+    layerConfig().ground_fit.min_inlier_ratio);
+}
+
+TEST(FlatObstacleLayer, GroundFitRejectsInliersWithoutTwoDimensionalCoverage)
+{
+  FlatObstacleLayer layer(layerConfig());
+  std::vector<TerrainPoint> points;
+  for (int x_index = -8; x_index <= 7; ++x_index) {
+    const double x = 0.2 * (static_cast<double>(x_index) + 0.5) + 0.001;
+    for (int y_index = -1; y_index <= 1; ++y_index) {
+      const double y = 0.2 * (static_cast<double>(y_index) + 0.5) + 0.001;
+      points.push_back({x, y, 0.0});
+    }
+  }
+  for (int x_index = -5; x_index <= 5; x_index += 2) {
+    const double x = 0.2 * (static_cast<double>(x_index) + 0.5) + 0.001;
+    points.push_back({x, -1.099, 0.12});
+    points.push_back({x, 1.101, 0.12});
+  }
+
+  const auto update = layer.update(frame(points, 1.0, false));
+
+  EXPECT_TRUE(update.accepted);
+  EXPECT_FALSE(update.usable);
+  EXPECT_EQ(update.status, FlatObstacleLayerStatus::kGroundFitFailed);
+  EXPECT_EQ(update.reason, "insufficient_ground_inlier_span");
+  EXPECT_GE(
+    static_cast<double>(update.ground_plane.inlier_points) /
+    static_cast<double>(update.ground_plane.candidate_points),
+    layerConfig().ground_fit.min_inlier_ratio);
+}
+
 TEST(FlatObstacleLayer, ElevatedSurfaceCannotReplaceExpectedStandingGround)
 {
   FlatObstacleLayer layer(layerConfig());

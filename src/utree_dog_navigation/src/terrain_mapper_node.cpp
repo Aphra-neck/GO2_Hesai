@@ -563,9 +563,12 @@ void TerrainMapperNode::processCloud(
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 3000,
         "Flat obstacle layer is fail-closed: status=%s reason=%s, "
-        "ground_candidates=%zu, ground_inliers=%zu",
+        "ground_candidates=%zu, ground_inliers=%zu, ground_rmse=%.4f, "
+        "ground_slope=(%.4f, %.4f)",
         toString(update.status), update.reason.c_str(),
-        update.ground_plane.candidate_points, update.ground_plane.inlier_points);
+        update.ground_plane.candidate_points, update.ground_plane.inlier_points,
+        update.ground_plane.rmse, update.ground_plane.slope_x,
+        update.ground_plane.slope_y);
     }
     last_processed_flat_pose_ = *flat_pose;
     have_processed_flat_pose_ = true;

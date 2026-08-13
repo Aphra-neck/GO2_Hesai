@@ -15,6 +15,8 @@ namespace
 {
 constexpr double kSolveEpsilon = 1.0e-10;
 constexpr double kRayEpsilon = 1.0e-10;
+constexpr int kRobustGroundFitIterations = 4;
+constexpr int kHardGroundFitIterations = 8;
 
 bool finitePoint(const TerrainPoint & point) noexcept
 {
@@ -99,6 +101,43 @@ bool solvePlane(
   slope_y = matrix[1][3];
   intercept = matrix[2][3];
   return std::isfinite(slope_x) && std::isfinite(slope_y) && std::isfinite(intercept);
+}
+
+std::vector<std::size_t> classifyPlaneInliers(
+  const std::vector<TerrainPoint> & points, const FlatGroundPlane & plane,
+  double distance)
+{
+  std::vector<std::size_t> inliers;
+  inliers.reserve(points.size());
+  for (std::size_t index = 0U; index < points.size(); ++index) {
+    if (std::abs(points[index].z - plane.heightAt(points[index].x, points[index].y)) <=
+      distance)
+    {
+      inliers.push_back(index);
+    }
+  }
+  return inliers;
+}
+
+bool hasMinimumPlanarSpan(
+  const std::vector<TerrainPoint> & points,
+  const std::vector<std::size_t> & indices, double minimum_span)
+{
+  if (indices.empty()) {
+    return false;
+  }
+  double minimum_x = std::numeric_limits<double>::infinity();
+  double maximum_x = -std::numeric_limits<double>::infinity();
+  double minimum_y = std::numeric_limits<double>::infinity();
+  double maximum_y = -std::numeric_limits<double>::infinity();
+  for (const std::size_t index : indices) {
+    minimum_x = std::min(minimum_x, points[index].x);
+    maximum_x = std::max(maximum_x, points[index].x);
+    minimum_y = std::min(minimum_y, points[index].y);
+    maximum_y = std::max(maximum_y, points[index].y);
+  }
+  return maximum_x - minimum_x >= minimum_span &&
+         maximum_y - minimum_y >= minimum_span;
 }
 
 std::int64_t gridCoordinate(double value, double resolution) noexcept
@@ -470,21 +509,20 @@ bool FlatObstacleLayer::fitGroundPlane(
   for (const auto & entry : cells) {
     candidates.push_back(entry.second.point);
   }
+  std::sort(
+    candidates.begin(), candidates.end(),
+    [](const TerrainPoint & left, const TerrainPoint & right) {
+      if (left.x != right.x) {
+        return left.x < right.x;
+      }
+      if (left.y != right.y) {
+        return left.y < right.y;
+      }
+      return left.z < right.z;
+    });
   plane.candidate_points = candidates.size();
   if (candidates.size() < config_.ground_fit.min_points) {
     reason = "insufficient_ground_candidates";
-    return false;
-  }
-  const auto x_bounds = std::minmax_element(
-    candidates.begin(), candidates.end(),
-    [](const TerrainPoint & left, const TerrainPoint & right) {return left.x < right.x;});
-  const auto y_bounds = std::minmax_element(
-    candidates.begin(), candidates.end(),
-    [](const TerrainPoint & left, const TerrainPoint & right) {return left.y < right.y;});
-  if (x_bounds.second->x - x_bounds.first->x < config_.ground_fit.min_span ||
-    y_bounds.second->y - y_bounds.first->y < config_.ground_fit.min_span)
-  {
-    reason = "insufficient_ground_span";
     return false;
   }
 
@@ -492,7 +530,11 @@ bool FlatObstacleLayer::fitGroundPlane(
   for (std::size_t index = 0U; index < inliers.size(); ++index) {
     inliers[index] = index;
   }
-  for (int iteration = 0; iteration < 4; ++iteration) {
+  if (!hasMinimumPlanarSpan(candidates, inliers, config_.ground_fit.min_span)) {
+    reason = "insufficient_ground_span";
+    return false;
+  }
+  for (int iteration = 0; iteration < kRobustGroundFitIterations; ++iteration) {
     if (!solvePlane(
         candidates, inliers, plane.slope_x, plane.slope_y, plane.intercept))
     {
@@ -507,15 +549,10 @@ bool FlatObstacleLayer::fitGroundPlane(
           point.z - plane.heightAt(point.x, point.y)));
     }
     const double robust_sigma = 1.4826 * median(absolute_residuals);
-    const double threshold = std::max(
-      config_.ground_fit.inlier_distance, 2.5 * robust_sigma);
-    std::vector<std::size_t> next;
-    next.reserve(candidates.size());
-    for (std::size_t index = 0U; index < absolute_residuals.size(); ++index) {
-      if (absolute_residuals[index] <= threshold) {
-        next.push_back(index);
-      }
-    }
+    const double threshold = std::min(
+      config_.ground_fit.inlier_distance,
+      std::max(0.5 * config_.ground_fit.inlier_distance, 2.5 * robust_sigma));
+    auto next = classifyPlaneInliers(candidates, plane, threshold);
     if (next == inliers) {
       break;
     }
@@ -525,11 +562,35 @@ bool FlatObstacleLayer::fitGroundPlane(
       return false;
     }
   }
-  if (!solvePlane(candidates, inliers, plane.slope_x, plane.slope_y, plane.intercept)) {
-    reason = "degenerate_ground_geometry";
+  bool hard_fit_converged = false;
+  for (int iteration = 0; iteration < kHardGroundFitIterations; ++iteration) {
+    if (!solvePlane(candidates, inliers, plane.slope_x, plane.slope_y, plane.intercept)) {
+      reason = "degenerate_ground_geometry";
+      return false;
+    }
+    auto next = classifyPlaneInliers(
+      candidates, plane, config_.ground_fit.inlier_distance);
+    if (next.size() < 3U) {
+      plane.inlier_points = next.size();
+      reason = "insufficient_ground_inliers";
+      return false;
+    }
+    if (next == inliers) {
+      hard_fit_converged = true;
+      break;
+    }
+    inliers = std::move(next);
+  }
+  if (!hard_fit_converged) {
+    plane.inlier_points = inliers.size();
+    reason = "ground_inlier_fit_did_not_converge";
     return false;
   }
   plane.inlier_points = inliers.size();
+  if (!hasMinimumPlanarSpan(candidates, inliers, config_.ground_fit.min_span)) {
+    reason = "insufficient_ground_inlier_span";
+    return false;
+  }
   double squared_error = 0.0;
   for (const std::size_t index : inliers) {
     const auto & point = candidates[index];
