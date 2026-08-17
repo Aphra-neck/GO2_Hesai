@@ -43,8 +43,8 @@ cd ~
 mkdir catkin_ws
 cd ~/catkin_ws
 
-git -c http.proxy=http://192.168.151.143:7890 \
-  -c https.proxy=http://192.168.151.143:7890 \
+git -c http.proxy=http://192.168.151.145:7890 \
+  -c https.proxy=http://192.168.151.145:7890 \
   clone --branch ROS2-2D-navigation --single-branch \
   https://github.com/Aphra-neck/GO2_Hesai.git .
 ```
@@ -71,8 +71,8 @@ git -c http.proxy=http://192.168.151.143:7890 \
 ```bash
 cd ~/catkin_ws
 test "$(git branch --show-current)" = ROS2-2D-navigation || exit 1
-git -c http.proxy=http://192.168.151.143:7890 \
-  -c https.proxy=http://192.168.151.143:7890 \
+git -c http.proxy=http://192.168.151.145:7890 \
+  -c https.proxy=http://192.168.151.145:7890 \
   pull --ff-only origin ROS2-2D-navigation
 
 source /opt/ros/humble/setup.bash
@@ -101,8 +101,8 @@ Jetson 的 `~/catkin_ws` 只使用上面的 `pull --ff-only` 更新。确认机�
 ```powershell
 Set-Location C:\path\to\GO2_Hesai
 git status --short --branch
-git -c http.proxy=http://192.168.151.143:7890 `
-  -c https.proxy=http://192.168.151.143:7890 `
+git -c http.proxy=http://192.168.151.145:7890 `
+  -c https.proxy=http://192.168.151.145:7890 `
   push origin ROS2-2D-navigation
 ```
 
@@ -293,7 +293,7 @@ Go2 LowState
 | WSL2 mirrored | `192.168.151.145/24` | 运行 RViz2 |
 | Jetson `enP8p1s0` | `192.168.123.18/24` | Go2 与 Hesai 设备网络 |
 | Hesai XT-16 | `192.168.123.20` | UDP 点云发送端 |
-| Git 代理 | `192.168.151.143:7890` | Jetson 访问 GitHub |
+| Git 代理 | `192.168.151.145:7890` | Jetson 访问 GitHub |
 
 ROS 2 使用 domain `30` 和 Fast DDS。Unitree SDK2 在 `enP8p1s0` 上独立使用
 DDS domain `0`。不要把 ROS 2 切换为 `rmw_cyclonedds_cpp`。
@@ -1234,7 +1234,7 @@ source ./shell/ros2_environment.sh
 
 ./tools/go2-log stop
 ./tools/go2-log repair
-GO2_LOG_PROXY=http://192.168.151.143:7890 ./tools/go2-log upload
+GO2_LOG_PROXY=http://192.168.151.145:7890 ./tools/go2-log upload
 ```
 
 自动收尾用于防止新的会话继续积压，但不会在下一次启动时擅自上传历史会话。旧的 stale
@@ -1260,7 +1260,7 @@ push。每个会话最多 100 MiB，本地最多保留 20 个；只有远端提�
 才允许被清理。默认上传到公开仓库 `Aphra-neck/G02_log` 的 `main` 分支，并使用：
 
 ```bash
-export GO2_LOG_PROXY=http://192.168.151.143:7890
+export GO2_LOG_PROXY=http://192.168.151.145:7890
 ```
 
 实机上传当前使用对 `Aphra-neck/G02_log` 具有写权限的 GitHub Deploy Key，并通过
@@ -1283,8 +1283,8 @@ Windows 本地拉取并分析：
 
 ```powershell
 git -C D:\G02_log `
-  -c http.proxy=http://192.168.151.143:7890 `
-  -c https.proxy=http://192.168.151.143:7890 `
+  -c http.proxy=http://192.168.151.145:7890 `
+  -c https.proxy=http://192.168.151.145:7890 `
   pull --ff-only origin main
 
 # 先替换为本机 GO2_Hesai checkout 的实际路径

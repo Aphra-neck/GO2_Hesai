@@ -127,11 +127,11 @@ cd ~/catkin_ws
 ```
 
 The upload checkout defaults to `~/G02_log`, the target branch defaults to
-`main`, and Git HTTP(S) operations use `http://192.168.151.143:7890`. Override
+`main`, and Git HTTP(S) operations use `http://192.168.151.145:7890`. Override
 the proxy or checkout without changing the script:
 
 ```bash
-export GO2_LOG_PROXY=http://192.168.151.143:7890
+export GO2_LOG_PROXY=http://192.168.151.145:7890
 export GO2_LOG_REPO=~/G02_log
 ```
 
@@ -422,8 +422,8 @@ Pull `Aphra-neck/G02_log` into `D:\G02_log`, then run the analyzer from a local
 
 ```powershell
 git -C D:\G02_log `
-  -c http.proxy=http://192.168.151.143:7890 `
-  -c https.proxy=http://192.168.151.143:7890 `
+  -c http.proxy=http://192.168.151.145:7890 `
+  -c https.proxy=http://192.168.151.145:7890 `
   pull --ff-only origin main
 
 python .\tools\analyze_diagnostics.py `
