@@ -7,7 +7,7 @@
         <type>UDPv4</type>
         <maxInitialPeersRange>64</maxInitialPeersRange>
         <interfaceWhiteList>
-          <address>192.168.151.143</address>
+          <address>192.168.151.145</address>
         </interfaceWhiteList>
       </transport_descriptor>
     </transport_descriptors>
@@ -23,7 +23,7 @@
             </locator>
             <locator>
               <udpv4>
-                <address>192.168.151.143</address>
+                <address>192.168.151.145</address>
               </udpv4>
             </locator>
           </initialPeersList>
