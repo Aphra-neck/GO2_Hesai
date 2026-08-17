@@ -290,7 +290,7 @@ Go2 LowState
 | 端点 | 地址 | 用途 |
 | --- | --- | --- |
 | Jetson Wi-Fi | `192.168.151.213/24` | ROS 2 数据与 WSL2 通信 |
-| WSL2 mirrored | `192.168.151.143/24` | 运行 RViz2 |
+| WSL2 mirrored | `192.168.151.145/24` | 运行 RViz2 |
 | Jetson `enP8p1s0` | `192.168.123.18/24` | Go2 与 Hesai 设备网络 |
 | Hesai XT-16 | `192.168.123.20` | UDP 点云发送端 |
 | Git 代理 | `192.168.151.143:7890` | Jetson 访问 GitHub |
@@ -357,7 +357,7 @@ wsl -l -v
 ip -4 -brief address
 ```
 
-当前 profile 要求地址中出现 `192.168.151.143/24`。如果 Windows Wi-Fi 地址改变，
+当前 profile 要求地址中出现 `192.168.151.145/24`。如果 Windows Wi-Fi 地址改变，
 必须同步更新两份 XML 和下面的防火墙规则。
 
 ### 配置 Windows 入站防火墙
@@ -412,7 +412,7 @@ ROS 2 Humble 已安装；若任一前提缺失，先按 Microsoft WSL 与 ROS 2 
 
 ```bash
 mkdir -p ~/go2_rviz/config/fastdds ~/go2_rviz/rviz
-GO2_RVIZ_CONFIG_REF=ea744e856e6296a52c2ee9dd825d02a01489901b
+GO2_RVIZ_CONFIG_REF=c7b060e13da89c165adb2bd05d76bfb9ce00f4e7
 
 curl --fail --location \
   "https://raw.githubusercontent.com/Aphra-neck/GO2_Hesai/${GO2_RVIZ_CONFIG_REF}/config/fastdds/wsl2_mirrored.xml" \
@@ -423,7 +423,7 @@ curl --fail --location \
   -o ~/go2_rviz/rviz/flat_obstacle_navigation.rviz
 ```
 
-`GO2_RVIZ_CONFIG_REF` 固定到本次实机验证通过的配置提交，避免 WSL2 与 Jetson 因
+`GO2_RVIZ_CONFIG_REF` 固定到当前双端地址配置提交，避免 WSL2 与 Jetson 因
 下载时刻不同而使用两个版本。以后有意修改 DDS 或 RViz 配置时，应在完成双端验证后
 同步更新这里的提交号。
 
@@ -436,7 +436,7 @@ curl --fail --location \
 grep -n '<address>' ~/go2_rviz/config/fastdds/wsl2_mirrored.xml
 ```
 
-输出必须同时包含 `192.168.151.213` 和 `192.168.151.143`。
+输出必须同时包含 `192.168.151.213` 和 `192.168.151.145`。
 
 ## 日常完整启动
 
@@ -1563,7 +1563,7 @@ ros2 daemon stop
 ros2 topic list --no-daemon
 ```
 
-两端 profile 都必须同时包含 `192.168.151.213` 与 `192.168.151.143`，且 whitelist
+两端 profile 都必须同时包含 `192.168.151.213` 与 `192.168.151.145`，且 whitelist
 地址必须属于本机。不要启动 `fastdds discovery`，不要设置 `ROS_DISCOVERY_SERVER`，
 也不要把 multicast 测试当作静态单播配置的通过条件。
 
