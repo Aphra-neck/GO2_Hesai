@@ -110,6 +110,18 @@ TEST(FlatObstacleLayer, RejectsGroundAnchorErrorAtObstacleHeightThreshold)
   EXPECT_THROW(FlatObstacleLayer layer(config), std::invalid_argument);
 }
 
+TEST(FlatObstacleLayer, RejectsInvalidBodyClearanceChangeLimit)
+{
+  auto config = layerConfig();
+  config.ground_fit.max_body_clearance_change = 0.0;
+  EXPECT_THROW(FlatObstacleLayer layer(config), std::invalid_argument);
+
+  config = layerConfig();
+  config.ground_fit.max_body_clearance_change =
+    config.ground_fit.max_anchor_error + 0.001;
+  EXPECT_THROW(FlatObstacleLayer layer(config), std::invalid_argument);
+}
+
 TEST(FlatObstacleLayer, TiltedFlatWorldPlaneRemainsFreeAcrossMovingBodyPoses)
 {
   auto config = layerConfig();
@@ -161,6 +173,31 @@ TEST(FlatObstacleLayer, BodyHeightChangeKeepsPreviouslyAnchoredWorldFloor)
   EXPECT_TRUE(snapshot.usable);
   EXPECT_EQ(countRaw(snapshot), 0U);
   EXPECT_TRUE(snapshot.obstacle_points.empty());
+}
+
+TEST(FlatObstacleLayer, BodyRiseCannotAcceptUnsupportedElevatedSurface)
+{
+  FlatObstacleLayer layer(layerConfig());
+  const auto floor = groundGrid();
+  layer.update(frame(floor, 1.0, false));
+  ASSERT_TRUE(layer.update(frame(floor, 1.1, true)).usable);
+
+  auto elevated_surface = floor;
+  for (auto & point : elevated_surface) {
+    point.z += 0.12;
+  }
+  auto raised_body = frame(elevated_surface, 1.2, true);
+  raised_body.body_position.z += 0.09;
+  raised_body.sensor_origin.z += 0.09;
+  for (int frame_index = 0; frame_index < 3; ++frame_index) {
+    raised_body.stamp_seconds = 1.2 + 0.1 * static_cast<double>(frame_index);
+    const auto update = layer.update(raised_body);
+
+    EXPECT_FALSE(update.usable);
+    EXPECT_EQ(update.status, FlatObstacleLayerStatus::kGroundFitFailed);
+    EXPECT_EQ(update.reason, "ground_anchor_error_above_limit");
+    EXPECT_FALSE(layer.snapshot().usable);
+  }
 }
 
 TEST(FlatObstacleLayer, DensePointsRequireDistinctSourceTimestampsToConfirm)

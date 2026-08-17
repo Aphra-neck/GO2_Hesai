@@ -62,6 +62,8 @@ terrain_mapper:
     flat_obstacle.ground_fit.max_range: 3.0
     flat_obstacle.ground_fit.seed_height_tolerance: 0.20
     flat_obstacle.ground_fit.max_anchor_error: 0.06
+    # Only applies when accepting a coherent world-height shift through the body anchor.
+    flat_obstacle.ground_fit.max_body_clearance_change: 0.02
     flat_obstacle.ground_fit.cell_size: 0.20
     flat_obstacle.ground_fit.min_points: 24
     flat_obstacle.ground_fit.min_span: 0.80

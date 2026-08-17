@@ -334,6 +334,9 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
                 "flat_obstacle.ground_fit.max_anchor_error": mapper[
                     "flat_obstacle.ground_fit.max_anchor_error"
                 ],
+                "flat_obstacle.ground_fit.max_body_clearance_change": mapper[
+                    "flat_obstacle.ground_fit.max_body_clearance_change"
+                ],
                 "flat_obstacle.ground_fit.cell_size": mapper[
                     "flat_obstacle.ground_fit.cell_size"
                 ],
@@ -376,6 +379,7 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
                 "flat_obstacle.ground_fit.max_range": 3.0,
                 "flat_obstacle.ground_fit.seed_height_tolerance": 0.20,
                 "flat_obstacle.ground_fit.max_anchor_error": 0.06,
+                "flat_obstacle.ground_fit.max_body_clearance_change": 0.02,
                 "flat_obstacle.ground_fit.cell_size": 0.20,
                 "flat_obstacle.ground_fit.min_points": 24,
                 "flat_obstacle.ground_fit.min_span": 0.80,
@@ -403,15 +407,13 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
                 ],
             },
             {
-                "flat_obstacle.footprint_length": 0.90,
-                "flat_obstacle.footprint_width": 0.55,
-                "flat_obstacle.obstacle_clearance": 0.10,
+                "flat_obstacle.footprint_length": 0.80,
+                "flat_obstacle.footprint_width": 0.45,
+                "flat_obstacle.obstacle_clearance": 0.00,
             },
         )
-        self.assertEqual(
-            mapper["flat_obstacle.obstacle_clearance"],
-            planner["flat_obstacle.obstacle_clearance"],
-        )
+        self.assertEqual(mapper["flat_obstacle.obstacle_clearance"], 0.10)
+        self.assertEqual(planner["flat_obstacle.obstacle_clearance"], 0.00)
 
     def test_map_capture_is_a_diagnostic_only_sidecar(self):
         description = _load_launch_description()

@@ -25,6 +25,7 @@ struct FlatObstacleGroundFitConfig
   double max_rmse{0.04};
   double max_tilt{0.20};
   double max_anchor_error{0.06};
+  double max_body_clearance_change{0.02};
 };
 
 struct FlatObstacleLayerConfig
@@ -180,8 +181,12 @@ private:
   std::size_t height_{0U};
   std::unordered_map<VoxelKey, VoxelEvidence, VoxelKeyHash> evidence_;
   FlatObstacleLayerSnapshot snapshot_;
+  FlatGroundPlane trusted_ground_plane_;
   double latest_stamp_seconds_{0.0};
+  double trusted_body_ground_clearance_{0.0};
   bool have_stamp_{false};
+  bool have_trusted_ground_plane_{false};
+  bool have_trusted_body_ground_clearance_{false};
   std::size_t accepted_epoch_frames_{0U};
 };
 

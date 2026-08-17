@@ -222,6 +222,8 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
     declare_parameter("flat_obstacle.ground_fit.max_tilt", 0.20);
   flat_config.ground_fit.max_anchor_error =
     declare_parameter("flat_obstacle.ground_fit.max_anchor_error", 0.06);
+  flat_config.ground_fit.max_body_clearance_change =
+    declare_parameter("flat_obstacle.ground_fit.max_body_clearance_change", 0.02);
   if (hit_confirmation_frames < 2 || clear_confirmation_frames < 1 ||
     ground_fit_min_points < 3)
   {

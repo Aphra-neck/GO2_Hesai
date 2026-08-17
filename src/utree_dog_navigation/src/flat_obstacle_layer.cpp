@@ -240,7 +240,10 @@ FlatObstacleLayer::FlatObstacleLayer(FlatObstacleLayerConfig config)
     fit.min_inlier_ratio > 1.0 || !std::isfinite(fit.max_rmse) || fit.max_rmse <= 0.0 ||
     !std::isfinite(fit.max_tilt) || fit.max_tilt <= 0.0 ||
     !std::isfinite(fit.max_anchor_error) || fit.max_anchor_error <= 0.0 ||
-    fit.max_anchor_error >= config_.min_height)
+    fit.max_anchor_error >= config_.min_height ||
+    !std::isfinite(fit.max_body_clearance_change) ||
+    fit.max_body_clearance_change <= 0.0 ||
+    fit.max_body_clearance_change > fit.max_anchor_error)
   {
     throw std::invalid_argument("flat obstacle layer configuration is invalid");
   }
@@ -415,6 +418,11 @@ FlatObstacleLayerUpdate FlatObstacleLayer::update(const FlatObstacleFrame & fram
   have_stamp_ = true;
   snapshot_.stamp_seconds = frame.stamp_seconds;
   snapshot_.ground_plane = plane;
+  trusted_ground_plane_ = plane;
+  have_trusted_ground_plane_ = true;
+  trusted_body_ground_clearance_ = frame.body_position.z -
+    plane.heightAt(frame.body_position.x, frame.body_position.y);
+  have_trusted_body_ground_clearance_ = true;
   snapshot_.raw_obstacles.assign(width_ * height_, 0U);
   snapshot_.obstacle_points.clear();
   std::size_t confirmed = 0U;
@@ -456,6 +464,10 @@ void FlatObstacleLayer::resetEpoch()
   accepted_epoch_frames_ = 0U;
   have_stamp_ = false;
   latest_stamp_seconds_ = 0.0;
+  trusted_ground_plane_ = FlatGroundPlane{};
+  have_trusted_ground_plane_ = false;
+  trusted_body_ground_clearance_ = 0.0;
+  have_trusted_body_ground_clearance_ = false;
   clearState(FlatObstacleLayerStatus::kUninitialized, "waiting_for_first_frame");
 }
 
@@ -614,14 +626,20 @@ bool FlatObstacleLayer::fitGroundPlane(
     return false;
   }
   const double fitted_ground = plane.heightAt(frame.body_position.x, frame.body_position.y);
-  double anchor_error = std::abs(fitted_ground - expected_ground);
-  if (accepted_epoch_frames_ != 0U) {
-    // Permit body articulation or a coherent world shift, but not an unsupported floor jump.
+  const double body_anchor_error = std::abs(fitted_ground - expected_ground);
+  bool anchor_valid = body_anchor_error <= config_.ground_fit.max_anchor_error;
+  if (have_trusted_ground_plane_) {
     const double trusted_ground =
-      snapshot_.ground_plane.heightAt(frame.body_position.x, frame.body_position.y);
-    anchor_error = std::min(anchor_error, std::abs(fitted_ground - trusted_ground));
+      trusted_ground_plane_.heightAt(frame.body_position.x, frame.body_position.y);
+    const double world_anchor_error = std::abs(fitted_ground - trusted_ground);
+    const double body_clearance_error = std::abs(
+      frame.body_position.z - fitted_ground - trusted_body_ground_clearance_);
+    anchor_valid = world_anchor_error <= config_.ground_fit.max_anchor_error ||
+      (have_trusted_body_ground_clearance_ &&
+      body_anchor_error <= config_.ground_fit.max_anchor_error &&
+      body_clearance_error <= config_.ground_fit.max_body_clearance_change);
   }
-  if (anchor_error > config_.ground_fit.max_anchor_error) {
+  if (!anchor_valid) {
     reason = "ground_anchor_error_above_limit";
     return false;
   }
@@ -832,6 +850,8 @@ std::vector<std::uint8_t> FlatObstacleLayer::inflate(
 
 void FlatObstacleLayer::clearState(FlatObstacleLayerStatus status, std::string reason)
 {
+  // Invalidate the published map on a transient fit failure; resetEpoch owns
+  // clearing the trusted ground anchor when the source coordinate epoch changes.
   evidence_.clear();
   accepted_epoch_frames_ = 0U;
   snapshot_.usable = false;
