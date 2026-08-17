@@ -504,6 +504,45 @@ TEST(FlatObstacleLayer, GroundFitUsesDominantSurfaceWhenSecondaryReturnsExceedIn
     layerConfig().ground_fit.min_inlier_ratio);
 }
 
+TEST(FlatObstacleLayer, GroundFitAllowsSlowlyConvergingBoundaryInliers)
+{
+  FlatObstacleLayer layer(layerConfig());
+  const std::vector<double> heights{
+    0.0358, -0.0233, -0.0124, -0.0466, 0.0003, 0.0456, 0.0525,
+    0.0473, -0.0308, -0.0382, -0.0183, -0.0094, 0.0046, 0.0588,
+    -0.0646, 0.0077, 0.0327, 0.0631, 0.0354, -0.0038, 0.0557,
+    -0.0537, -0.0565, -0.0154, -0.0393, 0.0423, 0.0438, 0.0174};
+  std::vector<TerrainPoint> points;
+  points.reserve(4U * heights.size());
+  std::size_t height_index = 0U;
+  for (int x_index = 0; x_index < 7; ++x_index) {
+    const double x = 0.5 + 0.2 * static_cast<double>(x_index);
+    for (int y_index = 0; y_index < 4; ++y_index) {
+      const double y = 0.5 + 0.2 * static_cast<double>(y_index);
+      const double z = heights[height_index++];
+      points.insert(
+        points.end(), {{-x, -y, z}, {-x, y, z}, {x, -y, z}, {x, y, z}});
+    }
+  }
+
+  const auto update = layer.update(frame(points, 1.0, false));
+
+  ASSERT_TRUE(update.accepted);
+  ASSERT_NE(update.status, FlatObstacleLayerStatus::kGroundFitFailed) << update.reason;
+  EXPECT_GE(
+    static_cast<double>(update.ground_plane.inlier_points) /
+    static_cast<double>(update.ground_plane.candidate_points),
+    layerConfig().ground_fit.min_inlier_ratio);
+  EXPECT_LE(update.ground_plane.rmse, layerConfig().ground_fit.max_rmse);
+  EXPECT_LE(
+    std::atan(std::hypot(
+      update.ground_plane.slope_x, update.ground_plane.slope_y)),
+    layerConfig().ground_fit.max_tilt);
+  EXPECT_LE(
+    std::abs(update.ground_plane.intercept),
+    layerConfig().ground_fit.max_anchor_error);
+}
+
 TEST(FlatObstacleLayer, GroundFitRejectsInliersWithoutTwoDimensionalCoverage)
 {
   FlatObstacleLayer layer(layerConfig());

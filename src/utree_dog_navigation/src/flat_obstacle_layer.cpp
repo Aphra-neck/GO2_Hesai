@@ -16,7 +16,8 @@ namespace
 constexpr double kSolveEpsilon = 1.0e-10;
 constexpr double kRayEpsilon = 1.0e-10;
 constexpr int kRobustGroundFitIterations = 4;
-constexpr int kHardGroundFitIterations = 8;
+// Near-threshold return bands can migrate one group per refit before reaching a fixed consensus.
+constexpr int kHardGroundFitIterations = 32;
 
 bool finitePoint(const TerrainPoint & point) noexcept
 {
