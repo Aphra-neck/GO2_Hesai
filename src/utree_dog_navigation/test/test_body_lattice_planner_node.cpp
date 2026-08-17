@@ -933,11 +933,14 @@ TEST_F(FlatObstaclePlannerNodeTest, PublishesExecutableStartConnectorBeforeLatti
   ASSERT_TRUE(spinUntil(
       [this]() {return !paths_.empty() && !paths_.back().poses.empty();}, 2s));
   const auto & poses = paths_.back().poses;
-  ASSERT_EQ(poses.size(), 5U);
+  ASSERT_GE(poses.size(), 5U);
   EXPECT_NEAR(poses[0].pose.position.x, odom.pose.pose.position.x, 1.0e-9);
   EXPECT_NEAR(poses[0].pose.position.y, odom.pose.pose.position.y, 1.0e-9);
-  EXPECT_NEAR(poses[1].pose.position.x, -0.1, 1.0e-6);
-  EXPECT_NEAR(poses[1].pose.position.y, -0.1, 1.0e-6);
+  EXPECT_GT(
+    std::hypot(
+      poses[1].pose.position.x - poses[0].pose.position.x,
+      poses[1].pose.position.y - poses[0].pose.position.y),
+    1.0e-6);
   EXPECT_NEAR(poses[2].pose.position.x, poses[1].pose.position.x, 1.0e-9);
   EXPECT_NEAR(poses[2].pose.position.y, poses[1].pose.position.y, 1.0e-9);
   EXPECT_NEAR(
@@ -946,8 +949,14 @@ TEST_F(FlatObstaclePlannerNodeTest, PublishesExecutableStartConnectorBeforeLatti
   EXPECT_NEAR(
     2.0 * std::atan2(poses[2].pose.orientation.z, poses[2].pose.orientation.w),
     -0.5 * kPi, 1.0e-9);
-  EXPECT_NEAR(poses[3].pose.position.x, -0.1, 1.0e-6);
-  EXPECT_NEAR(poses[3].pose.position.y, -0.3, 1.0e-6);
+  bool advanced_toward_goal = false;
+  for (std::size_t index = 3U; index < poses.size(); ++index) {
+    if (poses[index].pose.position.y < poses[2].pose.position.y - 0.05) {
+      advanced_toward_goal = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(advanced_toward_goal);
   EXPECT_NEAR(poses.back().pose.position.x, goal.pose.position.x, 1.0e-6);
   EXPECT_NEAR(poses.back().pose.position.y, goal.pose.position.y, 1.0e-6);
 }

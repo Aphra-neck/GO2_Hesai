@@ -42,7 +42,8 @@ terrain_mapper:
     # Diagnostic only: warn when cloud delivery or its source stamp stops advancing.
     cloud_stale_warning_age: 1.0
     # Keep rebuild recovery aligned with body_lattice_planner.start_snap_radius.
-    confidence_rebuild.start_radius: 0.55
+    # Commissioning mode uses a broad recovery window on sparse near-field maps.
+    confidence_rebuild.start_radius: 0.80
     # flat_obstacle is an explicitly confirmed, standing-robot mode. It fits
     # local ground in each synchronized frame and projects actual filtered
     # Super-LIO obstacle points into the 2D planner.
@@ -55,7 +56,8 @@ terrain_mapper:
     flat_obstacle.hit_confirmation_window: 0.35
     flat_obstacle.clear_confirmation_frames: 2
     flat_obstacle.clear_confirmation_window: 0.35
-    flat_obstacle.obstacle_clearance: 0.10
+    # Do not add a second grid-cell margin at the 0.20 m map resolution.
+    flat_obstacle.obstacle_clearance: 0.00
     # Stationary XT-16 calibration: body z minus observed floor z.
     flat_obstacle.nominal_body_height: 0.34
     flat_obstacle.max_odom_age: 0.5
@@ -111,12 +113,13 @@ body_lattice_planner:
     lateral_cost_factor: 1.25
     max_expansions: 250000
     # XT-16 has an unobserved near-field ring around the body. Keep this
-    # bounded start-only allowance separate from goal snapping.
-    start_snap_radius: 0.55
-    snap_radius: 0.50
-    # Initial deployment uses a tight body envelope; tune dynamic leg margin later.
-    flat_obstacle.footprint_length: 0.80
-    flat_obstacle.footprint_width: 0.45
+    # Broad commissioning recovery; the connector is still collision checked.
+    start_snap_radius: 0.80
+    snap_radius: 0.80
+    # Central-torso envelope for open-field bring-up. Restore the measured
+    # leg-inclusive footprint before obstacle-rich deployment.
+    flat_obstacle.footprint_length: 0.60
+    flat_obstacle.footprint_width: 0.30
     flat_obstacle.obstacle_clearance: 0.00
     verified_flat_start.enabled: false
     verified_flat_start.support_inner_radius: 1.0

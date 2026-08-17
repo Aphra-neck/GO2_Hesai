@@ -39,9 +39,9 @@ enum class PlanningMode : std::uint8_t
 
 struct FlatObstacleConfig
 {
-  double footprint_length{0.90};
-  double footprint_width{0.55};
-  double obstacle_clearance{0.10};
+  double footprint_length{0.60};
+  double footprint_width{0.30};
+  double obstacle_clearance{0.00};
   // Surface elevation used by PlannedGridState. The node may instead lock body Z directly.
   double surface_elevation{0.0};
 };
@@ -61,7 +61,7 @@ struct LatticePlannerConfig
   double reverse_cost_factor{1.15};
   double lateral_cost_factor{1.25};
   int max_expansions{250000};
-  double snap_radius{0.5};
+  double snap_radius{0.8};
   // A negative value preserves the legacy contract: use snap_radius for both endpoints.
   double start_snap_radius{-1.0};
   VerifiedFlatStartConfig verified_flat_start{};

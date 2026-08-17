@@ -154,7 +154,7 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
   integration_window_ = config.integration_window;
   min_observed_frames_ = config.min_observed_frames;
   confidence_rebuild_start_radius_ =
-    declare_parameter("confidence_rebuild.start_radius", 0.55);
+    declare_parameter("confidence_rebuild.start_radius", 0.80);
   if (!std::isfinite(integration_window_) || integration_window_ <= 0.0) {
     throw std::invalid_argument("integration_window must be finite and greater than zero");
   }
@@ -193,7 +193,7 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
   flat_config.voxel_resolution_z =
     declare_parameter("flat_obstacle.voxel_resolution_z", 0.10);
   flat_config.obstacle_clearance =
-    declare_parameter("flat_obstacle.obstacle_clearance", 0.10);
+    declare_parameter("flat_obstacle.obstacle_clearance", 0.00);
   const int hit_confirmation_frames =
     declare_parameter("flat_obstacle.hit_confirmation_frames", 2);
   flat_config.hit_confirmation_window =

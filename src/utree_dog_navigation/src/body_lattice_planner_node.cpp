@@ -123,14 +123,14 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
   config.reverse_cost_factor = declare_parameter("reverse_cost_factor", 1.15);
   config.lateral_cost_factor = declare_parameter("lateral_cost_factor", 1.25);
   config.max_expansions = declare_parameter("max_expansions", 250000);
-  config.snap_radius = declare_parameter("snap_radius", 0.5);
+  config.snap_radius = declare_parameter("snap_radius", 0.8);
   config.start_snap_radius = declare_parameter("start_snap_radius", config.snap_radius);
   config.flat_obstacle.footprint_length =
-    declare_parameter("flat_obstacle.footprint_length", 0.90);
+    declare_parameter("flat_obstacle.footprint_length", 0.60);
   config.flat_obstacle.footprint_width =
-    declare_parameter("flat_obstacle.footprint_width", 0.55);
+    declare_parameter("flat_obstacle.footprint_width", 0.30);
   config.flat_obstacle.obstacle_clearance =
-    declare_parameter("flat_obstacle.obstacle_clearance", 0.10);
+    declare_parameter("flat_obstacle.obstacle_clearance", 0.00);
   config.verified_flat_start.enabled =
     declare_parameter("verified_flat_start.enabled", false);
   config.verified_flat_start.support_inner_radius =

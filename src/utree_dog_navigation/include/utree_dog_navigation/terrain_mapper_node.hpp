@@ -100,7 +100,7 @@ private:
   double self_width_{0.55};
   double self_height_{0.7};
   double integration_window_{1.5};
-  double confidence_rebuild_start_radius_{0.55};
+  double confidence_rebuild_start_radius_{0.80};
   int min_observed_frames_{4};
   double publish_rate_{2.0};
   double cloud_stale_warning_age_{1.0};

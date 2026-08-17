@@ -385,6 +385,9 @@ TEST(LatticePlanner, FlatObstacleModeAppliesFootprintClearanceAtEndpoints)
   config.planning_mode = PlanningMode::kFlatObstacle;
   config.start_snap_radius = 1.0;
   config.snap_radius = 0.0;
+  config.flat_obstacle.footprint_length = 0.90;
+  config.flat_obstacle.footprint_width = 0.55;
+  config.flat_obstacle.obstacle_clearance = 0.10;
   LatticePlanner planner(config);
   planner.setMap(map);
 
@@ -431,6 +434,9 @@ TEST(LatticePlanner, FlatObstacleModeFindsExecutableStartWithinStartSnapRadius)
   config.motion_step = 0.2;
   config.start_snap_radius = 0.55;
   config.snap_radius = 0.0;
+  config.flat_obstacle.footprint_length = 0.90;
+  config.flat_obstacle.footprint_width = 0.55;
+  config.flat_obstacle.obstacle_clearance = 0.10;
   LatticePlanner planner(config);
   planner.setMap(map);
 
@@ -444,6 +450,33 @@ TEST(LatticePlanner, FlatObstacleModeFindsExecutableStartWithinStartSnapRadius)
   EXPECT_EQ(result.states.front().x, 100);
   EXPECT_EQ(result.states.front().y, 99);
   EXPECT_EQ(result.states.front().yaw, 12);
+}
+
+TEST(LatticePlanner, FlatObstacleModeCommissioningEnvelopeClearsObservedStartSnapNoise)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  auto map = makeFlatObstacleMap(0.2F, 200, 200);
+  map->origin_x = -20.2F;
+  map->origin_y = -20.0F;
+  // Reproduces the intermittent left-rear cell observed beside the live Go2 start pose.
+  markFlatObstacle(map, 98, 103);
+
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 16;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.14;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan(
+    {-0.032, 0.025, -91.87 * kPi / 180.0},
+    {-0.1, -0.1, -0.5 * kPi});
+
+  ASSERT_TRUE(result.success);
+  EXPECT_TRUE(result.include_exact_start);
+  EXPECT_FALSE(result.states.empty());
 }
 
 TEST(LatticePlanner, FlatObstacleModeKeepsStartRecoveryInsideStartSnapRadius)
@@ -460,6 +493,9 @@ TEST(LatticePlanner, FlatObstacleModeKeepsStartRecoveryInsideStartSnapRadius)
   config.motion_step = 0.2;
   config.start_snap_radius = 0.14;
   config.snap_radius = 0.0;
+  config.flat_obstacle.footprint_length = 0.90;
+  config.flat_obstacle.footprint_width = 0.55;
+  config.flat_obstacle.obstacle_clearance = 0.10;
   LatticePlanner planner(config);
   planner.setMap(map);
 
@@ -483,6 +519,9 @@ TEST(LatticePlanner, FlatObstacleModeRejectsBlockedStartConnectorWithFreeEndpoin
   config.motion_step = 0.2;
   config.start_snap_radius = 0.0;
   config.snap_radius = 0.0;
+  config.flat_obstacle.footprint_length = 0.90;
+  config.flat_obstacle.footprint_width = 0.55;
+  config.flat_obstacle.obstacle_clearance = 0.10;
   LatticePlanner planner(config);
   planner.setMap(map);
 
@@ -593,6 +632,9 @@ TEST(LatticePlanner, FlatObstacleModeChecksIntermediateRotationFootprint)
   config.start_snap_radius = 0.0;
   config.snap_radius = 0.0;
   config.max_expansions = 2;
+  config.flat_obstacle.footprint_length = 0.90;
+  config.flat_obstacle.footprint_width = 0.55;
+  config.flat_obstacle.obstacle_clearance = 0.10;
   LatticePlanner clear_planner(config);
   clear_planner.setMap(clear_map);
   ASSERT_TRUE(clear_planner.plan({2.01, 2.01, 0.0}, {2.01, 2.01, kQuarterTurn}).success);

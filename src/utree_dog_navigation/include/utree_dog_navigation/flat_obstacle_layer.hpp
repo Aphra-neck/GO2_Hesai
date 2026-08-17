@@ -44,7 +44,7 @@ struct FlatObstacleLayerConfig
   double self_width{0.55};
   double self_height{0.70};
   double nominal_body_height{0.34};
-  double obstacle_clearance{0.10};
+  double obstacle_clearance{0.00};
   std::size_t hit_confirmation_frames{2U};
   double hit_confirmation_window{0.35};
   std::size_t clear_confirmation_frames{2U};
