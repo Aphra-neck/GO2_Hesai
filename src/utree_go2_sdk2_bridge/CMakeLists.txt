@@ -24,6 +24,17 @@ find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(unitree_sdk2 REQUIRED)
 
+# unitree_sdk2 installs generated DDS message headers under include/unitree,
+# while their CycloneDDS C++ dependencies live under include/ddscxx. Some SDK2
+# releases omit the latter from the exported target include directories.
+find_path(UNITREE_DDSCXX_INCLUDE_DIR
+  NAMES org/eclipse/cyclonedds/topic/datatopic.hpp
+  PATH_SUFFIXES include/ddscxx)
+if(NOT UNITREE_DDSCXX_INCLUDE_DIR)
+  message(FATAL_ERROR
+    "CycloneDDS C++ headers required by Unitree SDK2 messages were not found")
+endif()
+
 add_library(control_safety STATIC src/control_safety.cpp)
 target_include_directories(control_safety PUBLIC include)
 ament_target_dependencies(control_safety geometry_msgs)
@@ -31,7 +42,9 @@ ament_target_dependencies(control_safety geometry_msgs)
 add_executable(go2_sdk2_bridge_node
   src/go2_sdk2_bridge_node.cpp
   src/go2_sdk2_bridge_main.cpp)
-target_include_directories(go2_sdk2_bridge_node PRIVATE include)
+target_include_directories(go2_sdk2_bridge_node PRIVATE
+  include
+  ${UNITREE_DDSCXX_INCLUDE_DIR})
 target_link_libraries(go2_sdk2_bridge_node control_safety unitree_sdk2)
 ament_target_dependencies(go2_sdk2_bridge_node
   geometry_msgs nav_msgs rclcpp rcl_interfaces std_srvs tf2 tf2_geometry_msgs)

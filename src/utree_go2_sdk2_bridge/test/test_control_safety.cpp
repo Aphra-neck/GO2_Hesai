@@ -11,7 +11,7 @@ namespace
 ControlParameters validParameters()
 {
   return ControlParameters{
-    20.0, 1.0, 0.5, 0.2, 0.6, 0.15, 0.2,
+    20.0, 1.0, 0.5, 1.0, 3.0, 0.25, 0.2, 0.6, 0.15, 0.2,
     0.7853981633974483, 0.2617993877991494,
     0.05, 1.0, 1.5, 0.6, 0.35, 0.8};
 }
@@ -65,6 +65,18 @@ TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 
   parameters = validParameters();
+  parameters.sport_state_timeout = 0.0;
+  EXPECT_FALSE(validateControlParameters(parameters).empty());
+
+  parameters = validParameters();
+  parameters.balance_stand_timeout = std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(validateControlParameters(parameters).empty());
+
+  parameters = validParameters();
+  parameters.balance_stand_retry_interval = parameters.balance_stand_timeout;
+  EXPECT_FALSE(validateControlParameters(parameters).empty());
+
+  parameters = validParameters();
   parameters.goal_yaw_tolerance = 4.0;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 
@@ -79,6 +91,66 @@ TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
   parameters = validParameters();
   parameters.max_vy = -0.1;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
+}
+
+TEST(SportMotionState, UnlocksOnlyTheStandingLock)
+{
+  EXPECT_EQ(
+    classifySportMotionState(1002U),
+    SportMotionPreparation::kRequestBalanceStand);
+  EXPECT_STREQ(sportMotionStateName(1002U), "standing lock");
+
+  EXPECT_EQ(classifySportMotionState(100U), SportMotionPreparation::kReady);
+  EXPECT_EQ(classifySportMotionState(1013U), SportMotionPreparation::kReady);
+}
+
+TEST(SportMotionState, RejectsDampingAndOtherMotionModes)
+{
+  for (const std::uint32_t state_code :
+    {1001U, 1004U, 1007U, 1015U, 2010U, 9999U})
+  {
+    EXPECT_EQ(
+      classifySportMotionState(state_code), SportMotionPreparation::kReject)
+      << "state_code=" << state_code;
+  }
+  EXPECT_STREQ(sportMotionStateName(1001U), "damping");
+  EXPECT_STREQ(sportMotionStateName(9999U), "unknown");
+}
+
+TEST(BalanceStandRetry, WaitsThenRetriesWhileStandingLockPersists)
+{
+  EXPECT_EQ(
+    evaluateBalanceStandRetry(1002U, 0.10, 0.10, 0.25, 3.0),
+    BalanceStandRetryAction::kWait);
+  EXPECT_EQ(
+    evaluateBalanceStandRetry(1002U, 0.25, 0.25, 0.25, 3.0),
+    BalanceStandRetryAction::kRetry);
+}
+
+TEST(BalanceStandRetry, ConfirmsOnlyAnExecutableStateTransition)
+{
+  EXPECT_EQ(
+    evaluateBalanceStandRetry(1013U, 0.30, 0.05, 0.25, 3.0),
+    BalanceStandRetryAction::kReady);
+  EXPECT_EQ(
+    evaluateBalanceStandRetry(100U, 0.30, 0.05, 0.25, 3.0),
+    BalanceStandRetryAction::kReady);
+  EXPECT_EQ(
+    evaluateBalanceStandRetry(1001U, 0.30, 0.05, 0.25, 3.0),
+    BalanceStandRetryAction::kReject);
+  EXPECT_EQ(
+    evaluateBalanceStandRetry(1013U, 3.0, 0.25, 0.25, 3.0),
+    BalanceStandRetryAction::kReady);
+  EXPECT_EQ(
+    evaluateBalanceStandRetry(1001U, 3.0, 0.25, 0.25, 3.0),
+    BalanceStandRetryAction::kReject);
+}
+
+TEST(BalanceStandRetry, TimesOutWithoutOneFinalRetry)
+{
+  EXPECT_EQ(
+    evaluateBalanceStandRetry(1002U, 3.0, 0.25, 0.25, 3.0),
+    BalanceStandRetryAction::kTimedOut);
 }
 
 TEST(ControlParameters, AcceptsValuesWithinTheSdkCapabilityEnvelope)

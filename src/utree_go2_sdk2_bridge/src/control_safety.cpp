@@ -63,6 +63,78 @@ void MotionAuthorization::disarm()
   state_ = MotionAuthorizationState::kDisarmed;
 }
 
+SportMotionPreparation classifySportMotionState(std::uint32_t state_code)
+{
+  switch (state_code) {
+    case 100U:    // Agile.
+    case 1013U:   // Balance standing.
+      return SportMotionPreparation::kReady;
+    case 1002U:   // Standing lock.
+      return SportMotionPreparation::kRequestBalanceStand;
+    default:
+      return SportMotionPreparation::kReject;
+  }
+}
+
+const char * sportMotionStateName(std::uint32_t state_code)
+{
+  switch (state_code) {
+    case 100U: return "agile";
+    case 1001U: return "damping";
+    case 1002U: return "standing lock";
+    case 1004U:
+    case 2006U: return "crouch";
+    case 1006U: return "special action";
+    case 1007U: return "sit";
+    case 1008U: return "front jump";
+    case 1009U: return "front pounce";
+    case 1013U: return "balance standing";
+    case 1015U: return "regular walking";
+    case 1016U: return "regular running";
+    case 1017U: return "regular endurance";
+    case 1091U: return "pose";
+    case 2007U: return "avoidance";
+    case 2008U: return "bound run";
+    case 2009U: return "jump run";
+    case 2010U: return "classic walk";
+    case 2011U: return "handstand";
+    case 2012U: return "front flip";
+    case 2013U: return "back flip";
+    case 2014U: return "left flip";
+    case 2016U: return "cross step";
+    case 2017U: return "upright";
+    case 2019U: return "towing";
+    default: return "unknown";
+  }
+}
+
+BalanceStandRetryAction evaluateBalanceStandRetry(
+  std::uint32_t state_code,
+  double elapsed,
+  double since_last_attempt,
+  double retry_interval,
+  double timeout)
+{
+  const auto preparation = classifySportMotionState(state_code);
+  if (preparation == SportMotionPreparation::kReady) {
+    return BalanceStandRetryAction::kReady;
+  }
+  if (preparation == SportMotionPreparation::kReject) {
+    return BalanceStandRetryAction::kReject;
+  }
+  if (!std::isfinite(elapsed) || !std::isfinite(since_last_attempt) ||
+    !std::isfinite(retry_interval) || !std::isfinite(timeout) ||
+    elapsed < 0.0 || since_last_attempt < 0.0 || retry_interval <= 0.0 || timeout <= 0.0)
+  {
+    return BalanceStandRetryAction::kReject;
+  }
+  if (elapsed >= timeout) {
+    return BalanceStandRetryAction::kTimedOut;
+  }
+  return since_last_attempt >= retry_interval ?
+    BalanceStandRetryAction::kRetry : BalanceStandRetryAction::kWait;
+}
+
 std::string validateControlParameters(const ControlParameters & parameters)
 {
   // These are hard rejection limits, not operating recommendations. Runtime
@@ -75,6 +147,18 @@ std::string validateControlParameters(const ControlParameters & parameters)
   }
   if (!inPositiveRange(parameters.odom_timeout, 60.0)) {
     return "odom_timeout must be finite and in (0, 60] seconds";
+  }
+  if (!inPositiveRange(parameters.sport_state_timeout, 60.0)) {
+    return "sport_state_timeout must be finite and in (0, 60] seconds";
+  }
+  if (!inPositiveRange(parameters.balance_stand_timeout, 60.0)) {
+    return "balance_stand_timeout must be finite and in (0, 60] seconds";
+  }
+  if (!std::isfinite(parameters.balance_stand_retry_interval) ||
+    parameters.balance_stand_retry_interval <= 0.0 ||
+    parameters.balance_stand_retry_interval >= parameters.balance_stand_timeout)
+  {
+    return "balance_stand_retry_interval must be finite and in (0, balance_stand_timeout) seconds";
   }
   if (!inClosedRange(parameters.timestamp_future_tolerance, 0.0, 5.0)) {
     return "timestamp_future_tolerance must be finite and in [0, 5] seconds";

@@ -11,6 +11,9 @@ go2_sdk2_bridge:
     command_rate: 20.0
     path_timeout: 1.0
     odom_timeout: 0.5
+    sport_state_timeout: 1.0
+    balance_stand_timeout: 3.0
+    balance_stand_retry_interval: 0.25
     timestamp_future_tolerance: 0.2
     lookahead_distance: 0.6
     goal_position_tolerance: 0.15

@@ -36,6 +36,10 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   command_rate_ = declare_parameter("command_rate", 20.0);
   path_timeout_ = declare_parameter("path_timeout", 1.0);
   odom_timeout_ = declare_parameter("odom_timeout", 0.5);
+  sport_state_timeout_ = declare_parameter("sport_state_timeout", 1.0);
+  balance_stand_timeout_ = declare_parameter("balance_stand_timeout", 3.0);
+  balance_stand_retry_interval_ =
+    declare_parameter("balance_stand_retry_interval", 0.25);
   timestamp_future_tolerance_ = declare_parameter("timestamp_future_tolerance", 0.2);
   lookahead_distance_ = declare_parameter("lookahead_distance", 0.6);
   goal_position_tolerance_ = declare_parameter("goal_position_tolerance", 0.15);
@@ -76,7 +80,8 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
             "world_frame, body_frame, path_topic, and odom_topic must not be empty");
   }
   const ControlParameters parameters{
-    command_rate_, path_timeout_, odom_timeout_, timestamp_future_tolerance_,
+    command_rate_, path_timeout_, odom_timeout_, sport_state_timeout_,
+    balance_stand_timeout_, balance_stand_retry_interval_, timestamp_future_tolerance_,
     lookahead_distance_, goal_position_tolerance_, goal_yaw_tolerance_,
     heading_alignment_enter_angle_, heading_alignment_exit_angle_,
     explicit_rotation_tolerance_,
@@ -90,6 +95,12 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   sport_client_ = std::make_unique<unitree::robot::go2::SportClient>();
   sport_client_->SetTimeout(0.5F);
   sport_client_->Init();
+
+  sport_state_sub_ = std::make_shared<
+    unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(
+    "rt/sportmodestate");
+  sport_state_sub_->InitChannel(
+    std::bind(&Go2Sdk2BridgeNode::sportStateCallback, this, std::placeholders::_1), 1);
 
   path_sub_ = create_subscription<nav_msgs::msg::Path>(
     // Execute only paths published after this bridge subscription is matched.
@@ -120,6 +131,13 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
 
 Go2Sdk2BridgeNode::~Go2Sdk2BridgeNode() noexcept
 {
+  try {
+    if (sport_state_sub_) {
+      sport_state_sub_->CloseChannel();
+    }
+  } catch (...) {
+    std::fprintf(stderr, "go2_sdk2_bridge: failed to close sport state subscription\n");
+  }
   if (!sport_client_ || !command_active_) {
     return;
   }
@@ -324,6 +342,7 @@ void Go2Sdk2BridgeNode::enableCallback(
       path_progress_tracker_.reset();
       completed_goal_latch_.clear();
       heading_alignment_active_ = false;
+      balance_stand_pending_ = false;
       const bool stopped = stopRobot("motion disabled by service");
       response->success = stopped;
       response->message = command_active_ ?
@@ -361,16 +380,70 @@ void Go2Sdk2BridgeNode::enableCallback(
         return;
       }
     }
+
+    const auto sport_state_code = freshSportStateCode();
+    if (!sport_state_code) {
+      failSafe("missing or stale Unitree sport state while enabling motion");
+      response->success = false;
+      response->message =
+        "Cannot arm: rt/sportmodestate is missing or stale";
+      return;
+    }
+    const auto preparation = classifySportMotionState(*sport_state_code);
+    if (preparation == SportMotionPreparation::kReject) {
+      failSafe("Unitree sport state is not executable");
+      response->success = false;
+      response->message =
+        "Cannot arm: Unitree motion state " + std::to_string(*sport_state_code) +
+        " (" + sportMotionStateName(*sport_state_code) + ") is not executable";
+      return;
+    }
+    if (preparation == SportMotionPreparation::kRequestBalanceStand &&
+      !balance_stand_pending_)
+    {
+      // BalanceStand can affect the robot even if its RPC reply is lost. Mark
+      // the command active first so every failure or disable path sends StopMove.
+      command_active_ = true;
+      const int32_t status = sport_client_->BalanceStand();
+      if (status != 0) {
+        failSafe("BalanceStand returned an error while releasing standing lock");
+        response->success = false;
+        response->message =
+          "Cannot arm: BalanceStand failed with status " + std::to_string(status);
+        return;
+      }
+      balance_stand_pending_ = true;
+      const auto request_time = std::chrono::steady_clock::now();
+      balance_stand_requested_at_ = request_time;
+      balance_stand_last_attempt_at_ = request_time;
+      RCLCPP_WARN(
+        get_logger(),
+        "Requested BalanceStand to release Unitree standing lock (state 1002)");
+    }
+    if (preparation == SportMotionPreparation::kReady) {
+      balance_stand_pending_ = false;
+    }
     if (motion_authorization_.armed()) {
       response->success = true;
-      response->message = motion_authorization_.executionAuthorized() ?
-        "Go2 motion is already armed" : "Go2 motion is already armed and waiting for a path";
+      if (balance_stand_pending_) {
+        response->message =
+          "Go2 motion is already armed; waiting for standing lock release";
+      } else {
+        response->message = motion_authorization_.executionAuthorized() ?
+          "Go2 motion is already armed" :
+          "Go2 motion is already armed and waiting for a path";
+      }
       return;
     }
     motion_authorization_.arm(path_ != nullptr);
     response->success = true;
-    response->message = path_ ?
-      "Go2 motion armed" : "Go2 motion armed; waiting for a fresh body path";
+    if (balance_stand_pending_) {
+      response->message =
+        "Go2 motion armed; requested BalanceStand to release standing lock";
+    } else {
+      response->message = path_ ?
+        "Go2 motion armed" : "Go2 motion armed; waiting for a fresh body path";
+    }
   } catch (const std::exception & exception) {
     failSafe("exception while changing motion state");
     if (response) {
@@ -412,6 +485,67 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   }
   if (!motion_authorization_.armed()) {
     stopRobot("retrying unconfirmed stop while motion is disabled");
+    return;
+  }
+  const auto sport_state_code = freshSportStateCode();
+  if (!sport_state_code) {
+    failSafe("Unitree sport state timeout");
+    RCLCPP_ERROR(
+      get_logger(), "Stopped because rt/sportmodestate is missing or stale");
+    return;
+  }
+  const auto preparation = classifySportMotionState(*sport_state_code);
+  if (balance_stand_pending_) {
+    const auto current_steady_time = std::chrono::steady_clock::now();
+    const double elapsed = std::chrono::duration<double>(
+      current_steady_time - balance_stand_requested_at_).count();
+    const double since_last_attempt = std::chrono::duration<double>(
+      current_steady_time - balance_stand_last_attempt_at_).count();
+    switch (evaluateBalanceStandRetry(
+        *sport_state_code, elapsed, since_last_attempt,
+        balance_stand_retry_interval_, balance_stand_timeout_))
+    {
+      case BalanceStandRetryAction::kReady:
+        balance_stand_pending_ = false;
+        RCLCPP_INFO(
+          get_logger(), "Unitree standing lock released; state=%u (%s)",
+          *sport_state_code, sportMotionStateName(*sport_state_code));
+        break;
+      case BalanceStandRetryAction::kWait:
+        return;
+      case BalanceStandRetryAction::kRetry: {
+        const int32_t status = sport_client_->BalanceStand();
+        if (status != 0) {
+          failSafe("BalanceStand retry returned an error");
+          RCLCPP_ERROR(
+            get_logger(), "BalanceStand retry failed with status %d", status);
+          return;
+        }
+        balance_stand_last_attempt_at_ = std::chrono::steady_clock::now();
+        RCLCPP_WARN(
+          get_logger(),
+          "Retried BalanceStand after %.3f s; standing lock remains active", elapsed);
+        return;
+      }
+      case BalanceStandRetryAction::kTimedOut:
+        failSafe("BalanceStand did not release Unitree standing lock");
+        RCLCPP_ERROR(
+          get_logger(),
+          "BalanceStand timed out after %.3f s; state=%u (%s)", elapsed,
+          *sport_state_code, sportMotionStateName(*sport_state_code));
+        return;
+      case BalanceStandRetryAction::kReject:
+        failSafe("Unitree sport state changed while releasing standing lock");
+        RCLCPP_ERROR(
+          get_logger(), "Stopped while releasing standing lock; state=%u (%s)",
+          *sport_state_code, sportMotionStateName(*sport_state_code));
+        return;
+    }
+  } else if (preparation != SportMotionPreparation::kReady) {
+    failSafe("Unitree sport state became non-executable");
+    RCLCPP_ERROR(
+      get_logger(), "Stopped in Unitree motion state %u (%s)",
+      *sport_state_code, sportMotionStateName(*sport_state_code));
     return;
   }
   const rclcpp::Time current_time = now();
@@ -582,7 +716,20 @@ void Go2Sdk2BridgeNode::failSafe(const char * reason)
   path_progress_tracker_.reset();
   completed_goal_latch_.clear();
   heading_alignment_active_ = false;
+  balance_stand_pending_ = false;
   stopRobot(reason);
+}
+
+void Go2Sdk2BridgeNode::sportStateCallback(const void * message)
+{
+  if (!message) {
+    return;
+  }
+  const auto * state =
+    static_cast<const unitree_go::msg::dds_::SportModeState_ *>(message);
+  const std::lock_guard<std::mutex> lock(sport_state_mutex_);
+  sport_state_code_ = state->error_code();
+  sport_state_received_at_ = std::chrono::steady_clock::now();
 }
 
 bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
@@ -592,6 +739,9 @@ bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
   path_progress_tracker_.reset();
   motion_authorization_.waitForPath();
   heading_alignment_active_ = false;
+  if (balance_stand_pending_) {
+    return true;
+  }
   const bool stopped = stopRobot(reason);
   if (!stopped) {
     motion_authorization_.disarm();
@@ -684,6 +834,27 @@ bool Go2Sdk2BridgeNode::messageStampFresh(
 {
   const double age = messageAgeSeconds(message_time, current_time);
   return std::isfinite(age) && age >= -timestamp_future_tolerance_ && age <= timeout;
+}
+
+std::optional<std::uint32_t> Go2Sdk2BridgeNode::freshSportStateCode() const
+{
+  std::uint32_t state_code = 0U;
+  std::chrono::steady_clock::time_point received_at;
+  {
+    const std::lock_guard<std::mutex> lock(sport_state_mutex_);
+    if (!sport_state_code_) {
+      return std::nullopt;
+    }
+    state_code = *sport_state_code_;
+    received_at = sport_state_received_at_;
+  }
+  const auto current_time = std::chrono::steady_clock::now();
+  const double age = std::chrono::duration<double>(
+    current_time - received_at).count();
+  if (!std::isfinite(age) || age < 0.0 || age > sport_state_timeout_) {
+    return std::nullopt;
+  }
+  return state_code;
 }
 
 bool Go2Sdk2BridgeNode::lowcmdPublisherPresent()

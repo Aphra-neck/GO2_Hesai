@@ -32,6 +32,9 @@ struct ControlParameters
   double command_rate;
   double path_timeout;
   double odom_timeout;
+  double sport_state_timeout;
+  double balance_stand_timeout;
+  double balance_stand_retry_interval;
   double timestamp_future_tolerance;
   double lookahead_distance;
   double goal_position_tolerance;
@@ -112,6 +115,36 @@ enum class MotionAuthorizationState
   kArmedWaitingForPath,
   kArmedExecuting,
 };
+
+// Unitree exposes the active high-level motion state through the historical
+// error_code field in rt/sportmodestate. A locked stand accepts Move RPCs but
+// does not execute them until BalanceStand releases the joint lock.
+enum class SportMotionPreparation
+{
+  kReady,
+  kRequestBalanceStand,
+  kReject,
+};
+
+SportMotionPreparation classifySportMotionState(std::uint32_t state_code);
+
+const char * sportMotionStateName(std::uint32_t state_code);
+
+enum class BalanceStandRetryAction
+{
+  kReady,
+  kWait,
+  kRetry,
+  kTimedOut,
+  kReject,
+};
+
+BalanceStandRetryAction evaluateBalanceStandRetry(
+  std::uint32_t state_code,
+  double elapsed,
+  double since_last_attempt,
+  double retry_interval,
+  double timeout);
 
 // Separates a one-time operator arm from the presence of a currently executable path.
 class MotionAuthorization

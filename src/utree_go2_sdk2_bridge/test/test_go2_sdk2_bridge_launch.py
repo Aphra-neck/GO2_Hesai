@@ -106,6 +106,34 @@ def _launch_node(description, context):
 
 
 class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
+    def test_explicit_arm_releases_standing_lock_without_mode_takeover(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        callback = source[
+            source.index("void Go2Sdk2BridgeNode::enableCallback") : source.index(
+                "void Go2Sdk2BridgeNode::controlTick"
+            )
+        ]
+
+        self.assertIn("classifySportMotionState", callback)
+        self.assertIn("sport_client_->BalanceStand()", callback)
+        self.assertIn("balance_stand_pending_ = true", callback)
+        control_loop = source[
+            source.index("void Go2Sdk2BridgeNode::controlTickImpl") : source.index(
+                "void Go2Sdk2BridgeNode::failSafe"
+            )
+        ]
+        self.assertIn("evaluateBalanceStandRetry", control_loop)
+        self.assertIn("BalanceStandRetryAction::kRetry", control_loop)
+        self.assertIn("sport_client_->BalanceStand()", control_loop)
+        for forbidden in (
+            "SwitchJoystick",
+            "SelectMode",
+            "ReleaseMode",
+            "ServiceSwitch",
+        ):
+            self.assertNotIn(forbidden, source)
+
     def test_execution_path_subscription_does_not_replay_history(self):
         with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
             source = stream.read()
