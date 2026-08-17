@@ -139,6 +139,30 @@ TEST(FlatObstacleLayer, TiltedFlatWorldPlaneRemainsFreeAcrossMovingBodyPoses)
   EXPECT_TRUE(snapshot.obstacle_points.empty());
 }
 
+TEST(FlatObstacleLayer, BodyHeightChangeKeepsPreviouslyAnchoredWorldFloor)
+{
+  FlatObstacleLayer layer(layerConfig());
+  const auto floor = groundGrid();
+
+  const auto first = layer.update(frame(floor, 1.0, false));
+  ASSERT_TRUE(first.accepted);
+  ASSERT_FALSE(first.usable);
+  const auto second = layer.update(frame(floor, 1.1, true));
+  ASSERT_TRUE(second.usable) << second.reason;
+
+  auto lowered_body = frame(floor, 1.2, true);
+  lowered_body.body_position.z -= 0.09;
+  lowered_body.sensor_origin.z -= 0.09;
+  const auto update = layer.update(lowered_body);
+  const auto snapshot = layer.snapshot();
+
+  EXPECT_TRUE(update.usable) << update.reason;
+  EXPECT_EQ(update.status, FlatObstacleLayerStatus::kReady);
+  EXPECT_TRUE(snapshot.usable);
+  EXPECT_EQ(countRaw(snapshot), 0U);
+  EXPECT_TRUE(snapshot.obstacle_points.empty());
+}
+
 TEST(FlatObstacleLayer, DensePointsRequireDistinctSourceTimestampsToConfirm)
 {
   FlatObstacleLayer layer(layerConfig());

@@ -613,8 +613,14 @@ bool FlatObstacleLayer::fitGroundPlane(
     reason = "ground_tilt_above_limit";
     return false;
   }
-  const double anchor_error = std::abs(
-    plane.heightAt(frame.body_position.x, frame.body_position.y) - expected_ground);
+  const double fitted_ground = plane.heightAt(frame.body_position.x, frame.body_position.y);
+  double anchor_error = std::abs(fitted_ground - expected_ground);
+  if (accepted_epoch_frames_ != 0U) {
+    // Permit body articulation or a coherent world shift, but not an unsupported floor jump.
+    const double trusted_ground =
+      snapshot_.ground_plane.heightAt(frame.body_position.x, frame.body_position.y);
+    anchor_error = std::min(anchor_error, std::abs(fitted_ground - trusted_ground));
+  }
   if (anchor_error > config_.ground_fit.max_anchor_error) {
     reason = "ground_anchor_error_above_limit";
     return false;
