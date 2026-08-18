@@ -63,41 +63,6 @@ void MotionAuthorization::disarm()
   state_ = MotionAuthorizationState::kDisarmed;
 }
 
-bool SdkControlOwnership::released() const
-{
-  return !command_may_be_active_ && !joystick_may_be_suppressed_;
-}
-
-bool SdkControlOwnership::commandMayBeActive() const
-{
-  return command_may_be_active_;
-}
-
-bool SdkControlOwnership::joystickMayBeSuppressed() const
-{
-  return joystick_may_be_suppressed_;
-}
-
-void SdkControlOwnership::commandMayHaveStarted()
-{
-  command_may_be_active_ = true;
-}
-
-void SdkControlOwnership::commandStopped()
-{
-  command_may_be_active_ = false;
-}
-
-void SdkControlOwnership::joystickSuppressionMayHaveStarted()
-{
-  joystick_may_be_suppressed_ = true;
-}
-
-void SdkControlOwnership::joystickRestored()
-{
-  joystick_may_be_suppressed_ = false;
-}
-
 SportMotionPreparation classifySportMotionState(std::uint32_t state_code)
 {
   switch (state_code) {

@@ -796,27 +796,4 @@ TEST(MotionAuthorization, PathTimeoutRequiresASecondExplicitArm)
   EXPECT_TRUE(authorization.executionAuthorized());
 }
 
-TEST(SdkControlOwnership, ConservativelyTracksUnconfirmedSdkSideEffects)
-{
-  SdkControlOwnership ownership;
-
-  EXPECT_TRUE(ownership.released());
-  EXPECT_FALSE(ownership.commandMayBeActive());
-  EXPECT_FALSE(ownership.joystickMayBeSuppressed());
-
-  ownership.joystickSuppressionMayHaveStarted();
-  EXPECT_FALSE(ownership.released());
-  EXPECT_TRUE(ownership.joystickMayBeSuppressed());
-
-  ownership.commandMayHaveStarted();
-  EXPECT_TRUE(ownership.commandMayBeActive());
-
-  ownership.commandStopped();
-  EXPECT_FALSE(ownership.commandMayBeActive());
-  EXPECT_FALSE(ownership.released());
-
-  ownership.joystickRestored();
-  EXPECT_TRUE(ownership.released());
-}
-
 }  // namespace utree_go2_sdk2_bridge

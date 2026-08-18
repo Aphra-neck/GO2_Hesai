@@ -126,53 +126,13 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
         self.assertIn("evaluateBalanceStandRetry", control_loop)
         self.assertIn("BalanceStandRetryAction::kRetry", control_loop)
         self.assertIn("sport_client_->BalanceStand()", control_loop)
-        for forbidden in ("SelectMode", "ReleaseMode", "ServiceSwitch"):
+        for forbidden in (
+            "SwitchJoystick",
+            "SelectMode",
+            "ReleaseMode",
+            "ServiceSwitch",
+        ):
             self.assertNotIn(forbidden, source)
-
-    def test_sdk_control_owns_joystick_only_while_motion_can_execute(self):
-        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
-            source = stream.read()
-
-        control_loop = source[
-            source.index("void Go2Sdk2BridgeNode::controlTickImpl") : source.index(
-                "void Go2Sdk2BridgeNode::failSafe"
-            )
-        ]
-        stop_path = source[
-            source.index("bool Go2Sdk2BridgeNode::stopRobot") : source.index(
-                "bool Go2Sdk2BridgeNode::cachedPathValid"
-            )
-        ]
-
-        self.assertIn("suppressJoystickForSdkControl()", control_loop)
-        self.assertLess(
-            control_loop.index("suppressJoystickForSdkControl()"),
-            control_loop.index("sport_client_->Move"),
-        )
-        self.assertIn("sport_client_->SwitchJoystick(true)", stop_path)
-        self.assertIn("sdk_control_ownership_.joystickRestored()", stop_path)
-        self.assertIn("if (stop_confirmed && !joystick_restored)", stop_path)
-        self.assertLess(
-            stop_path.index("if (stop_confirmed && !joystick_restored)"),
-            stop_path.index("sport_client_->SwitchJoystick(true)"),
-        )
-
-    def test_startup_recovers_sdk_state_after_an_ungraceful_previous_exit(self):
-        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
-            source = stream.read()
-
-        startup = source[
-            source.index("sport_client_->Init()") : source.index(
-                "sport_state_sub_ = std::make_shared"
-            )
-        ]
-        self.assertIn("sdk_control_ownership_.commandMayHaveStarted()", startup)
-        self.assertIn(
-            "sdk_control_ownership_.joystickSuppressionMayHaveStarted()", startup
-        )
-        self.assertIn(
-            'stopRobot("SDK2 bridge startup recovery")', startup
-        )
 
     def test_execution_path_subscription_does_not_replay_history(self):
         with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
