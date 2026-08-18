@@ -95,6 +95,16 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   sport_client_ = std::make_unique<unitree::robot::go2::SportClient>();
   sport_client_->SetTimeout(0.5F);
   sport_client_->Init();
+  // A previous process may have been killed while a one-second Move command
+  // or joystick suppression was still active. Recover both robot-side states
+  // before accepting a goal.
+  sdk_control_ownership_.commandMayHaveStarted();
+  sdk_control_ownership_.joystickSuppressionMayHaveStarted();
+  if (!stopRobot("SDK2 bridge startup recovery")) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "SDK2 stop or native joystick recovery was not confirmed during startup; retries will continue while idle");
+  }
 
   sport_state_sub_ = std::make_shared<
     unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(
@@ -138,35 +148,25 @@ Go2Sdk2BridgeNode::~Go2Sdk2BridgeNode() noexcept
   } catch (...) {
     std::fprintf(stderr, "go2_sdk2_bridge: failed to close sport state subscription\n");
   }
-  if (!sport_client_ || !command_active_) {
+  if (!sport_client_ || sdk_control_ownership_.released()) {
     return;
   }
 
   constexpr int kStopAttempts = 3;
   try {
     for (int attempt = 1; attempt <= kStopAttempts; ++attempt) {
-      try {
-        const int32_t status = sport_client_->StopMove();
-        if (status == 0) {
-          command_active_ = false;
-          RCLCPP_WARN(get_logger(), "Go2 stopped during SDK2 bridge shutdown");
-          return;
-        }
-        RCLCPP_ERROR(
-          get_logger(), "Shutdown StopMove attempt %d/%d failed with status %d",
-          attempt, kStopAttempts, status);
-      } catch (const std::exception & exception) {
-        RCLCPP_ERROR(
-          get_logger(), "Shutdown StopMove attempt %d/%d threw: %s",
-          attempt, kStopAttempts, exception.what());
-      } catch (...) {
-        RCLCPP_ERROR(
-          get_logger(), "Shutdown StopMove attempt %d/%d threw an unknown exception",
-          attempt, kStopAttempts);
+      if (stopRobot("SDK2 bridge shutdown")) {
+        RCLCPP_WARN(
+          get_logger(), "Go2 stopped and native joystick response restored during shutdown");
+        return;
       }
+      RCLCPP_ERROR(
+        get_logger(), "Shutdown SDK control release attempt %d/%d was not confirmed",
+        attempt, kStopAttempts);
     }
     RCLCPP_FATAL(
-      get_logger(), "Unable to confirm StopMove after %d shutdown attempts",
+      get_logger(),
+      "Unable to confirm StopMove and native joystick restoration after %d shutdown attempts",
       kStopAttempts);
   } catch (const std::exception & exception) {
     std::fprintf(
@@ -345,8 +345,9 @@ void Go2Sdk2BridgeNode::enableCallback(
       balance_stand_pending_ = false;
       const bool stopped = stopRobot("motion disabled by service");
       response->success = stopped;
-      response->message = command_active_ ?
-        "Disable requested, but StopMove is not yet confirmed" : "Go2 motion disabled";
+      response->message = sdk_control_ownership_.released() ?
+        "Go2 motion disabled; native joystick response restored" :
+        "Disable requested, but StopMove or joystick restoration is not yet confirmed";
       return;
     }
     if (lowcmdPublisherPresent()) {
@@ -355,9 +356,10 @@ void Go2Sdk2BridgeNode::enableCallback(
       response->message = "Cannot enable: a /lowcmd publisher is active";
       return;
     }
-    if (!motion_authorization_.armed() && command_active_) {
+    if (!motion_authorization_.armed() && !sdk_control_ownership_.released()) {
       response->success = false;
-      response->message = "Cannot enable: waiting for StopMove confirmation";
+      response->message =
+        "Cannot enable: waiting for StopMove and joystick restoration confirmation";
       return;
     }
     const rclcpp::Time current_time = now();
@@ -401,9 +403,16 @@ void Go2Sdk2BridgeNode::enableCallback(
     if (preparation == SportMotionPreparation::kRequestBalanceStand &&
       !balance_stand_pending_)
     {
+      if (!suppressJoystickForSdkControl()) {
+        failSafe("SwitchJoystick(false) failed while releasing standing lock");
+        response->success = false;
+        response->message =
+          "Cannot arm: failed to suppress native joystick response";
+        return;
+      }
       // BalanceStand can affect the robot even if its RPC reply is lost. Mark
       // the command active first so every failure or disable path sends StopMove.
-      command_active_ = true;
+      sdk_control_ownership_.commandMayHaveStarted();
       const int32_t status = sport_client_->BalanceStand();
       if (status != 0) {
         failSafe("BalanceStand returned an error while releasing standing lock");
@@ -677,9 +686,14 @@ void Go2Sdk2BridgeNode::controlTickImpl()
     return;
   }
 
+  if (!suppressJoystickForSdkControl()) {
+    failSafe("SwitchJoystick(false) failed before SDK2 Move");
+    return;
+  }
+
   // Move may have reached the robot even when its RPC reports an error. Mark the
   // command active first so every failure path issues StopMove conservatively.
-  command_active_ = true;
+  sdk_control_ownership_.commandMayHaveStarted();
   int32_t status = -1;
   try {
     status = sport_client_->Move(command->vx, command->vy, command->yaw_rate);
@@ -750,40 +764,103 @@ bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
   return stopped;
 }
 
-bool Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
+bool Go2Sdk2BridgeNode::suppressJoystickForSdkControl()
 {
-  if (!command_active_) {return true;}
-  try {
-    const int32_t status = sport_client_->StopMove();
-    if (status != 0) {
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "SportClient::StopMove failed with status %d (%s); will retry",
-        status, reason);
-      return false;
-    }
-    command_active_ = false;
-    RCLCPP_WARN(get_logger(), "Go2 stopped: %s", reason);
+  if (sdk_control_ownership_.joystickMayBeSuppressed()) {
     return true;
-  } catch (const std::exception & exception) {
-    try {
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "SportClient::StopMove threw (%s): %s; will retry", reason, exception.what());
-    } catch (...) {
-      std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw: %s\n", exception.what());
-    }
-    return false;
-  } catch (...) {
-    try {
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "SportClient::StopMove threw an unknown exception (%s); will retry", reason);
-    } catch (...) {
-      std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw an unknown exception\n");
-    }
+  }
+
+  // A lost RPC reply cannot prove that the robot ignored the request. Mark the
+  // side effect first so every failure path attempts to restore joystick input.
+  sdk_control_ownership_.joystickSuppressionMayHaveStarted();
+  const int32_t status = sport_client_->SwitchJoystick(false);
+  if (status != 0) {
+    RCLCPP_ERROR(
+      get_logger(), "SportClient::SwitchJoystick(false) failed with status %d", status);
     return false;
   }
+  RCLCPP_WARN(
+    get_logger(), "Native joystick response suppressed for SDK2 path execution");
+  return true;
+}
+
+bool Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
+{
+  bool stop_confirmed = !sdk_control_ownership_.commandMayBeActive();
+  if (!stop_confirmed) {
+    try {
+      const int32_t status = sport_client_->StopMove();
+      if (status == 0) {
+        sdk_control_ownership_.commandStopped();
+        stop_confirmed = true;
+        RCLCPP_WARN(get_logger(), "Go2 stopped: %s", reason);
+      } else {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "SportClient::StopMove failed with status %d (%s); will retry",
+          status, reason);
+      }
+    } catch (const std::exception & exception) {
+      try {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "SportClient::StopMove threw (%s): %s; will retry", reason, exception.what());
+      } catch (...) {
+        std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw: %s\n", exception.what());
+      }
+    } catch (...) {
+      try {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "SportClient::StopMove threw an unknown exception (%s); will retry", reason);
+      } catch (...) {
+        std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw an unknown exception\n");
+      }
+    }
+  }
+
+  bool joystick_restored = !sdk_control_ownership_.joystickMayBeSuppressed();
+  if (stop_confirmed && !joystick_restored) {
+    try {
+      const int32_t status = sport_client_->SwitchJoystick(true);
+      if (status == 0) {
+        sdk_control_ownership_.joystickRestored();
+        joystick_restored = true;
+        RCLCPP_INFO(get_logger(), "Native joystick response restored: %s", reason);
+      } else {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "SportClient::SwitchJoystick(true) failed with status %d (%s); will retry",
+          status, reason);
+      }
+    } catch (const std::exception & exception) {
+      try {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "SportClient::SwitchJoystick(true) threw (%s): %s; will retry",
+          reason, exception.what());
+      } catch (...) {
+        std::fprintf(
+          stderr, "go2_sdk2_bridge: SwitchJoystick(true) threw: %s\n", exception.what());
+      }
+    } catch (...) {
+      try {
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "SportClient::SwitchJoystick(true) threw an unknown exception (%s); will retry",
+          reason);
+      } catch (...) {
+        std::fprintf(
+          stderr, "go2_sdk2_bridge: SwitchJoystick(true) threw an unknown exception\n");
+      }
+    }
+  } else if (!stop_confirmed) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Keeping native joystick response suppressed until StopMove is confirmed (%s)", reason);
+  }
+
+  return stop_confirmed && joystick_restored;
 }
 
 bool Go2Sdk2BridgeNode::cachedPathValid() const

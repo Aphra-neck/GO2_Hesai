@@ -40,6 +40,7 @@ private:
   void controlTickImpl();
   void failSafe(const char * reason);
   bool waitForNewPath(const char * reason);
+  bool suppressJoystickForSdkControl();
   bool stopRobot(const char * reason) noexcept;
   bool cachedPathValid() const;
   bool cachedOdomValid() const;
@@ -60,9 +61,7 @@ private:
   std::string body_frame_;
   int domain_id_{0};
   MotionAuthorization motion_authorization_;
-  // Cleared only after SportClient confirms StopMove. BalanceStand is also a
-  // motion-affecting command, so it sets this before the RPC is attempted.
-  bool command_active_{false};
+  SdkControlOwnership sdk_control_ownership_;
   double command_rate_{20.0};
   double path_timeout_{1.0};
   double odom_timeout_{0.5};

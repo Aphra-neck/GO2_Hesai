@@ -373,7 +373,7 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
                 "flat_obstacle.hit_confirmation_window": 0.35,
                 "flat_obstacle.clear_confirmation_frames": 2,
                 "flat_obstacle.clear_confirmation_window": 0.35,
-                "flat_obstacle.obstacle_clearance": 0.10,
+                "flat_obstacle.obstacle_clearance": 0.00,
                 "flat_obstacle.nominal_body_height": 0.34,
                 "flat_obstacle.max_odom_age": 0.5,
                 "flat_obstacle.ground_fit.max_range": 3.0,
@@ -407,12 +407,12 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
                 ],
             },
             {
-                "flat_obstacle.footprint_length": 0.80,
-                "flat_obstacle.footprint_width": 0.45,
+                "flat_obstacle.footprint_length": 0.60,
+                "flat_obstacle.footprint_width": 0.30,
                 "flat_obstacle.obstacle_clearance": 0.00,
             },
         )
-        self.assertEqual(mapper["flat_obstacle.obstacle_clearance"], 0.10)
+        self.assertEqual(mapper["flat_obstacle.obstacle_clearance"], 0.00)
         self.assertEqual(planner["flat_obstacle.obstacle_clearance"], 0.00)
 
     def test_map_capture_is_a_diagnostic_only_sidecar(self):

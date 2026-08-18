@@ -1012,6 +1012,10 @@ ros2 service call /go2_sdk2_bridge/enable_motion \
 
 授权可以发生在新路径到达前；此时 bridge 停车并等待。此后每次在 RViz 发布一个新的有效
 目标，规划器生成新鲜 `/body_path` 后会自动执行，不需要为每个目标重复调用 `data: true`。
+bridge 只在新鲜路径实际进入 SDK2 执行时调用一次 `SwitchJoystick(false)`，避免原生遥控器
+摇杆覆盖 `Move()` 速度；停车时先确认 `StopMove()`，再调用 `SwitchJoystick(true)` 恢复摇杆。
+节点启动时也会先执行一次 `StopMove()` 再恢复摇杆，处理上一个进程被强制结束后可能遗留的
+短时速度指令和仲裁状态。
 正常到达目标或收到规划器显式发布的新鲜空路径时，bridge 会停车但保留本次授权并等待
 下一条新路径。路径缓存超时、里程计超时或其他安全故障会立即停车并解除授权，排除原因后
 必须重新显式 arm，不能让中断前的旧目标自动恢复。
@@ -1190,7 +1194,9 @@ ros2 service call /go2_sdk2_bridge/enable_motion \
 ```
 
 如果 SDK2 尚未确认 `StopMove`，禁用服务会返回失败；节点仍保持禁用并按控制周期
-持续重试停车，在确认成功前拒绝再次启用。
+持续重试停车，在确认成功前拒绝再次启用，也不会提前恢复原生遥控器摇杆，避免两个运动
+命令源同时生效。正常确认停车后会自动调用 `SwitchJoystick(true)`；bridge 每次启动也会先
+执行一次同样的恢复操作。软件仲裁不能替代实体急停。
 
 不要让 `utree_go2_sdk2_bridge` 和发布 `/lowcmd` 的 RL 控制器同时控制机器人。
 

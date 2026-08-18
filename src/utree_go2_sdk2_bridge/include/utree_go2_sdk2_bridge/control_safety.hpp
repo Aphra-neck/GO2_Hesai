@@ -163,6 +163,25 @@ private:
   MotionAuthorizationState state_{MotionAuthorizationState::kDisarmed};
 };
 
+// Tracks SDK calls whose side effects may have reached the robot even when the
+// RPC reply is lost. Each flag is cleared only after the inverse call succeeds.
+class SdkControlOwnership
+{
+public:
+  bool released() const;
+  bool commandMayBeActive() const;
+  bool joystickMayBeSuppressed() const;
+
+  void commandMayHaveStarted();
+  void commandStopped();
+  void joystickSuppressionMayHaveStarted();
+  void joystickRestored();
+
+private:
+  bool command_may_be_active_{false};
+  bool joystick_may_be_suppressed_{false};
+};
+
 // Returns an empty string when every parameter is inside the bridge's hard safety envelope.
 std::string validateControlParameters(const ControlParameters & parameters);
 
