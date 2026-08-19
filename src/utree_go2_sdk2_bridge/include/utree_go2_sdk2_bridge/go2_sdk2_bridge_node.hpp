@@ -38,9 +38,16 @@ private:
     std_srvs::srv::SetBool::Response::SharedPtr response);
   void controlTick();
   void controlTickImpl();
-  void failSafe(const char * reason);
+  void failSafe(
+    const char * reason,
+    JoystickRecoveryPolicy recovery_policy =
+    JoystickRecoveryPolicy::kRequireConfirmedStop);
   bool waitForNewPath(const char * reason);
-  bool stopRobot(const char * reason) noexcept;
+  bool suppressJoystickForSdkControl();
+  bool stopRobot(
+    const char * reason,
+    JoystickRecoveryPolicy recovery_policy =
+    JoystickRecoveryPolicy::kRequireConfirmedStop) noexcept;
   bool cachedPathValid() const;
   bool cachedOdomValid() const;
   bool pathFresh(const rclcpp::Time & current_time) const;
@@ -52,7 +59,7 @@ private:
     const rclcpp::Time & message_time,
     const rclcpp::Time & current_time,
     double timeout) const;
-  std::optional<std::uint32_t> freshSportStateCode() const;
+  std::optional<SportStateSample> freshSportState();
   bool lowcmdPublisherPresent();
 
   std::string network_interface_;
@@ -60,9 +67,9 @@ private:
   std::string body_frame_;
   int domain_id_{0};
   MotionAuthorization motion_authorization_;
-  // Cleared only after SportClient confirms StopMove. BalanceStand is also a
-  // motion-affecting command, so it sets this before the RPC is attempted.
-  bool command_active_{false};
+  SdkControlOwnership sdk_control_ownership_;
+  PostJoystickSportStateGate post_joystick_sport_state_gate_;
+  JoystickRecoveryPolicyLatch joystick_recovery_policy_latch_;
   double command_rate_{20.0};
   double path_timeout_{1.0};
   double odom_timeout_{0.5};
@@ -91,7 +98,11 @@ private:
   nav_msgs::msg::Path::SharedPtr path_;
   nav_msgs::msg::Odometry::SharedPtr odom_;
   mutable std::mutex sport_state_mutex_;
+  UnsafeSportStateLatch unsafe_sport_state_latch_;
   std::optional<std::uint32_t> sport_state_code_;
+  std::uint8_t sport_state_mode_{0U};
+  std::uint8_t sport_state_gait_type_{0U};
+  std::uint64_t sport_state_sequence_{0U};
   std::chrono::steady_clock::time_point sport_state_received_at_{};
   std::unique_ptr<unitree::robot::go2::SportClient> sport_client_;
   unitree::robot::ChannelSubscriberPtr<unitree_go::msg::dds_::SportModeState_>

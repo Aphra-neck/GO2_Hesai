@@ -117,6 +117,118 @@ TEST(SportMotionState, RejectsDampingAndOtherMotionModes)
   EXPECT_STREQ(sportMotionStateName(9999U), "unknown");
 }
 
+TEST(UnsafeSportStateLatch, PreservesAnUnsafeSampleAcrossANewerReadySample)
+{
+  UnsafeSportStateLatch latch;
+  latch.observe(SportStateSample{2011U, 0U, 0U, 42U});
+  latch.observe(SportStateSample{1013U, 0U, 0U, 43U});
+
+  const auto sample = latch.take();
+  ASSERT_TRUE(sample.has_value());
+  EXPECT_EQ(sample->state_code, 2011U);
+  EXPECT_EQ(sample->sequence, 42U);
+  EXPECT_FALSE(latch.take().has_value());
+}
+
+TEST(UnsafeSportStateLatch, PreservesStandingLockAcrossANewerReadySample)
+{
+  UnsafeSportStateLatch latch;
+  latch.observe(SportStateSample{1002U, 0U, 0U, 42U});
+  latch.observe(SportStateSample{1013U, 0U, 0U, 43U});
+
+  const auto sample = latch.take();
+  ASSERT_TRUE(sample.has_value());
+  EXPECT_EQ(sample->state_code, 1002U);
+  EXPECT_EQ(sample->sequence, 42U);
+}
+
+TEST(UnsafeSportStateLatch, RejectStateSupersedesPendingStandingLock)
+{
+  UnsafeSportStateLatch latch;
+  latch.observe(SportStateSample{1002U, 0U, 0U, 42U});
+  latch.observe(SportStateSample{2011U, 0U, 0U, 43U});
+  latch.observe(SportStateSample{1013U, 0U, 0U, 44U});
+
+  const auto sample = latch.take();
+  ASSERT_TRUE(sample.has_value());
+  EXPECT_EQ(sample->state_code, 2011U);
+  EXPECT_EQ(sample->sequence, 43U);
+}
+
+TEST(PostJoystickSportStateGate, WaitsForAStateSampleAfterSuppression)
+{
+  PostJoystickSportStateGate gate;
+  gate.joystickSuppressedAfter(42U);
+
+  EXPECT_EQ(
+    gate.evaluate(1013U, 42U),
+    PostJoystickSportStateAction::kWaitForNewSample);
+}
+
+TEST(PostJoystickSportStateGate, StopsForEveryFreshStateOutsideTheAllowlist)
+{
+  for (const std::uint32_t state_code : {1002U, 2009U, 2011U, 9999U}) {
+    PostJoystickSportStateGate gate;
+    gate.joystickSuppressedAfter(42U);
+
+    EXPECT_EQ(
+      gate.evaluate(state_code, 43U),
+      PostJoystickSportStateAction::kStopRestoreAndDisarm)
+      << "state_code=" << state_code;
+  }
+}
+
+TEST(PostJoystickSportStateGate, AllowsOnlyANewReadySampleDuringOneJoystickTakeover)
+{
+  for (const std::uint32_t state_code : {100U, 1013U}) {
+    PostJoystickSportStateGate gate;
+    EXPECT_EQ(
+      gate.evaluate(state_code, 41U),
+      PostJoystickSportStateAction::kWaitForNewSample);
+
+    gate.joystickSuppressedAfter(42U);
+    EXPECT_EQ(
+      gate.evaluate(state_code, 41U),
+      PostJoystickSportStateAction::kWaitForNewSample);
+    EXPECT_EQ(
+      gate.evaluate(state_code, 43U),
+      PostJoystickSportStateAction::kAllowMove);
+
+    gate.joystickRestored();
+    EXPECT_EQ(
+      gate.evaluate(state_code, 44U),
+      PostJoystickSportStateAction::kWaitForNewSample);
+  }
+}
+
+TEST(JoystickRecoveryPolicy, UnsafeSportStateRestoresJoystickAfterStopMoveAttempt)
+{
+  EXPECT_TRUE(shouldAttemptJoystickRestore(
+      true, false, JoystickRecoveryPolicy::kRestoreAfterStopAttempt));
+  EXPECT_FALSE(shouldAttemptJoystickRestore(
+      true, false, JoystickRecoveryPolicy::kRequireConfirmedStop));
+  EXPECT_TRUE(shouldAttemptJoystickRestore(
+      true, true, JoystickRecoveryPolicy::kRequireConfirmedStop));
+  EXPECT_FALSE(shouldAttemptJoystickRestore(
+      false, false, JoystickRecoveryPolicy::kRestoreAfterStopAttempt));
+}
+
+TEST(JoystickRecoveryPolicyLatch, EmergencyRecoverySurvivesOrdinaryRetries)
+{
+  JoystickRecoveryPolicyLatch latch;
+  EXPECT_EQ(
+    latch.policy(), JoystickRecoveryPolicy::kRequireConfirmedStop);
+
+  latch.request(JoystickRecoveryPolicy::kRestoreAfterStopAttempt);
+  latch.request(JoystickRecoveryPolicy::kRequireConfirmedStop);
+  EXPECT_EQ(
+    latch.policy(), JoystickRecoveryPolicy::kRestoreAfterStopAttempt);
+
+  latch.joystickRestored();
+  EXPECT_EQ(
+    latch.policy(), JoystickRecoveryPolicy::kRequireConfirmedStop);
+}
+
 TEST(BalanceStandRetry, WaitsThenRetriesWhileStandingLockPersists)
 {
   EXPECT_EQ(
@@ -794,6 +906,29 @@ TEST(MotionAuthorization, PathTimeoutRequiresASecondExplicitArm)
 
   authorization.arm(true);
   EXPECT_TRUE(authorization.executionAuthorized());
+}
+
+TEST(SdkControlOwnership, ConservativelyTracksUnconfirmedSdkSideEffects)
+{
+  SdkControlOwnership ownership;
+
+  EXPECT_TRUE(ownership.released());
+  EXPECT_FALSE(ownership.commandMayBeActive());
+  EXPECT_FALSE(ownership.joystickMayBeSuppressed());
+
+  ownership.joystickSuppressionMayHaveStarted();
+  EXPECT_FALSE(ownership.released());
+  EXPECT_TRUE(ownership.joystickMayBeSuppressed());
+
+  ownership.commandMayHaveStarted();
+  EXPECT_TRUE(ownership.commandMayBeActive());
+
+  ownership.commandStopped();
+  EXPECT_FALSE(ownership.commandMayBeActive());
+  EXPECT_FALSE(ownership.released());
+
+  ownership.joystickRestored();
+  EXPECT_TRUE(ownership.released());
 }
 
 }  // namespace utree_go2_sdk2_bridge
