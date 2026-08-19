@@ -36,10 +36,6 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   command_rate_ = declare_parameter("command_rate", 20.0);
   path_timeout_ = declare_parameter("path_timeout", 1.0);
   odom_timeout_ = declare_parameter("odom_timeout", 0.5);
-  sport_state_timeout_ = declare_parameter("sport_state_timeout", 1.0);
-  balance_stand_timeout_ = declare_parameter("balance_stand_timeout", 3.0);
-  balance_stand_retry_interval_ =
-    declare_parameter("balance_stand_retry_interval", 0.25);
   timestamp_future_tolerance_ = declare_parameter("timestamp_future_tolerance", 0.2);
   lookahead_distance_ = declare_parameter("lookahead_distance", 0.6);
   goal_position_tolerance_ = declare_parameter("goal_position_tolerance", 0.15);
@@ -80,8 +76,7 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
             "world_frame, body_frame, path_topic, and odom_topic must not be empty");
   }
   const ControlParameters parameters{
-    command_rate_, path_timeout_, odom_timeout_, sport_state_timeout_,
-    balance_stand_timeout_, balance_stand_retry_interval_, timestamp_future_tolerance_,
+    command_rate_, path_timeout_, odom_timeout_, timestamp_future_tolerance_,
     lookahead_distance_, goal_position_tolerance_, goal_yaw_tolerance_,
     heading_alignment_enter_angle_, heading_alignment_exit_angle_,
     explicit_rotation_tolerance_,
@@ -95,22 +90,6 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   sport_client_ = std::make_unique<unitree::robot::go2::SportClient>();
   sport_client_->SetTimeout(0.5F);
   sport_client_->Init();
-  // A previous process may have been killed while a one-second Move command
-  // or joystick suppression was still active. Recover both robot-side states
-  // before accepting a goal.
-  sdk_control_ownership_.commandMayHaveStarted();
-  sdk_control_ownership_.joystickSuppressionMayHaveStarted();
-  if (!stopRobot("SDK2 bridge startup recovery")) {
-    RCLCPP_ERROR(
-      get_logger(),
-      "SDK2 stop or native joystick recovery was not confirmed during startup; retries will continue while idle");
-  }
-
-  sport_state_sub_ = std::make_shared<
-    unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(
-    "rt/sportmodestate");
-  sport_state_sub_->InitChannel(
-    std::bind(&Go2Sdk2BridgeNode::sportStateCallback, this, std::placeholders::_1), 1);
 
   path_sub_ = create_subscription<nav_msgs::msg::Path>(
     // Execute only paths published after this bridge subscription is matched.
@@ -141,32 +120,35 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
 
 Go2Sdk2BridgeNode::~Go2Sdk2BridgeNode() noexcept
 {
-  try {
-    if (sport_state_sub_) {
-      sport_state_sub_->CloseChannel();
-    }
-  } catch (...) {
-    std::fprintf(stderr, "go2_sdk2_bridge: failed to close sport state subscription\n");
-  }
-  if (!sport_client_ || sdk_control_ownership_.released()) {
+  if (!sport_client_ || !command_active_) {
     return;
   }
 
   constexpr int kStopAttempts = 3;
   try {
     for (int attempt = 1; attempt <= kStopAttempts; ++attempt) {
-      if (stopRobot("SDK2 bridge shutdown")) {
-        RCLCPP_WARN(
-          get_logger(), "Go2 stopped and native joystick response restored during shutdown");
-        return;
+      try {
+        const int32_t status = sport_client_->StopMove();
+        if (status == 0) {
+          command_active_ = false;
+          RCLCPP_WARN(get_logger(), "Go2 stopped during SDK2 bridge shutdown");
+          return;
+        }
+        RCLCPP_ERROR(
+          get_logger(), "Shutdown StopMove attempt %d/%d failed with status %d",
+          attempt, kStopAttempts, status);
+      } catch (const std::exception & exception) {
+        RCLCPP_ERROR(
+          get_logger(), "Shutdown StopMove attempt %d/%d threw: %s",
+          attempt, kStopAttempts, exception.what());
+      } catch (...) {
+        RCLCPP_ERROR(
+          get_logger(), "Shutdown StopMove attempt %d/%d threw an unknown exception",
+          attempt, kStopAttempts);
       }
-      RCLCPP_ERROR(
-        get_logger(), "Shutdown SDK control release attempt %d/%d was not confirmed",
-        attempt, kStopAttempts);
     }
     RCLCPP_FATAL(
-      get_logger(),
-      "Unable to confirm StopMove and native joystick restoration after %d shutdown attempts",
+      get_logger(), "Unable to confirm StopMove after %d shutdown attempts",
       kStopAttempts);
   } catch (const std::exception & exception) {
     std::fprintf(
@@ -342,12 +324,10 @@ void Go2Sdk2BridgeNode::enableCallback(
       path_progress_tracker_.reset();
       completed_goal_latch_.clear();
       heading_alignment_active_ = false;
-      balance_stand_pending_ = false;
       const bool stopped = stopRobot("motion disabled by service");
       response->success = stopped;
-      response->message = sdk_control_ownership_.released() ?
-        "Go2 motion disabled; native joystick response restored" :
-        "Disable requested, but StopMove or joystick restoration is not yet confirmed";
+      response->message = command_active_ ?
+        "Disable requested, but StopMove is not yet confirmed" : "Go2 motion disabled";
       return;
     }
     if (lowcmdPublisherPresent()) {
@@ -356,10 +336,9 @@ void Go2Sdk2BridgeNode::enableCallback(
       response->message = "Cannot enable: a /lowcmd publisher is active";
       return;
     }
-    if (!motion_authorization_.armed() && !sdk_control_ownership_.released()) {
+    if (!motion_authorization_.armed() && command_active_) {
       response->success = false;
-      response->message =
-        "Cannot enable: waiting for StopMove and joystick restoration confirmation";
+      response->message = "Cannot enable: waiting for StopMove confirmation";
       return;
     }
     const rclcpp::Time current_time = now();
@@ -382,85 +361,16 @@ void Go2Sdk2BridgeNode::enableCallback(
         return;
       }
     }
-
-    const auto sport_state = freshSportState();
-    if (!sport_state) {
-      failSafe("missing or stale Unitree sport state while enabling motion");
-      response->success = false;
-      response->message =
-        "Cannot arm: rt/sportmodestate is missing or stale";
-      return;
-    }
-    const auto preparation = classifySportMotionState(sport_state->state_code);
-    if (preparation == SportMotionPreparation::kReject) {
-      sdk_control_ownership_.commandMayHaveStarted();
-      failSafe(
-        "Unitree sport state is not executable",
-        JoystickRecoveryPolicy::kRestoreAfterStopAttempt);
-      response->success = false;
-      response->message =
-        "Cannot arm: Unitree motion state " + std::to_string(sport_state->state_code) +
-        " (" + sportMotionStateName(sport_state->state_code) + ") is not executable";
-      return;
-    }
-    if (preparation == SportMotionPreparation::kRequestBalanceStand &&
-      sdk_control_ownership_.joystickMayBeSuppressed())
-    {
-      sdk_control_ownership_.commandMayHaveStarted();
-      failSafe(
-        "standing lock appeared while native joystick was suppressed",
-        JoystickRecoveryPolicy::kRestoreAfterStopAttempt);
-      response->success = false;
-      response->message =
-        "Cannot arm: standing lock appeared during SDK2 path execution";
-      return;
-    }
-    if (preparation == SportMotionPreparation::kRequestBalanceStand &&
-      !balance_stand_pending_)
-    {
-      // BalanceStand can affect the robot even if its RPC reply is lost. Mark
-      // the command active first so every failure or disable path sends StopMove.
-      sdk_control_ownership_.commandMayHaveStarted();
-      const int32_t status = sport_client_->BalanceStand();
-      if (status != 0) {
-        failSafe("BalanceStand returned an error while releasing standing lock");
-        response->success = false;
-        response->message =
-          "Cannot arm: BalanceStand failed with status " + std::to_string(status);
-        return;
-      }
-      balance_stand_pending_ = true;
-      const auto request_time = std::chrono::steady_clock::now();
-      balance_stand_requested_at_ = request_time;
-      balance_stand_last_attempt_at_ = request_time;
-      RCLCPP_WARN(
-        get_logger(),
-        "Requested BalanceStand to release Unitree standing lock (state 1002)");
-    }
-    if (preparation == SportMotionPreparation::kReady) {
-      balance_stand_pending_ = false;
-    }
     if (motion_authorization_.armed()) {
       response->success = true;
-      if (balance_stand_pending_) {
-        response->message =
-          "Go2 motion is already armed; waiting for standing lock release";
-      } else {
-        response->message = motion_authorization_.executionAuthorized() ?
-          "Go2 motion is already armed" :
-          "Go2 motion is already armed and waiting for a path";
-      }
+      response->message = motion_authorization_.executionAuthorized() ?
+        "Go2 motion is already armed" : "Go2 motion is already armed and waiting for a path";
       return;
     }
     motion_authorization_.arm(path_ != nullptr);
     response->success = true;
-    if (balance_stand_pending_) {
-      response->message =
-        "Go2 motion armed; requested BalanceStand to release standing lock";
-    } else {
-      response->message = path_ ?
-        "Go2 motion armed" : "Go2 motion armed; waiting for a fresh body path";
-    }
+    response->message = path_ ?
+      "Go2 motion armed" : "Go2 motion armed; waiting for a fresh body path";
   } catch (const std::exception & exception) {
     failSafe("exception while changing motion state");
     if (response) {
@@ -502,74 +412,6 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   }
   if (!motion_authorization_.armed()) {
     stopRobot("retrying unconfirmed stop while motion is disabled");
-    return;
-  }
-  const auto sport_state = freshSportState();
-  if (!sport_state) {
-    failSafe("Unitree sport state timeout");
-    RCLCPP_ERROR(
-      get_logger(), "Stopped because rt/sportmodestate is missing or stale");
-    return;
-  }
-  const auto preparation = classifySportMotionState(sport_state->state_code);
-  if (balance_stand_pending_) {
-    const auto current_steady_time = std::chrono::steady_clock::now();
-    const double elapsed = std::chrono::duration<double>(
-      current_steady_time - balance_stand_requested_at_).count();
-    const double since_last_attempt = std::chrono::duration<double>(
-      current_steady_time - balance_stand_last_attempt_at_).count();
-    switch (evaluateBalanceStandRetry(
-        sport_state->state_code, elapsed, since_last_attempt,
-        balance_stand_retry_interval_, balance_stand_timeout_))
-    {
-      case BalanceStandRetryAction::kReady:
-        balance_stand_pending_ = false;
-        RCLCPP_INFO(
-          get_logger(), "Unitree standing lock released; state=%u (%s)",
-          sport_state->state_code, sportMotionStateName(sport_state->state_code));
-        break;
-      case BalanceStandRetryAction::kWait:
-        return;
-      case BalanceStandRetryAction::kRetry: {
-        const int32_t status = sport_client_->BalanceStand();
-        if (status != 0) {
-          failSafe("BalanceStand retry returned an error");
-          RCLCPP_ERROR(
-            get_logger(), "BalanceStand retry failed with status %d", status);
-          return;
-        }
-        balance_stand_last_attempt_at_ = std::chrono::steady_clock::now();
-        RCLCPP_WARN(
-          get_logger(),
-          "Retried BalanceStand after %.3f s; standing lock remains active", elapsed);
-        return;
-      }
-      case BalanceStandRetryAction::kTimedOut:
-        failSafe("BalanceStand did not release Unitree standing lock");
-        RCLCPP_ERROR(
-          get_logger(),
-          "BalanceStand timed out after %.3f s; state=%u (%s)", elapsed,
-          sport_state->state_code, sportMotionStateName(sport_state->state_code));
-        return;
-      case BalanceStandRetryAction::kReject:
-        failSafe(
-          "Unitree sport state changed while releasing standing lock",
-          JoystickRecoveryPolicy::kRestoreAfterStopAttempt);
-        RCLCPP_ERROR(
-          get_logger(), "Stopped while releasing standing lock; state=%u (%s)",
-          sport_state->state_code, sportMotionStateName(sport_state->state_code));
-        return;
-    }
-  } else if (preparation != SportMotionPreparation::kReady) {
-    sdk_control_ownership_.commandMayHaveStarted();
-    failSafe(
-      "Unitree sport state became non-executable",
-      JoystickRecoveryPolicy::kRestoreAfterStopAttempt);
-    RCLCPP_ERROR(
-      get_logger(), "Stopped in Unitree motion state %u (%s), mode=%u gait_type=%u",
-      sport_state->state_code, sportMotionStateName(sport_state->state_code),
-      static_cast<unsigned>(sport_state->mode),
-      static_cast<unsigned>(sport_state->gait_type));
     return;
   }
   const rclcpp::Time current_time = now();
@@ -701,35 +543,9 @@ void Go2Sdk2BridgeNode::controlTickImpl()
     return;
   }
 
-  if (!suppressJoystickForSdkControl()) {
-    failSafe("SwitchJoystick(false) failed before SDK2 Move");
-    return;
-  }
-
-  switch (post_joystick_sport_state_gate_.evaluate(
-      sport_state->state_code, sport_state->sequence))
-  {
-    case PostJoystickSportStateAction::kWaitForNewSample:
-      return;
-    case PostJoystickSportStateAction::kAllowMove:
-      break;
-    case PostJoystickSportStateAction::kStopRestoreAndDisarm:
-      sdk_control_ownership_.commandMayHaveStarted();
-      failSafe(
-        "unsafe Unitree sport state after joystick suppression",
-        JoystickRecoveryPolicy::kRestoreAfterStopAttempt);
-      RCLCPP_ERROR(
-        get_logger(),
-        "Stopped before first Move in Unitree motion state %u (%s), mode=%u gait_type=%u",
-        sport_state->state_code, sportMotionStateName(sport_state->state_code),
-        static_cast<unsigned>(sport_state->mode),
-        static_cast<unsigned>(sport_state->gait_type));
-      return;
-  }
-
   // Move may have reached the robot even when its RPC reports an error. Mark the
   // command active first so every failure path issues StopMove conservatively.
-  sdk_control_ownership_.commandMayHaveStarted();
+  command_active_ = true;
   int32_t status = -1;
   try {
     status = sport_client_->Move(command->vx, command->vy, command->yaw_rate);
@@ -757,9 +573,7 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   command_pub_->publish(command_message);
 }
 
-void Go2Sdk2BridgeNode::failSafe(
-  const char * reason,
-  JoystickRecoveryPolicy recovery_policy)
+void Go2Sdk2BridgeNode::failSafe(const char * reason)
 {
   motion_authorization_.disarm();
   path_.reset();
@@ -768,26 +582,7 @@ void Go2Sdk2BridgeNode::failSafe(
   path_progress_tracker_.reset();
   completed_goal_latch_.clear();
   heading_alignment_active_ = false;
-  balance_stand_pending_ = false;
-  stopRobot(reason, recovery_policy);
-}
-
-void Go2Sdk2BridgeNode::sportStateCallback(const void * message)
-{
-  if (!message) {
-    return;
-  }
-  const auto * state =
-    static_cast<const unitree_go::msg::dds_::SportModeState_ *>(message);
-  const std::lock_guard<std::mutex> lock(sport_state_mutex_);
-  ++sport_state_sequence_;
-  sport_state_code_ = state->error_code();
-  sport_state_mode_ = state->mode();
-  sport_state_gait_type_ = state->gait_type();
-  unsafe_sport_state_latch_.observe(SportStateSample{
-      *sport_state_code_, sport_state_mode_, sport_state_gait_type_,
-      sport_state_sequence_});
-  sport_state_received_at_ = std::chrono::steady_clock::now();
+  stopRobot(reason);
 }
 
 bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
@@ -797,9 +592,6 @@ bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
   path_progress_tracker_.reset();
   motion_authorization_.waitForPath();
   heading_alignment_active_ = false;
-  if (balance_stand_pending_) {
-    return true;
-  }
   const bool stopped = stopRobot(reason);
   if (!stopped) {
     motion_authorization_.disarm();
@@ -808,120 +600,40 @@ bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
   return stopped;
 }
 
-bool Go2Sdk2BridgeNode::suppressJoystickForSdkControl()
+bool Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
 {
-  if (sdk_control_ownership_.joystickMayBeSuppressed()) {
+  if (!command_active_) {return true;}
+  try {
+    const int32_t status = sport_client_->StopMove();
+    if (status != 0) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "SportClient::StopMove failed with status %d (%s); will retry",
+        status, reason);
+      return false;
+    }
+    command_active_ = false;
+    RCLCPP_WARN(get_logger(), "Go2 stopped: %s", reason);
     return true;
-  }
-
-  // A lost RPC reply cannot prove that the robot ignored the request. Mark the
-  // side effect first so every failure path attempts to restore joystick input.
-  sdk_control_ownership_.joystickSuppressionMayHaveStarted();
-  const int32_t status = sport_client_->SwitchJoystick(false);
-  if (status != 0) {
-    RCLCPP_ERROR(
-      get_logger(), "SportClient::SwitchJoystick(false) failed with status %d", status);
+  } catch (const std::exception & exception) {
+    try {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "SportClient::StopMove threw (%s): %s; will retry", reason, exception.what());
+    } catch (...) {
+      std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw: %s\n", exception.what());
+    }
+    return false;
+  } catch (...) {
+    try {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "SportClient::StopMove threw an unknown exception (%s); will retry", reason);
+    } catch (...) {
+      std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw an unknown exception\n");
+    }
     return false;
   }
-  std::uint64_t state_sequence = 0U;
-  {
-    const std::lock_guard<std::mutex> lock(sport_state_mutex_);
-    state_sequence = sport_state_sequence_;
-  }
-  post_joystick_sport_state_gate_.joystickSuppressedAfter(state_sequence);
-  RCLCPP_WARN(
-    get_logger(), "Native joystick response suppressed for SDK2 path execution");
-  return true;
-}
-
-bool Go2Sdk2BridgeNode::stopRobot(
-  const char * reason,
-  JoystickRecoveryPolicy recovery_policy) noexcept
-{
-  joystick_recovery_policy_latch_.request(recovery_policy);
-  bool stop_confirmed = !sdk_control_ownership_.commandMayBeActive();
-  if (!stop_confirmed) {
-    try {
-      const int32_t status = sport_client_->StopMove();
-      if (status == 0) {
-        sdk_control_ownership_.commandStopped();
-        stop_confirmed = true;
-        RCLCPP_WARN(get_logger(), "Go2 stopped: %s", reason);
-      } else {
-        RCLCPP_ERROR_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "SportClient::StopMove failed with status %d (%s); will retry",
-          status, reason);
-      }
-    } catch (const std::exception & exception) {
-      try {
-        RCLCPP_ERROR_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "SportClient::StopMove threw (%s): %s; will retry", reason, exception.what());
-      } catch (...) {
-        std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw: %s\n", exception.what());
-      }
-    } catch (...) {
-      try {
-        RCLCPP_ERROR_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "SportClient::StopMove threw an unknown exception (%s); will retry", reason);
-      } catch (...) {
-        std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw an unknown exception\n");
-      }
-    }
-  }
-
-  const auto effective_recovery_policy = joystick_recovery_policy_latch_.policy();
-  bool joystick_restored = !sdk_control_ownership_.joystickMayBeSuppressed();
-  if (joystick_restored) {
-    joystick_recovery_policy_latch_.joystickRestored();
-  }
-  if (shouldAttemptJoystickRestore(
-      !joystick_restored, stop_confirmed, effective_recovery_policy))
-  {
-    try {
-      const int32_t status = sport_client_->SwitchJoystick(true);
-      if (status == 0) {
-        sdk_control_ownership_.joystickRestored();
-        post_joystick_sport_state_gate_.joystickRestored();
-        joystick_recovery_policy_latch_.joystickRestored();
-        joystick_restored = true;
-        RCLCPP_INFO(get_logger(), "Native joystick response restored: %s", reason);
-      } else {
-        RCLCPP_ERROR_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "SportClient::SwitchJoystick(true) failed with status %d (%s); will retry",
-          status, reason);
-      }
-    } catch (const std::exception & exception) {
-      try {
-        RCLCPP_ERROR_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "SportClient::SwitchJoystick(true) threw (%s): %s; will retry",
-          reason, exception.what());
-      } catch (...) {
-        std::fprintf(
-          stderr, "go2_sdk2_bridge: SwitchJoystick(true) threw: %s\n", exception.what());
-      }
-    } catch (...) {
-      try {
-        RCLCPP_ERROR_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "SportClient::SwitchJoystick(true) threw an unknown exception (%s); will retry",
-          reason);
-      } catch (...) {
-        std::fprintf(
-          stderr, "go2_sdk2_bridge: SwitchJoystick(true) threw an unknown exception\n");
-      }
-    }
-  } else if (!stop_confirmed && !joystick_restored) {
-    RCLCPP_ERROR_THROTTLE(
-      get_logger(), *get_clock(), 3000,
-      "Keeping native joystick response suppressed until StopMove is confirmed (%s)", reason);
-  }
-
-  return stop_confirmed && joystick_restored;
 }
 
 bool Go2Sdk2BridgeNode::cachedPathValid() const
@@ -972,40 +684,6 @@ bool Go2Sdk2BridgeNode::messageStampFresh(
 {
   const double age = messageAgeSeconds(message_time, current_time);
   return std::isfinite(age) && age >= -timestamp_future_tolerance_ && age <= timeout;
-}
-
-std::optional<SportStateSample> Go2Sdk2BridgeNode::freshSportState()
-{
-  std::uint32_t state_code = 0U;
-  std::uint8_t mode = 0U;
-  std::uint8_t gait_type = 0U;
-  std::uint64_t sequence = 0U;
-  std::chrono::steady_clock::time_point received_at;
-  {
-    const std::lock_guard<std::mutex> lock(sport_state_mutex_);
-    if (motion_authorization_.armed()) {
-      if (const auto unsafe_sample = unsafe_sport_state_latch_.take()) {
-        return unsafe_sample;
-      }
-    } else {
-      (void)unsafe_sport_state_latch_.take();
-    }
-    if (!sport_state_code_) {
-      return std::nullopt;
-    }
-    state_code = *sport_state_code_;
-    mode = sport_state_mode_;
-    gait_type = sport_state_gait_type_;
-    sequence = sport_state_sequence_;
-    received_at = sport_state_received_at_;
-  }
-  const auto current_time = std::chrono::steady_clock::now();
-  const double age = std::chrono::duration<double>(
-    current_time - received_at).count();
-  if (!std::isfinite(age) || age < 0.0 || age > sport_state_timeout_) {
-    return std::nullopt;
-  }
-  return SportStateSample{state_code, mode, gait_type, sequence};
 }
 
 bool Go2Sdk2BridgeNode::lowcmdPublisherPresent()

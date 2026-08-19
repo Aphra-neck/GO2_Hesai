@@ -11,7 +11,7 @@ namespace
 ControlParameters validParameters()
 {
   return ControlParameters{
-    20.0, 1.0, 0.5, 1.0, 3.0, 0.25, 0.2, 0.6, 0.15, 0.2,
+    20.0, 1.0, 0.5, 0.2, 0.6, 0.15, 0.2,
     0.7853981633974483, 0.2617993877991494,
     0.05, 1.0, 1.5, 0.6, 0.35, 0.8};
 }
@@ -65,18 +65,6 @@ TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 
   parameters = validParameters();
-  parameters.sport_state_timeout = 0.0;
-  EXPECT_FALSE(validateControlParameters(parameters).empty());
-
-  parameters = validParameters();
-  parameters.balance_stand_timeout = std::numeric_limits<double>::infinity();
-  EXPECT_FALSE(validateControlParameters(parameters).empty());
-
-  parameters = validParameters();
-  parameters.balance_stand_retry_interval = parameters.balance_stand_timeout;
-  EXPECT_FALSE(validateControlParameters(parameters).empty());
-
-  parameters = validParameters();
   parameters.goal_yaw_tolerance = 4.0;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 
@@ -91,178 +79,6 @@ TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
   parameters = validParameters();
   parameters.max_vy = -0.1;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
-}
-
-TEST(SportMotionState, UnlocksOnlyTheStandingLock)
-{
-  EXPECT_EQ(
-    classifySportMotionState(1002U),
-    SportMotionPreparation::kRequestBalanceStand);
-  EXPECT_STREQ(sportMotionStateName(1002U), "standing lock");
-
-  EXPECT_EQ(classifySportMotionState(100U), SportMotionPreparation::kReady);
-  EXPECT_EQ(classifySportMotionState(1013U), SportMotionPreparation::kReady);
-}
-
-TEST(SportMotionState, RejectsDampingAndOtherMotionModes)
-{
-  for (const std::uint32_t state_code :
-    {1001U, 1004U, 1007U, 1015U, 2010U, 9999U})
-  {
-    EXPECT_EQ(
-      classifySportMotionState(state_code), SportMotionPreparation::kReject)
-      << "state_code=" << state_code;
-  }
-  EXPECT_STREQ(sportMotionStateName(1001U), "damping");
-  EXPECT_STREQ(sportMotionStateName(9999U), "unknown");
-}
-
-TEST(UnsafeSportStateLatch, PreservesAnUnsafeSampleAcrossANewerReadySample)
-{
-  UnsafeSportStateLatch latch;
-  latch.observe(SportStateSample{2011U, 0U, 0U, 42U});
-  latch.observe(SportStateSample{1013U, 0U, 0U, 43U});
-
-  const auto sample = latch.take();
-  ASSERT_TRUE(sample.has_value());
-  EXPECT_EQ(sample->state_code, 2011U);
-  EXPECT_EQ(sample->sequence, 42U);
-  EXPECT_FALSE(latch.take().has_value());
-}
-
-TEST(UnsafeSportStateLatch, PreservesStandingLockAcrossANewerReadySample)
-{
-  UnsafeSportStateLatch latch;
-  latch.observe(SportStateSample{1002U, 0U, 0U, 42U});
-  latch.observe(SportStateSample{1013U, 0U, 0U, 43U});
-
-  const auto sample = latch.take();
-  ASSERT_TRUE(sample.has_value());
-  EXPECT_EQ(sample->state_code, 1002U);
-  EXPECT_EQ(sample->sequence, 42U);
-}
-
-TEST(UnsafeSportStateLatch, RejectStateSupersedesPendingStandingLock)
-{
-  UnsafeSportStateLatch latch;
-  latch.observe(SportStateSample{1002U, 0U, 0U, 42U});
-  latch.observe(SportStateSample{2011U, 0U, 0U, 43U});
-  latch.observe(SportStateSample{1013U, 0U, 0U, 44U});
-
-  const auto sample = latch.take();
-  ASSERT_TRUE(sample.has_value());
-  EXPECT_EQ(sample->state_code, 2011U);
-  EXPECT_EQ(sample->sequence, 43U);
-}
-
-TEST(PostJoystickSportStateGate, WaitsForAStateSampleAfterSuppression)
-{
-  PostJoystickSportStateGate gate;
-  gate.joystickSuppressedAfter(42U);
-
-  EXPECT_EQ(
-    gate.evaluate(1013U, 42U),
-    PostJoystickSportStateAction::kWaitForNewSample);
-}
-
-TEST(PostJoystickSportStateGate, StopsForEveryFreshStateOutsideTheAllowlist)
-{
-  for (const std::uint32_t state_code : {1002U, 2009U, 2011U, 9999U}) {
-    PostJoystickSportStateGate gate;
-    gate.joystickSuppressedAfter(42U);
-
-    EXPECT_EQ(
-      gate.evaluate(state_code, 43U),
-      PostJoystickSportStateAction::kStopRestoreAndDisarm)
-      << "state_code=" << state_code;
-  }
-}
-
-TEST(PostJoystickSportStateGate, AllowsOnlyANewReadySampleDuringOneJoystickTakeover)
-{
-  for (const std::uint32_t state_code : {100U, 1013U}) {
-    PostJoystickSportStateGate gate;
-    EXPECT_EQ(
-      gate.evaluate(state_code, 41U),
-      PostJoystickSportStateAction::kWaitForNewSample);
-
-    gate.joystickSuppressedAfter(42U);
-    EXPECT_EQ(
-      gate.evaluate(state_code, 41U),
-      PostJoystickSportStateAction::kWaitForNewSample);
-    EXPECT_EQ(
-      gate.evaluate(state_code, 43U),
-      PostJoystickSportStateAction::kAllowMove);
-
-    gate.joystickRestored();
-    EXPECT_EQ(
-      gate.evaluate(state_code, 44U),
-      PostJoystickSportStateAction::kWaitForNewSample);
-  }
-}
-
-TEST(JoystickRecoveryPolicy, UnsafeSportStateRestoresJoystickAfterStopMoveAttempt)
-{
-  EXPECT_TRUE(shouldAttemptJoystickRestore(
-      true, false, JoystickRecoveryPolicy::kRestoreAfterStopAttempt));
-  EXPECT_FALSE(shouldAttemptJoystickRestore(
-      true, false, JoystickRecoveryPolicy::kRequireConfirmedStop));
-  EXPECT_TRUE(shouldAttemptJoystickRestore(
-      true, true, JoystickRecoveryPolicy::kRequireConfirmedStop));
-  EXPECT_FALSE(shouldAttemptJoystickRestore(
-      false, false, JoystickRecoveryPolicy::kRestoreAfterStopAttempt));
-}
-
-TEST(JoystickRecoveryPolicyLatch, EmergencyRecoverySurvivesOrdinaryRetries)
-{
-  JoystickRecoveryPolicyLatch latch;
-  EXPECT_EQ(
-    latch.policy(), JoystickRecoveryPolicy::kRequireConfirmedStop);
-
-  latch.request(JoystickRecoveryPolicy::kRestoreAfterStopAttempt);
-  latch.request(JoystickRecoveryPolicy::kRequireConfirmedStop);
-  EXPECT_EQ(
-    latch.policy(), JoystickRecoveryPolicy::kRestoreAfterStopAttempt);
-
-  latch.joystickRestored();
-  EXPECT_EQ(
-    latch.policy(), JoystickRecoveryPolicy::kRequireConfirmedStop);
-}
-
-TEST(BalanceStandRetry, WaitsThenRetriesWhileStandingLockPersists)
-{
-  EXPECT_EQ(
-    evaluateBalanceStandRetry(1002U, 0.10, 0.10, 0.25, 3.0),
-    BalanceStandRetryAction::kWait);
-  EXPECT_EQ(
-    evaluateBalanceStandRetry(1002U, 0.25, 0.25, 0.25, 3.0),
-    BalanceStandRetryAction::kRetry);
-}
-
-TEST(BalanceStandRetry, ConfirmsOnlyAnExecutableStateTransition)
-{
-  EXPECT_EQ(
-    evaluateBalanceStandRetry(1013U, 0.30, 0.05, 0.25, 3.0),
-    BalanceStandRetryAction::kReady);
-  EXPECT_EQ(
-    evaluateBalanceStandRetry(100U, 0.30, 0.05, 0.25, 3.0),
-    BalanceStandRetryAction::kReady);
-  EXPECT_EQ(
-    evaluateBalanceStandRetry(1001U, 0.30, 0.05, 0.25, 3.0),
-    BalanceStandRetryAction::kReject);
-  EXPECT_EQ(
-    evaluateBalanceStandRetry(1013U, 3.0, 0.25, 0.25, 3.0),
-    BalanceStandRetryAction::kReady);
-  EXPECT_EQ(
-    evaluateBalanceStandRetry(1001U, 3.0, 0.25, 0.25, 3.0),
-    BalanceStandRetryAction::kReject);
-}
-
-TEST(BalanceStandRetry, TimesOutWithoutOneFinalRetry)
-{
-  EXPECT_EQ(
-    evaluateBalanceStandRetry(1002U, 3.0, 0.25, 0.25, 3.0),
-    BalanceStandRetryAction::kTimedOut);
 }
 
 TEST(ControlParameters, AcceptsValuesWithinTheSdkCapabilityEnvelope)
@@ -906,29 +722,6 @@ TEST(MotionAuthorization, PathTimeoutRequiresASecondExplicitArm)
 
   authorization.arm(true);
   EXPECT_TRUE(authorization.executionAuthorized());
-}
-
-TEST(SdkControlOwnership, ConservativelyTracksUnconfirmedSdkSideEffects)
-{
-  SdkControlOwnership ownership;
-
-  EXPECT_TRUE(ownership.released());
-  EXPECT_FALSE(ownership.commandMayBeActive());
-  EXPECT_FALSE(ownership.joystickMayBeSuppressed());
-
-  ownership.joystickSuppressionMayHaveStarted();
-  EXPECT_FALSE(ownership.released());
-  EXPECT_TRUE(ownership.joystickMayBeSuppressed());
-
-  ownership.commandMayHaveStarted();
-  EXPECT_TRUE(ownership.commandMayBeActive());
-
-  ownership.commandStopped();
-  EXPECT_FALSE(ownership.commandMayBeActive());
-  EXPECT_FALSE(ownership.released());
-
-  ownership.joystickRestored();
-  EXPECT_TRUE(ownership.released());
 }
 
 }  // namespace utree_go2_sdk2_bridge

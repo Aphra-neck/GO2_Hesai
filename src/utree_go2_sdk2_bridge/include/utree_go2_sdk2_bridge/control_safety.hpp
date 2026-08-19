@@ -32,9 +32,6 @@ struct ControlParameters
   double command_rate;
   double path_timeout;
   double odom_timeout;
-  double sport_state_timeout;
-  double balance_stand_timeout;
-  double balance_stand_retry_interval;
   double timestamp_future_tolerance;
   double lookahead_distance;
   double goal_position_tolerance;
@@ -116,100 +113,6 @@ enum class MotionAuthorizationState
   kArmedExecuting,
 };
 
-// Unitree exposes the active high-level motion state through the historical
-// error_code field in rt/sportmodestate. A locked stand accepts Move RPCs but
-// does not execute them until BalanceStand releases the joint lock.
-enum class SportMotionPreparation
-{
-  kReady,
-  kRequestBalanceStand,
-  kReject,
-};
-
-SportMotionPreparation classifySportMotionState(std::uint32_t state_code);
-
-const char * sportMotionStateName(std::uint32_t state_code);
-
-struct SportStateSample
-{
-  std::uint32_t state_code;
-  std::uint8_t mode;
-  std::uint8_t gait_type;
-  std::uint64_t sequence;
-};
-
-// Retains a non-ready frame until the control loop handles it. A rejected
-// special state supersedes a pending standing-lock frame.
-class UnsafeSportStateLatch
-{
-public:
-  void observe(const SportStateSample & sample);
-  std::optional<SportStateSample> take();
-
-private:
-  std::optional<SportStateSample> pending_sample_;
-};
-
-enum class PostJoystickSportStateAction
-{
-  kWaitForNewSample,
-  kAllowMove,
-  kStopRestoreAndDisarm,
-};
-
-class PostJoystickSportStateGate
-{
-public:
-  void joystickSuppressedAfter(std::uint64_t state_sequence);
-  void joystickRestored();
-  PostJoystickSportStateAction evaluate(
-    std::uint32_t state_code,
-    std::uint64_t state_sequence);
-
-private:
-  std::optional<std::uint64_t> suppression_sequence_;
-};
-
-enum class JoystickRecoveryPolicy
-{
-  kRequireConfirmedStop,
-  kRestoreAfterStopAttempt,
-};
-
-bool shouldAttemptJoystickRestore(
-  bool joystick_may_be_suppressed,
-  bool stop_move_confirmed,
-  JoystickRecoveryPolicy policy);
-
-// Emergency recovery cannot be downgraded by an ordinary retry before native
-// joystick restoration is confirmed.
-class JoystickRecoveryPolicyLatch
-{
-public:
-  void request(JoystickRecoveryPolicy policy);
-  JoystickRecoveryPolicy policy() const;
-  void joystickRestored();
-
-private:
-  JoystickRecoveryPolicy policy_{JoystickRecoveryPolicy::kRequireConfirmedStop};
-};
-
-enum class BalanceStandRetryAction
-{
-  kReady,
-  kWait,
-  kRetry,
-  kTimedOut,
-  kReject,
-};
-
-BalanceStandRetryAction evaluateBalanceStandRetry(
-  std::uint32_t state_code,
-  double elapsed,
-  double since_last_attempt,
-  double retry_interval,
-  double timeout);
-
 // Separates a one-time operator arm from the presence of a currently executable path.
 class MotionAuthorization
 {
@@ -225,25 +128,6 @@ public:
 
 private:
   MotionAuthorizationState state_{MotionAuthorizationState::kDisarmed};
-};
-
-// Tracks SDK calls whose side effects may have reached the robot even when the
-// RPC reply is lost. Each flag is cleared only after the inverse call succeeds.
-class SdkControlOwnership
-{
-public:
-  bool released() const;
-  bool commandMayBeActive() const;
-  bool joystickMayBeSuppressed() const;
-
-  void commandMayHaveStarted();
-  void commandStopped();
-  void joystickSuppressionMayHaveStarted();
-  void joystickRestored();
-
-private:
-  bool command_may_be_active_{false};
-  bool joystick_may_be_suppressed_{false};
 };
 
 // Returns an empty string when every parameter is inside the bridge's hard safety envelope.

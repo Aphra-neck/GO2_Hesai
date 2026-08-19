@@ -1,9 +1,7 @@
 #pragma once
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 
@@ -12,8 +10,6 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_srvs/srv/set_bool.hpp"
-#include "unitree/idl/go2/SportModeState_.hpp"
-#include "unitree/robot/channel/channel_subscriber.hpp"
 #include "unitree/robot/go2/sport/sport_client.hpp"
 #include "utree_go2_sdk2_bridge/control_safety.hpp"
 
@@ -32,22 +28,14 @@ public:
 private:
   void pathCallback(const nav_msgs::msg::Path::SharedPtr msg);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
-  void sportStateCallback(const void * message);
   void enableCallback(
     const std_srvs::srv::SetBool::Request::SharedPtr request,
     std_srvs::srv::SetBool::Response::SharedPtr response);
   void controlTick();
   void controlTickImpl();
-  void failSafe(
-    const char * reason,
-    JoystickRecoveryPolicy recovery_policy =
-    JoystickRecoveryPolicy::kRequireConfirmedStop);
+  void failSafe(const char * reason);
   bool waitForNewPath(const char * reason);
-  bool suppressJoystickForSdkControl();
-  bool stopRobot(
-    const char * reason,
-    JoystickRecoveryPolicy recovery_policy =
-    JoystickRecoveryPolicy::kRequireConfirmedStop) noexcept;
+  bool stopRobot(const char * reason) noexcept;
   bool cachedPathValid() const;
   bool cachedOdomValid() const;
   bool pathFresh(const rclcpp::Time & current_time) const;
@@ -59,7 +47,6 @@ private:
     const rclcpp::Time & message_time,
     const rclcpp::Time & current_time,
     double timeout) const;
-  std::optional<SportStateSample> freshSportState();
   bool lowcmdPublisherPresent();
 
   std::string network_interface_;
@@ -67,15 +54,11 @@ private:
   std::string body_frame_;
   int domain_id_{0};
   MotionAuthorization motion_authorization_;
-  SdkControlOwnership sdk_control_ownership_;
-  PostJoystickSportStateGate post_joystick_sport_state_gate_;
-  JoystickRecoveryPolicyLatch joystick_recovery_policy_latch_;
+  // Cleared only after SportClient confirms StopMove.
+  bool command_active_{false};
   double command_rate_{20.0};
   double path_timeout_{1.0};
   double odom_timeout_{0.5};
-  double sport_state_timeout_{1.0};
-  double balance_stand_timeout_{3.0};
-  double balance_stand_retry_interval_{0.25};
   double timestamp_future_tolerance_{0.2};
   double lookahead_distance_{0.6};
   double goal_position_tolerance_{0.15};
@@ -84,9 +67,6 @@ private:
   double heading_alignment_exit_angle_{0.2617993877991494};
   double explicit_rotation_tolerance_{0.05};
   bool heading_alignment_active_{false};
-  bool balance_stand_pending_{false};
-  std::chrono::steady_clock::time_point balance_stand_requested_at_{};
-  std::chrono::steady_clock::time_point balance_stand_last_attempt_at_{};
   double linear_gain_{1.0};
   double yaw_gain_{1.5};
   double max_vx_{};
@@ -97,16 +77,7 @@ private:
   std::optional<std::int64_t> path_goal_generation_;
   nav_msgs::msg::Path::SharedPtr path_;
   nav_msgs::msg::Odometry::SharedPtr odom_;
-  mutable std::mutex sport_state_mutex_;
-  UnsafeSportStateLatch unsafe_sport_state_latch_;
-  std::optional<std::uint32_t> sport_state_code_;
-  std::uint8_t sport_state_mode_{0U};
-  std::uint8_t sport_state_gait_type_{0U};
-  std::uint64_t sport_state_sequence_{0U};
-  std::chrono::steady_clock::time_point sport_state_received_at_{};
   std::unique_ptr<unitree::robot::go2::SportClient> sport_client_;
-  unitree::robot::ChannelSubscriberPtr<unitree_go::msg::dds_::SportModeState_>
-  sport_state_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr command_pub_;
