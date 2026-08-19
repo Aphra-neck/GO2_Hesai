@@ -52,8 +52,8 @@ PLANNER_SERIES_COUNT=''
 PLANNER_SERIES_INTERVAL_SEC=''
 
 # Bracket the first character so concurrent pgrep queries cannot match each other.
-readonly ROBOT_PROCESS_PATTERN='[h]esai_ros_driver_node|[g]o2_imu_bridge_node|[s]uper_lio_node|[b]ody_odom_adapter_node|[t]errain_mapper_node|[b]ody_lattice_planner_node|[g]o2_sdk2_bridge_node|[r]l_controller_node|[u]tree_go2_rl_controller'
-readonly MOTION_PROCESS_PATTERN='[g]o2_sdk2_bridge_node|[r]l_controller_node|[u]tree_go2_rl_controller'
+readonly ROBOT_PROCESS_PATTERN='[h]esai_ros_driver_node|[g]o2_imu_bridge_node|[s]uper_lio_node|[b]ody_odom_adapter_node|[t]errain_mapper_node|[b]ody_lattice_planner_node|[g]o2_sdk2_bridge_node|[g]o2_sdk2_direct_bridge_node|[g]o2_sdk2_simple_nav_node|[r]l_controller_node|[u]tree_go2_rl_controller'
+readonly MOTION_PROCESS_PATTERN='[g]o2_sdk2_bridge_node|[g]o2_sdk2_direct_bridge_node|[g]o2_sdk2_simple_nav_node|[r]l_controller_node|[u]tree_go2_rl_controller'
 
 declare -ar COMPONENT_SPECS=(
   'hesai_lidar:[h]esai_ros_driver_node'
@@ -63,6 +63,7 @@ declare -ar COMPONENT_SPECS=(
   'terrain_mapper:[t]errain_mapper_node'
   'body_lattice_planner:[b]ody_lattice_planner_node'
   'go2_sdk2_bridge:[g]o2_sdk2_bridge_node'
+  'go2_sdk2_direct_bridge:[g]o2_sdk2_direct_bridge_node'
   'go2_rl_controller:[r]l_controller_node|[u]tree_go2_rl_controller'
 )
 
@@ -1227,7 +1228,7 @@ capture_ros_graph() {
   local node safe_name output_file param_status
   while IFS= read -r node; do
     (( stop_requested_ref == 0 )) || break
-    [[ "${node}" =~ (super_lio|body_odom_adapter|terrain_mapper|body_lattice_planner|go2_sdk2_bridge|go2_imu_bridge|hesai_ros_driver) ]] || continue
+    [[ "${node}" =~ (super_lio|body_odom_adapter|terrain_mapper|body_lattice_planner|go2_sdk2_bridge|go2_sdk2_direct_bridge|go2_imu_bridge|hesai_ros_driver) ]] || continue
     safe_name="$(printf '%s' "${node#/}" | tr -c 'A-Za-z0-9_.-' '_')"
     output_file="${session_dir}/parameters_${safe_name}.yaml"
     [[ -f "${output_file}" ]] && continue

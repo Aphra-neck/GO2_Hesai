@@ -18,9 +18,9 @@
 namespace utree_go2_sdk2_bridge
 {
 
-// Commissioning executor: a goal plus body odometry become a Manhattan route
-// with heading alignment at each leg. It intentionally bypasses terrain maps
-// and the body-path planner.
+// Direct SDK2 bridge: a goal plus existing body odometry become a Manhattan
+// route with heading alignment at each leg. The terrain stack may keep running,
+// but its body path is not an input to this bridge.
 class SimpleGoalExecutorNode : public rclcpp::Node
 {
 public:

@@ -81,6 +81,10 @@ if [[ "${FAKE_MOTION_PROCESS:-0}" == 1 ]]; then
   echo '4242 /opt/go2/go2_sdk2_bridge_node'
   exit 0
 fi
+if [[ "${FAKE_DIRECT_MOTION_PROCESS:-0}" == 1 ]]; then
+  echo '4243 /opt/go2/go2_sdk2_direct_bridge_node'
+  exit 0
+fi
 if [[ "${FAKE_CONCURRENT_PGREP:-0}" == 1 &&
       "$*" == *'go2_sdk2_bridge_node'* ]]; then
   echo '11384 pgrep -f go2_sdk2_bridge_node'
@@ -258,6 +262,18 @@ process_status=$?
 set -e
 test "${process_status}" -ne 0
 [[ "${process_output}" == *"motion command process is running"* ]]
+test "${before_graph_failure}" = \
+  "$(sha256sum "${session_dir}/planner_input_inspections.jsonl")"
+
+set +e
+direct_process_output="$(
+  env "${common_environment[@]}" FAKE_DIRECT_MOTION_PROCESS=1 \
+    "${GO2_LOG}" planner-check --no-goal 2>&1
+)"
+direct_process_status=$?
+set -e
+test "${direct_process_status}" -ne 0
+[[ "${direct_process_output}" == *"motion command process is running"* ]]
 test "${before_graph_failure}" = \
   "$(sha256sum "${session_dir}/planner_input_inspections.jsonl")"
 

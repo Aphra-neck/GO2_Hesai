@@ -152,14 +152,13 @@ if (( lowcmd_publishers > 0 )); then
   exit 1
 fi
 
-if ! bridge_processes="$(
-    checked_pgrep "/utree_go2_sdk2_bridge/go2_sdk2_bridge_node"
-  )"; then
+executor_pattern='/utree_go2_sdk2_bridge/(go2_sdk2_bridge_node|go2_sdk2_direct_bridge_node|go2_sdk2_simple_nav_node)'
+if ! bridge_processes="$(checked_pgrep "${executor_pattern}")"; then
   echo "The SDK2 bridge process query failed; refusing to start another bridge." >&2
   exit 1
 fi
 if [[ -n "${bridge_processes}" ]]; then
-  echo "The Go2 SDK2 bridge is already running." >&2
+  echo "An SDK2 motion bridge is already running." >&2
   echo "${bridge_processes}" >&2
   exit 1
 fi

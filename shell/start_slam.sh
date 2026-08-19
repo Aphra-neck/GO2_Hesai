@@ -230,7 +230,7 @@ finalize_owned_diagnostics() {
   local blockers=''
   if ! blockers="$(
       checked_pgrep \
-        'hesai_ros_driver_node|go2_imu_bridge_node|super_lio_node|terrain_mapper_node|body_lattice_planner_node|body_odom_adapter_node|go2_sdk2_bridge_node|flat_obstacle_map_recorder.py|utree_go2_rl_controller|rl_controller_node'
+        'hesai_ros_driver_node|go2_imu_bridge_node|super_lio_node|terrain_mapper_node|body_lattice_planner_node|body_odom_adapter_node|go2_sdk2_bridge_node|go2_sdk2_direct_bridge_node|go2_sdk2_simple_nav_node|flat_obstacle_map_recorder.py|utree_go2_rl_controller|rl_controller_node'
     )"; then
     echo \
       "Automatic diagnostic finalization skipped because the robot process query failed; active session retained: ${DIAGNOSTIC_SESSION_ID}" \

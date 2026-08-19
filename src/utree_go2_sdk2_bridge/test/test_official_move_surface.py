@@ -5,30 +5,53 @@ import unittest
 
 
 PACKAGE_ROOT = pathlib.Path(__file__).resolve().parents[1]
-NODE_SOURCE = PACKAGE_ROOT / "src" / "go2_sdk2_bridge_node.cpp"
+NODE_SOURCES = (
+    PACKAGE_ROOT / "src" / "go2_sdk2_bridge_node.cpp",
+    PACKAGE_ROOT / "src" / "simple_goal_executor_node.cpp",
+)
+DIRECT_LAUNCH = PACKAGE_ROOT / "launch" / "go2_sdk2_direct_bridge.launch.py"
+DIRECT_START = PACKAGE_ROOT.parents[1] / "shell" / "start_sdk2_direct_bridge.sh"
 
 
 class OfficialMoveSurfaceTest(unittest.TestCase):
     def test_bridge_uses_only_move_and_stop_motion_rpcs(self):
-        source = NODE_SOURCE.read_text(encoding="utf-8")
+        for node_source in NODE_SOURCES:
+            with self.subTest(source=node_source.name):
+                source = node_source.read_text(encoding="utf-8")
+                self.assertIn("unitree::robot::go2::SportClient", source)
+                self.assertIn("sport_client_->Move(", source)
+                self.assertIn("sport_client_->StopMove()", source)
 
-        self.assertIn("unitree::robot::go2::SportClient", source)
-        self.assertIn("sport_client_->Move(", source)
-        self.assertIn("sport_client_->StopMove()", source)
+                for forbidden_call in (
+                    "sport_client_->BalanceStand(",
+                    "sport_client_->SwitchJoystick(",
+                    "sport_client_->HandStand(",
+                    "sport_client_->FreeJump(",
+                    "sport_client_->StaticWalk(",
+                    "sport_client_->TrotRun(",
+                    "sport_client_->EconomicGait(",
+                    "SelectMode(",
+                    "ReleaseMode(",
+                    "ServiceSwitch(",
+                ):
+                    self.assertNotIn(forbidden_call, source)
 
-        for forbidden_call in (
-            "sport_client_->BalanceStand(",
-            "sport_client_->SwitchJoystick(",
-            "sport_client_->HandStand(",
-            "sport_client_->FreeJump(",
-            "sport_client_->StaticWalk(",
-            "sport_client_->TrotRun(",
-            "sport_client_->EconomicGait(",
-            "SelectMode(",
-            "ReleaseMode(",
-            "ServiceSwitch(",
+    def test_direct_bridge_does_not_consume_or_launch_the_planner(self):
+        source = NODE_SOURCES[1].read_text(encoding="utf-8")
+        launch = DIRECT_LAUNCH.read_text(encoding="utf-8")
+        start = DIRECT_START.read_text(encoding="utf-8")
+
+        self.assertNotIn("nav_msgs::msg::Path", source)
+        self.assertNotIn("path_sub_", source)
+        self.assertIn('executable="go2_sdk2_direct_bridge_node"', launch)
+        self.assertEqual(launch.count("Node("), 1)
+        for planner_executable in (
+            "body_odom_adapter_node",
+            "terrain_mapper_node",
+            "body_lattice_planner_node",
         ):
-            self.assertNotIn(forbidden_call, source)
+            self.assertNotIn(planner_executable, launch)
+            self.assertNotIn(planner_executable, start)
 
 
 if __name__ == "__main__":

@@ -78,6 +78,11 @@ SH
 
 cat > "${fake_bin}/pgrep" <<'SH'
 #!/usr/bin/env bash
+if [[ "${FAKE_DIRECT_BRIDGE_RUNNING:-false}" == true &&
+      "$*" == *"go2_sdk2_direct_bridge_node"* ]]; then
+  echo '4243 /opt/go2/go2_sdk2_direct_bridge_node'
+  exit 0
+fi
 exit 1
 SH
 
@@ -129,5 +134,15 @@ grep -Fq ' yaw=0.8 rad/s [YAML:' <<< "${override_output}"
 grep -Fq 'max_vy:=0.7' "${trace_file}"
 test "$(grep -c 'max_vx:=' "${trace_file}" || true)" -eq 0
 test "$(grep -c 'max_yaw_rate:=' "${trace_file}" || true)" -eq 0
+
+set +e
+direct_bridge_output="$(
+  env "${common_environment[@]}" FAKE_DIRECT_BRIDGE_RUNNING=true \
+    "${workspace}/shell/start_sdk2_bridge.sh" 2>&1
+)"
+direct_bridge_status=$?
+set -e
+test "${direct_bridge_status}" -ne 0
+[[ "${direct_bridge_output}" == *"An SDK2 motion bridge is already running"* ]]
 
 echo "PASS: SDK2 startup uses YAML defaults and forwards only explicit velocity overrides"

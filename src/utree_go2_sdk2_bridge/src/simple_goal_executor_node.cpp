@@ -33,7 +33,7 @@ double quaternionYaw(const geometry_msgs::msg::Quaternion & q)
 
 }  // namespace
 
-SimpleGoalExecutorNode::SimpleGoalExecutorNode() : Node("go2_sdk2_simple_nav")
+SimpleGoalExecutorNode::SimpleGoalExecutorNode() : Node("go2_sdk2_direct_bridge")
 {
   network_interface_ = declare_parameter("network_interface", "enP8p1s0");
   domain_id_ = declare_parameter("domain_id", 0);
@@ -71,7 +71,7 @@ SimpleGoalExecutorNode::SimpleGoalExecutorNode() : Node("go2_sdk2_simple_nav")
     !finite(max_vx_) || max_vx_ <= 0.0 || !finite(max_vy_) || max_vy_ <= 0.0 ||
     !finite(max_yaw_rate_) || max_yaw_rate_ <= 0.0)
   {
-    throw std::invalid_argument("simple navigation parameters are outside their positive ranges");
+    throw std::invalid_argument("direct bridge parameters are outside their positive ranges");
   }
   if (domain_id_ < 0 || domain_id_ > 232) {
     throw std::invalid_argument("domain_id must be in [0, 232]");
@@ -101,8 +101,8 @@ SimpleGoalExecutorNode::SimpleGoalExecutorNode() : Node("go2_sdk2_simple_nav")
 
   RCLCPP_WARN(
     get_logger(),
-    "Simple Go2 navigation is disabled; it uses only /goal_pose and /lio/body_odom "
-    "and does not perform obstacle avoidance");
+    "Direct Go2 SDK2 bridge is disabled; it uses /goal_pose and /lio/body_odom, "
+    "ignores /body_path, and does not perform obstacle avoidance");
 }
 
 SimpleGoalExecutorNode::~SimpleGoalExecutorNode() noexcept
@@ -128,7 +128,7 @@ void SimpleGoalExecutorNode::goalCallback(const geometry_msgs::msg::PoseStamped:
   }
   if (!msg->header.frame_id.empty() && msg->header.frame_id != world_frame_) {
     RCLCPP_ERROR(
-      get_logger(), "Ignoring goal in frame '%s'; simple navigation requires '%s'",
+      get_logger(), "Ignoring goal in frame '%s'; direct bridge requires '%s'",
       msg->header.frame_id.c_str(), world_frame_.c_str());
     return;
   }
@@ -164,7 +164,7 @@ void SimpleGoalExecutorNode::enableCallback(
     armed_ = false;
     clearGoal("motion disabled");
     response->success = stopRobot("motion disabled");
-    response->message = response->success ? "Simple Go2 motion disabled" : "StopMove not confirmed";
+    response->message = response->success ? "Direct Go2 bridge disabled" : "StopMove not confirmed";
     return;
   }
   if (lowcmdPublisherPresent()) {
@@ -179,7 +179,7 @@ void SimpleGoalExecutorNode::enableCallback(
   }
   armed_ = true;
   response->success = true;
-  response->message = goal_ ? "Simple Go2 motion armed" : "Simple Go2 motion armed; waiting for /goal_pose";
+  response->message = goal_ ? "Direct Go2 bridge armed" : "Direct Go2 bridge armed; waiting for /goal_pose";
 }
 
 void SimpleGoalExecutorNode::controlTick()
@@ -216,7 +216,7 @@ void SimpleGoalExecutorNode::controlTickImpl()
     clearGoal("body odometry stopped");
     stopRobot("body odometry stopped");
     RCLCPP_ERROR_THROTTLE(
-      get_logger(), *get_clock(), 3000, "Simple navigation stopped: body odometry stopped");
+      get_logger(), *get_clock(), 3000, "Direct bridge stopped: body odometry stopped");
     return;
   }
   if (!goal_) {
@@ -247,7 +247,7 @@ void SimpleGoalExecutorNode::controlTickImpl()
     if (std::abs(error) <= yaw_tolerance_) {
       stopRobot("simple goal reached");
       clearGoal("simple goal reached");
-      RCLCPP_INFO(get_logger(), "Simple goal reached; authorization remains armed");
+      RCLCPP_INFO(get_logger(), "Direct-bridge goal reached; authorization remains armed");
       return;
     }
     (void)sendMove(0.0, 0.0, clamp(yaw_gain_ * error, max_yaw_rate_));
@@ -353,14 +353,14 @@ bool SimpleGoalExecutorNode::stopRobot(const char * reason) noexcept
     const int32_t status = sport_client_->StopMove();
     if (status == 0) {
       command_active_ = false;
-      RCLCPP_INFO(get_logger(), "Simple navigation stopped: %s", reason);
+      RCLCPP_INFO(get_logger(), "Direct bridge stopped: %s", reason);
       return true;
     }
     RCLCPP_ERROR_THROTTLE(
-      get_logger(), *get_clock(), 3000, "Simple StopMove failed with status %d (%s)", status, reason);
+      get_logger(), *get_clock(), 3000, "Direct-bridge StopMove failed with status %d (%s)", status, reason);
   } catch (...) {
     RCLCPP_ERROR_THROTTLE(
-      get_logger(), *get_clock(), 3000, "Simple StopMove threw (%s)", reason);
+      get_logger(), *get_clock(), 3000, "Direct-bridge StopMove threw (%s)", reason);
   }
   return false;
 }
@@ -381,7 +381,7 @@ bool SimpleGoalExecutorNode::sendMove(double vx, double vy, double yaw_rate)
     armed_ = false;
     clearGoal("SportClient::Move failed");
     stopRobot("SportClient::Move failed");
-    RCLCPP_ERROR(get_logger(), "Simple SportClient::Move failed with status %d", status);
+    RCLCPP_ERROR(get_logger(), "Direct-bridge SportClient::Move failed with status %d", status);
     return false;
   }
   geometry_msgs::msg::TwistStamped command;
@@ -397,7 +397,7 @@ bool SimpleGoalExecutorNode::sendMove(double vx, double vy, double yaw_rate)
 void SimpleGoalExecutorNode::clearGoal(const char * reason)
 {
   if (goal_) {
-    RCLCPP_INFO(get_logger(), "Simple goal cleared: %s", reason);
+    RCLCPP_INFO(get_logger(), "Direct-bridge goal cleared: %s", reason);
   }
   goal_.reset();
   route_.clear();
@@ -418,7 +418,7 @@ void SimpleGoalExecutorNode::rebuildRoute()
   segment_start_ = {odom_->pose.pose.position.x, odom_->pose.pose.position.y};
   has_segment_start_ = true;
   phase_ = Phase::kAlignSegment;
-  RCLCPP_INFO(get_logger(), "Simple route contains %zu translation targets", route_.size());
+  RCLCPP_INFO(get_logger(), "Direct bridge route contains %zu translation targets", route_.size());
 }
 
 void SimpleGoalExecutorNode::advanceReachedSegments()
