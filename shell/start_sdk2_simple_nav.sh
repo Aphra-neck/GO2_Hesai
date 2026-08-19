@@ -23,6 +23,11 @@ if pgrep -af -- '/utree_go2_sdk2_bridge/(go2_sdk2_bridge_node|go2_sdk2_simple_na
   pgrep -af -- '/utree_go2_sdk2_bridge/(go2_sdk2_bridge_node|go2_sdk2_simple_nav_node)' >&2
   exit 1
 fi
+if pgrep -af -- '/utree_dog_navigation/(terrain_mapper_node|body_lattice_planner_node|body_odom_adapter_node)' >/dev/null 2>&1; then
+  echo "The terrain navigation stack is already running; stop it before simple navigation:" >&2
+  pgrep -af -- '/utree_dog_navigation/(terrain_mapper_node|body_lattice_planner_node|body_odom_adapter_node)' >&2
+  exit 1
+fi
 if ros2 topic info --no-daemon --spin-time 3 /lowcmd 2>/dev/null |
   awk -F': *' '$1 == "Publisher count" && $2 ~ /^[1-9][0-9]*$/ {found=1} END {exit found ? 0 : 1}'
 then

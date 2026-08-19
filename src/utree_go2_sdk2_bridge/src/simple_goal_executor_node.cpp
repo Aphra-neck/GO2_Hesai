@@ -28,7 +28,7 @@ double quaternionYaw(const geometry_msgs::msg::Quaternion & q)
   }
   return std::atan2(
     2.0 * (q.w * q.z + q.x * q.y) / norm,
-    1.0 - 2.0 * (q.y * q.y + q.z * q.z) / norm);
+    (norm - 2.0 * (q.y * q.y + q.z * q.z)) / norm);
 }
 
 }  // namespace
@@ -44,6 +44,7 @@ SimpleGoalExecutorNode::SimpleGoalExecutorNode() : Node("go2_sdk2_simple_nav")
   yaw_tolerance_ = declare_parameter("yaw_tolerance", 0.12);
   align_tolerance_ = declare_parameter("align_tolerance", 0.08);
   linear_gain_ = declare_parameter("linear_gain", 1.0);
+  lateral_gain_ = declare_parameter("lateral_gain", 1.0);
   yaw_gain_ = declare_parameter("yaw_gain", 1.5);
   max_vx_ = declare_parameter("max_vx", 0.6);
   max_vy_ = declare_parameter("max_vy", 0.35);
@@ -65,7 +66,8 @@ SimpleGoalExecutorNode::SimpleGoalExecutorNode() : Node("go2_sdk2_simple_nav")
   if (!finite(command_rate_) || command_rate_ <= 0.0 || !finite(odom_timeout_) || odom_timeout_ <= 0.0 ||
     !finite(position_tolerance_) || position_tolerance_ < 0.0 || !finite(yaw_tolerance_) ||
     yaw_tolerance_ < 0.0 || !finite(align_tolerance_) || align_tolerance_ < 0.0 ||
-    !finite(linear_gain_) || linear_gain_ <= 0.0 || !finite(yaw_gain_) || yaw_gain_ <= 0.0 ||
+    !finite(linear_gain_) || linear_gain_ <= 0.0 || !finite(lateral_gain_) || lateral_gain_ <= 0.0 ||
+    !finite(yaw_gain_) || yaw_gain_ <= 0.0 ||
     !finite(max_vx_) || max_vx_ <= 0.0 || !finite(max_vy_) || max_vy_ <= 0.0 ||
     !finite(max_yaw_rate_) || max_yaw_rate_ <= 0.0)
   {
@@ -125,9 +127,10 @@ void SimpleGoalExecutorNode::goalCallback(const geometry_msgs::msg::PoseStamped:
     return;
   }
   if (!msg->header.frame_id.empty() && msg->header.frame_id != world_frame_) {
-    RCLCPP_WARN(
-      get_logger(), "Goal frame is '%s'; simple navigation assumes configured world frame '%s'",
+    RCLCPP_ERROR(
+      get_logger(), "Ignoring goal in frame '%s'; simple navigation requires '%s'",
       msg->header.frame_id.c_str(), world_frame_.c_str());
+    return;
   }
   goal_ = *msg;
   route_.clear();
@@ -271,8 +274,28 @@ void SimpleGoalExecutorNode::controlTickImpl()
   }
 
   const auto & target = route_[route_index_];
-  const double world_dx = target.x - odom_->pose.pose.position.x;
-  const double world_dy = target.y - odom_->pose.pose.position.y;
+  const double start_x = has_segment_start_ ? segment_start_.x : odom_->pose.pose.position.x;
+  const double start_y = has_segment_start_ ? segment_start_.y : odom_->pose.pose.position.y;
+  const double segment_dx = target.x - start_x;
+  const double segment_dy = target.y - start_y;
+  const double segment_length = std::hypot(segment_dx, segment_dy);
+  if (!finite(segment_length) || segment_length <= position_tolerance_) {
+    advanceReachedSegments();
+    return;
+  }
+  const double direction_x = segment_dx / segment_length;
+  const double direction_y = segment_dy / segment_length;
+  const double current_progress =
+    (odom_->pose.pose.position.x - start_x) * direction_x +
+    (odom_->pose.pose.position.y - start_y) * direction_y;
+  const double remaining = std::clamp(segment_length - current_progress, 0.0, segment_length);
+  const double lateral_error =
+    (odom_->pose.pose.position.x - start_x) * (-direction_y) +
+    (odom_->pose.pose.position.y - start_y) * direction_x;
+  const double world_dx = direction_x * remaining;
+  const double world_dy = direction_y * remaining;
+  const double correction_x = direction_y * lateral_error;
+  const double correction_y = -direction_x * lateral_error;
   const auto yaw = currentYaw();
   if (!yaw) {
     armed_ = false;
@@ -282,13 +305,13 @@ void SimpleGoalExecutorNode::controlTickImpl()
   }
   const double cos_yaw = std::cos(*yaw);
   const double sin_yaw = std::sin(*yaw);
-  const double body_dx = cos_yaw * world_dx + sin_yaw * world_dy;
-  const double body_dy = -sin_yaw * world_dx + cos_yaw * world_dy;
+  const double body_dx = cos_yaw * (world_dx + correction_x) + sin_yaw * (world_dy + correction_y);
+  const double body_dy = -sin_yaw * (world_dx + correction_x) + cos_yaw * (world_dy + correction_y);
   const auto desired = desiredSegmentYaw();
   const double yaw_error = desired ? normalizeAngle(*desired - *yaw) : 0.0;
   (void)sendMove(
     clamp(linear_gain_ * body_dx, max_vx_),
-    clamp(linear_gain_ * body_dy, max_vy_),
+    clamp(lateral_gain_ * body_dy, max_vy_),
     clamp(yaw_gain_ * yaw_error, max_yaw_rate_));
 }
 
@@ -379,6 +402,7 @@ void SimpleGoalExecutorNode::clearGoal(const char * reason)
   goal_.reset();
   route_.clear();
   route_index_ = 0;
+  has_segment_start_ = false;
   phase_ = Phase::kAlignSegment;
 }
 
@@ -391,6 +415,8 @@ void SimpleGoalExecutorNode::rebuildRoute()
     odom_->pose.pose.position.x, odom_->pose.pose.position.y, *currentYaw(),
     goal_->pose.position.x, goal_->pose.position.y, position_tolerance_);
   route_index_ = 0;
+  segment_start_ = {odom_->pose.pose.position.x, odom_->pose.pose.position.y};
+  has_segment_start_ = true;
   phase_ = Phase::kAlignSegment;
   RCLCPP_INFO(get_logger(), "Simple route contains %zu translation targets", route_.size());
 }
@@ -406,6 +432,8 @@ void SimpleGoalExecutorNode::advanceReachedSegments()
       return;
     }
     ++route_index_;
+    segment_start_ = target;
+    has_segment_start_ = true;
     phase_ = Phase::kAlignSegment;
     stopRobot("right-angle waypoint reached");
   }
@@ -435,8 +463,10 @@ std::optional<double> SimpleGoalExecutorNode::desiredSegmentYaw() const
     return std::nullopt;
   }
   const auto & target = route_[route_index_];
-  const double dx = target.x - odom_->pose.pose.position.x;
-  const double dy = target.y - odom_->pose.pose.position.y;
+  const double start_x = has_segment_start_ ? segment_start_.x : odom_->pose.pose.position.x;
+  const double start_y = has_segment_start_ ? segment_start_.y : odom_->pose.pose.position.y;
+  const double dx = target.x - start_x;
+  const double dy = target.y - start_y;
   if (std::hypot(dx, dy) <= position_tolerance_) {
     return std::nullopt;
   }

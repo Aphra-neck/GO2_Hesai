@@ -15,6 +15,7 @@ go2_sdk2_simple_nav:
     yaw_tolerance: 0.12
     align_tolerance: 0.08
     linear_gain: 1.0
+    lateral_gain: 1.0
     yaw_gain: 1.5
     max_vx: 0.6
     max_vy: 0.35

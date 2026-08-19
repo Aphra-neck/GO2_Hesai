@@ -71,6 +71,7 @@ private:
   double yaw_tolerance_{0.12};
   double align_tolerance_{0.08};
   double linear_gain_{1.0};
+  double lateral_gain_{1.0};
   double yaw_gain_{1.5};
   double max_vx_{0.6};
   double max_vy_{0.35};
@@ -83,6 +84,8 @@ private:
   std::chrono::steady_clock::time_point last_odom_received_{};
   std::vector<SimpleWaypoint> route_;
   std::size_t route_index_{0};
+  SimpleWaypoint segment_start_{};
+  bool has_segment_start_{false};
   Phase phase_{Phase::kAlignSegment};
 
   std::unique_ptr<unitree::robot::go2::SportClient> sport_client_;

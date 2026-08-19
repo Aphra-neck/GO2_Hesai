@@ -8,6 +8,10 @@ The simple node consumes only:
 - `/goal_pose` (`geometry_msgs/msg/PoseStamped`)
 - `/lio/body_odom` (`nav_msgs/msg/Odometry`)
 
+Its launch file starts only the standalone body-odometry adapter needed to
+produce `/lio/body_odom` from Super-LIO `/lio/odom`; it does not start the
+terrain mapper, lattice planner, or their RViz process.
+
 For a diagonal goal it chooses one of the two Manhattan routes, selects the
 first leg closest to the current heading, rotates in place, translates to the
 right-angle waypoint, rotates again, translates to the goal, and finally aligns
@@ -19,6 +23,9 @@ The following controls remain deliberately present: explicit
 odometry receive watchdog that sends `StopMove()` if feedback stops arriving.
 This is a direct, obstacle-unaware commissioning mode and must not be used in
 obstacle-rich environments.
+
+Stop the normal terrain-navigation launch before starting this mode. The start
+script refuses to run alongside the old planner or another SDK2 executor.
 
 Start it with:
 
