@@ -53,6 +53,14 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
             self.assertNotIn(planner_executable, launch)
             self.assertNotIn(planner_executable, start)
 
+    def test_direct_bridge_does_not_stop_between_route_segments(self):
+        source = NODE_SOURCES[1].read_text(encoding="utf-8")
+
+        self.assertNotIn('stopRobot("segment heading aligned")', source)
+        self.assertNotIn('stopRobot("right-angle waypoint reached")', source)
+        self.assertIn("continuing with translation", source)
+        self.assertIn("continuing with next segment", source)
+
 
 if __name__ == "__main__":
     unittest.main()

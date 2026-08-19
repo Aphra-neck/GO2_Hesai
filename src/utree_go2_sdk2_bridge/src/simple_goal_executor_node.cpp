@@ -266,7 +266,11 @@ void SimpleGoalExecutorNode::controlTickImpl()
     const double error = normalizeAngle(*desired - *yaw);
     if (std::abs(error) <= align_tolerance_) {
       phase_ = Phase::kTranslateSegment;
-      stopRobot("segment heading aligned");
+      // Keep the SDK2 motion stream alive across an internal phase change.
+      // StopMove() can leave the Go2 waiting for a fresh locomotion wake-up;
+      // it is reserved for goal completion, disable, timeout, and faults.
+      RCLCPP_INFO(
+        get_logger(), "Direct bridge segment heading aligned; continuing with translation");
       return;
     }
     (void)sendMove(0.0, 0.0, clamp(yaw_gain_ * error, max_yaw_rate_));
@@ -435,7 +439,8 @@ void SimpleGoalExecutorNode::advanceReachedSegments()
     segment_start_ = target;
     has_segment_start_ = true;
     phase_ = Phase::kAlignSegment;
-    stopRobot("right-angle waypoint reached");
+    RCLCPP_INFO(
+      get_logger(), "Direct bridge right-angle waypoint reached; continuing with next segment");
   }
 }
 
