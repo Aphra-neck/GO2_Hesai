@@ -1,6 +1,6 @@
 # Go2 官方 SDK2 运动、控制权与导航接口核对
 
-核对日期：2026-08-18
+核对日期：2026-08-19
 
 接口事实仅使用宇树官方文档和官方 `unitree_sdk2` 源码；手倒立事件小节另外引用本仓库历史
 和操作员现场观察，并与官方事实分开标注。官方 SDK 本地检出为
@@ -30,6 +30,65 @@
 7. 宇树官方 SLAM 导航服务是另一套端到端栈。官方明确说明其 SDK2、`unitree_slam`、雷达驱动
    和测试程序占用 CycloneDDS，并与已初始化的 ROS/ROS2 环境存在二进制冲突。它不能作为
    当前 ROS 2 Humble + Super-LIO 管线中的一个可并行组件。
+
+## 两篇官方运动文档如何用于当前 bridge
+
+用户给出的两篇文章不是两套需要同时执行的启动步骤：
+
+- [《运控服务接口 V2.0》](https://support.unitree.com/home/zh/developer/Motion_Services_Interface_V2.0)
+  是 Go2 Edu 软件 `>= V1.1.6` 的当前接口说明；该页本身把旧软件版本引向旧版运控切换、
+  [《高层运动控制》](https://support.unitree.com/home/zh/developer/High_motion_control)和 AI 运动文档。
+- `High_motion_control` 因而只能作为旧固件调用面的兼容参考，不能覆盖 V2.0 的版本选择规则。
+  现场只读探针已经得到 `CheckMode(...)=mcf`；这与 V2.0 运控体系一致，但不能单凭模式名推导
+  出完整固件版本，仍须单独核对机器人固件。
+
+当前 bridge 可以而且应当参考 V2.0，但只参考高层速度执行部分。对应关系如下：
+
+| 官方接口职责 | 当前 bridge 对应 | 决策 |
+| --- | --- | --- |
+| domain `0`、指定机器狗网卡初始化 SDK2 | `ChannelFactory::Init(domain_id_, network_interface_)` | 已一致 |
+| 初始化 `go2::SportClient` | 构造、`SetTimeout()`、`Init()` | 已一致 |
+| 发送机体系 `vx`、`vy`、`vyaw` | 把 ROS `/body_path` 与 `/lio/body_odom` 转为 `Move(...)` | 架构正确 |
+| 周期刷新速度 | bridge 以配置的控制频率重复 `Move(...)` | 已一致 |
+| 结束时停止 | 到达、超时、禁用和退出路径调用 `StopMove()` | 已一致 |
+| 原生遥控器是否响应 | 可选 `SwitchJoystick(bool)` | 不是 `Move()` 前置步骤；当前不调用 |
+| 高层/低层运控切换 | `MotionSwitcherClient` | 高层 bridge 不 `ReleaseMode()`，不发布 `/lowcmd` |
+
+官方当前
+[`go2_sport_client.cpp`](https://github.com/unitreerobotics/unitree_sdk2/blob/21d0a3b2c46ee48c8fdf2783becb6be3beb0a59b/example/go2/go2_sport_client.cpp#L36-L71)
+是决定调用顺序的最直接源码证据：初始化完成后，`velocity_move` 分支直接周期调用 `Move()`；
+它没有先调用 `StandUp()`、`BalanceStand()`、`SwitchJoystick()`、`SelectMode()` 或
+`ReleaseMode()`。因此这两篇文章可以指导桥接器的 SDK 调用面，但不能支持把这些状态改变 RPC
+作为“不运动”的试错前置步骤。
+
+这两篇文档也不能把 `/sdk2_command` 当成物理运动反馈。当前 bridge 仅在 `Move()` RPC 返回
+成功后发布该 ROS 诊断话题；它证明路径到速度的计算和 SDK 服务请求已通过，不证明电机已经
+执行。剩余问题必须从 `rt/sportmodestate`、遥控器响应、机器人固件和运行时 SDK2/API 版本
+继续核对，而不是继续修改规划器。
+
+## SDK、服务 API 与固件版本边界
+
+本次固定核对的官方 `unitree_sdk2` 提交中：
+
+- CMake 工程版本是
+  [`2.0.0`](https://github.com/unitreerobotics/unitree_sdk2/blob/21d0a3b2c46ee48c8fdf2783becb6be3beb0a59b/CMakeLists.txt#L1-L2)。
+- Go2 sport 服务 API 常量是
+  [`1.0.0.1`](https://github.com/unitreerobotics/unitree_sdk2/blob/21d0a3b2c46ee48c8fdf2783becb6be3beb0a59b/include/unitree/robot/go2/sport/sport_api.hpp#L12-L16)。
+- Go2 robot-state 服务 API 常量也是
+  [`1.0.0.1`](https://github.com/unitreerobotics/unitree_sdk2/blob/21d0a3b2c46ee48c8fdf2783becb6be3beb0a59b/include/unitree/robot/go2/robot_state/robot_state_api.hpp#L13-L20)。
+- 通用客户端公开
+  [`GetApiVersion()` 和 `GetServerApiVersion()`](https://github.com/unitreerobotics/unitree_sdk2/blob/21d0a3b2c46ee48c8fdf2783becb6be3beb0a59b/include/unitree/robot/client/client.hpp#L21-L31)，
+  官方 Go2 robot-state 示例会比较两者。这只能核对客户端与机器人服务端的**服务 API 版本**。
+- Go2 的
+  [`RobotStateClient`](https://github.com/unitreerobotics/unitree_sdk2/blob/21d0a3b2c46ee48c8fdf2783becb6be3beb0a59b/include/unitree/robot/go2/robot_state/robot_state_client.hpp#L27-L40)
+  没有 `GetPkgVersion()`；不能把 `GetServerApiVersion()` 冒充完整机器人固件版本，也不能借用
+  B2 专用接口来查询 Go2。
+
+`SportClient` 构造函数的 `enableLease` 默认值为 `false`，当前 bridge 与官方 Go2 示例都使用
+默认构造。这个事实只能说明二者的客户端构造方式一致，不能据此断言原生遥控器当前拥有或
+失去了控制权。官方可见的遥控器接口是 `SwitchJoystick(bool)`；当前头文件没有对应的状态 getter。
+只读订阅 `rt/wirelesscontroller` 可以证明遥控器帧和摇杆值到达 SDK2 DDS，但不能单独证明
+sport 服务正在响应这些帧。
 
 ## 官方接口事实
 
@@ -293,15 +352,17 @@ service”：见
 
 1. 宇树官方，《运控服务接口 V2.0》：
    <https://support.unitree.com/home/zh/developer/Motion_Services_Interface_V2.0>
-2. 宇树官方，《运控切换服务接口》：
+2. 宇树官方，《高层运动控制》：
+   <https://support.unitree.com/home/zh/developer/High_motion_control>
+3. 宇树官方，《运控切换服务接口》：
    <https://support.unitree.com/home/zh/developer/Motion%20Switcher%20Service%20Interface>
-3. 宇树官方，《SLAM 导航服务接口》：
+4. 宇树官方，《SLAM 导航服务接口》：
    <https://support.unitree.com/home/zh/developer/SLAM%20and%20Navigation_service>
-4. 宇树官方 `unitree_sdk2` 源码，固定提交：
+5. 宇树官方 `unitree_sdk2` 源码，固定提交：
    <https://github.com/unitreerobotics/unitree_sdk2/tree/21d0a3b2c46ee48c8fdf2783becb6be3beb0a59b>
-5. 本仓库，`Harden SDK2 motion ownership`：
+6. 本仓库，`Harden SDK2 motion ownership`：
    <https://github.com/Aphra-neck/GO2_Hesai/commit/f944d57b3f7191e1440ae51bbe27578d43387220>
-6. 本仓库，对上述提交的完整回退：
+7. 本仓库，对上述提交的完整回退：
    <https://github.com/Aphra-neck/GO2_Hesai/commit/0dd3fd92eefc89cb77e7757e3dd1772279ba6767>
 
 操作员现场观察没有可链接的结构化会话记录，未作为官方接口事实来源。

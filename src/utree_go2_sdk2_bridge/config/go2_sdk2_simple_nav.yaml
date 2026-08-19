@@ -1,0 +1,21 @@
+go2_sdk2_simple_nav:
+  ros__parameters:
+    network_interface: enP8p1s0
+    domain_id: 0
+    enabled: false
+    world_frame: world
+    body_frame: base_link
+    goal_topic: /goal_pose
+    odom_topic: /lio/body_odom
+    command_topic: /sdk2_command
+    command_rate: 20.0
+    # Arrival-time watchdog; no ROS header timestamp gate is used.
+    odom_timeout: 1.0
+    position_tolerance: 0.15
+    yaw_tolerance: 0.12
+    align_tolerance: 0.08
+    linear_gain: 1.0
+    yaw_gain: 1.5
+    max_vx: 0.6
+    max_vy: 0.35
+    max_yaw_rate: 0.8
