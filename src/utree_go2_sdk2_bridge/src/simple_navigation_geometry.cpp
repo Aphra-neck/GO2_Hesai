@@ -51,4 +51,17 @@ std::vector<SimpleWaypoint> makeRightAngleRoute(
   return {y_then_x, {goal_x, goal_y}};
 }
 
+SimpleWaypoint targetDeltaInBody(
+  double current_x, double current_y, double current_yaw,
+  double target_x, double target_y)
+{
+  const double world_dx = target_x - current_x;
+  const double world_dy = target_y - current_y;
+  const double cos_yaw = std::cos(current_yaw);
+  const double sin_yaw = std::sin(current_yaw);
+  return {
+    cos_yaw * world_dx + sin_yaw * world_dy,
+    -sin_yaw * world_dx + cos_yaw * world_dy};
+}
+
 }  // namespace utree_go2_sdk2_bridge

@@ -22,6 +22,13 @@ wall-clock odometry receive watchdog remain. This bridge is obstacle-unaware
 even while the terrain map is displayed; use it only for short open-ground
 commissioning.
 
+After a goal completes, the bridge remains armed and refreshes
+`Move(0, 0, 0)` at the command rate. This keeps the SDK2 locomotion stream
+active for the next goal without an intervening `StopMove()`. Call
+`~/enable_motion` with `data: false` to issue `StopMove()` and fully return to
+manual operation. Do not use the native remote for routine driving while the
+direct bridge remains armed; it does not call `SwitchJoystick()` automatically.
+
 Run the normal SLAM and terrain-navigation commands first. Then start only this
 bridge instead of `start_sdk2_bridge.sh`:
 

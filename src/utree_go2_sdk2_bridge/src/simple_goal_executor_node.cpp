@@ -220,7 +220,11 @@ void SimpleGoalExecutorNode::controlTickImpl()
     return;
   }
   if (!goal_) {
-    stopRobot("waiting for goal");
+    // Hold a zero-speed Move while armed between goals. StopMove() can leave
+    // this Go2 firmware waiting for a fresh locomotion wake-up.
+    if (command_active_) {
+      (void)sendMove(0.0, 0.0, 0.0);
+    }
     return;
   }
   if (route_.empty() && route_index_ == 0) {
@@ -245,7 +249,9 @@ void SimpleGoalExecutorNode::controlTickImpl()
     }
     const double error = normalizeAngle(*target_yaw - *yaw);
     if (std::abs(error) <= yaw_tolerance_) {
-      stopRobot("simple goal reached");
+      if (!sendMove(0.0, 0.0, 0.0)) {
+        return;
+      }
       clearGoal("simple goal reached");
       RCLCPP_INFO(get_logger(), "Direct-bridge goal reached; authorization remains armed");
       return;
@@ -264,42 +270,23 @@ void SimpleGoalExecutorNode::controlTickImpl()
       return;
     }
     const double error = normalizeAngle(*desired - *yaw);
-    if (std::abs(error) <= align_tolerance_) {
-      phase_ = Phase::kTranslateSegment;
-      // Keep the SDK2 motion stream alive across an internal phase change.
-      // StopMove() can leave the Go2 waiting for a fresh locomotion wake-up;
-      // it is reserved for goal completion, disable, timeout, and faults.
-      RCLCPP_INFO(
-        get_logger(), "Direct bridge segment heading aligned; continuing with translation");
+    if (std::abs(error) > align_tolerance_) {
+      (void)sendMove(0.0, 0.0, clamp(yaw_gain_ * error, max_yaw_rate_));
       return;
     }
-    (void)sendMove(0.0, 0.0, clamp(yaw_gain_ * error, max_yaw_rate_));
-    return;
+    phase_ = Phase::kTranslateSegment;
+    RCLCPP_INFO(
+      get_logger(), "Direct bridge segment heading aligned; continuing with translation");
   }
 
   const auto & target = route_[route_index_];
-  const double start_x = has_segment_start_ ? segment_start_.x : odom_->pose.pose.position.x;
-  const double start_y = has_segment_start_ ? segment_start_.y : odom_->pose.pose.position.y;
-  const double segment_dx = target.x - start_x;
-  const double segment_dy = target.y - start_y;
-  const double segment_length = std::hypot(segment_dx, segment_dy);
-  if (!finite(segment_length) || segment_length <= position_tolerance_) {
+  const double world_dx = target.x - odom_->pose.pose.position.x;
+  const double world_dy = target.y - odom_->pose.pose.position.y;
+  const double target_distance = std::hypot(world_dx, world_dy);
+  if (!finite(target_distance) || target_distance <= position_tolerance_) {
     advanceReachedSegments();
     return;
   }
-  const double direction_x = segment_dx / segment_length;
-  const double direction_y = segment_dy / segment_length;
-  const double current_progress =
-    (odom_->pose.pose.position.x - start_x) * direction_x +
-    (odom_->pose.pose.position.y - start_y) * direction_y;
-  const double remaining = std::clamp(segment_length - current_progress, 0.0, segment_length);
-  const double lateral_error =
-    (odom_->pose.pose.position.x - start_x) * (-direction_y) +
-    (odom_->pose.pose.position.y - start_y) * direction_x;
-  const double world_dx = direction_x * remaining;
-  const double world_dy = direction_y * remaining;
-  const double correction_x = direction_y * lateral_error;
-  const double correction_y = -direction_x * lateral_error;
   const auto yaw = currentYaw();
   if (!yaw) {
     armed_ = false;
@@ -307,15 +294,14 @@ void SimpleGoalExecutorNode::controlTickImpl()
     stopRobot("invalid body heading");
     return;
   }
-  const double cos_yaw = std::cos(*yaw);
-  const double sin_yaw = std::sin(*yaw);
-  const double body_dx = cos_yaw * (world_dx + correction_x) + sin_yaw * (world_dy + correction_y);
-  const double body_dy = -sin_yaw * (world_dx + correction_x) + cos_yaw * (world_dy + correction_y);
+  const auto body_delta = targetDeltaInBody(
+    odom_->pose.pose.position.x, odom_->pose.pose.position.y, *yaw,
+    target.x, target.y);
   const auto desired = desiredSegmentYaw();
   const double yaw_error = desired ? normalizeAngle(*desired - *yaw) : 0.0;
   (void)sendMove(
-    clamp(linear_gain_ * body_dx, max_vx_),
-    clamp(lateral_gain_ * body_dy, max_vy_),
+    clamp(linear_gain_ * body_delta.x, max_vx_),
+    clamp(lateral_gain_ * body_delta.y, max_vy_),
     clamp(yaw_gain_ * yaw_error, max_yaw_rate_));
 }
 
