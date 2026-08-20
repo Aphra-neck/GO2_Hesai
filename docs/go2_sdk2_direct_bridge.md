@@ -29,6 +29,22 @@ active for the next goal without an intervening `StopMove()`. Call
 manual operation. Do not use the native remote for routine driving while the
 direct bridge remains armed; it does not call `SwitchJoystick()` automatically.
 
+The pure geometry/controller simulation can be run without ROS or a Go2:
+
+```bash
+cd ~/catkin_ws
+python3 tools/simulate_sdk2_direct_bridge.py
+```
+
+It checks long right-angle and axis-aligned routes, an overshot waypoint,
+nonzero initial heading, two goals in sequence, and a 0.75 s odometry gap.
+Every successful case must keep the command interval at or below 0.05 s.
+The final `yaw_bias_plus_pi_over_2` and `yaw_sign_inverted` cases are
+intentionally expected not to reach: they are diagnostic contrasts for a
+body-odometry frame/yaw offset or an inverted physical yaw response, not
+controller success criteria. This simulation does not emulate SDK2 firmware
+state, joystick ownership, or DDS transport.
+
 Run the normal SLAM and terrain-navigation commands first. Then start only this
 bridge instead of `start_sdk2_bridge.sh`:
 

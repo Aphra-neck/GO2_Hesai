@@ -13,7 +13,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "std_srvs/srv/set_bool.hpp"
 #include "unitree/robot/go2/sport/sport_client.hpp"
-#include "utree_go2_sdk2_bridge/simple_navigation_geometry.hpp"
+#include "utree_go2_sdk2_bridge/simple_navigation_controller.hpp"
 
 namespace utree_go2_sdk2_bridge
 {
@@ -28,12 +28,6 @@ public:
   ~SimpleGoalExecutorNode() noexcept override;
 
 private:
-  enum class Phase
-  {
-    kAlignSegment,
-    kTranslateSegment,
-  };
-
   void goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
   void enableCallback(
@@ -45,17 +39,10 @@ private:
   bool lowcmdPublisherPresent();
   bool odomFresh() const;
   bool finiteOdom() const;
-  bool finiteGoal() const;
   bool stopRobot(const char * reason) noexcept;
   bool sendMove(double vx, double vy, double yaw_rate);
   void clearGoal(const char * reason);
-  void rebuildRoute();
-  void advanceReachedSegments();
   std::optional<double> currentYaw() const;
-  std::optional<double> goalYaw() const;
-  std::optional<double> desiredSegmentYaw() const;
-  static double normalizeAngle(double angle);
-  static double clamp(double value, double limit);
 
   std::string network_interface_;
   std::string world_frame_;
@@ -70,6 +57,7 @@ private:
   double position_tolerance_{0.15};
   double yaw_tolerance_{0.12};
   double align_tolerance_{0.08};
+  double waypoint_cross_track_tolerance_{0.30};
   double linear_gain_{1.0};
   double lateral_gain_{1.0};
   double yaw_gain_{1.5};
@@ -80,13 +68,8 @@ private:
   bool armed_{false};
   bool command_active_{false};
   std::optional<nav_msgs::msg::Odometry> odom_;
-  std::optional<geometry_msgs::msg::PoseStamped> goal_;
   std::chrono::steady_clock::time_point last_odom_received_{};
-  std::vector<SimpleWaypoint> route_;
-  std::size_t route_index_{0};
-  SimpleWaypoint segment_start_{};
-  bool has_segment_start_{false};
-  Phase phase_{Phase::kAlignSegment};
+  SimpleNavigationController navigation_;
 
   std::unique_ptr<unitree::robot::go2::SportClient> sport_client_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr goal_sub_;

@@ -1,6 +1,5 @@
 #include "utree_go2_sdk2_bridge/simple_goal_executor_node.hpp"
 
-#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -12,7 +11,6 @@ namespace utree_go2_sdk2_bridge
 {
 namespace
 {
-constexpr double kPi = 3.14159265358979323846;
 constexpr double kQuaternionEpsilon = 1.0e-9;
 
 bool finite(double value)
@@ -43,6 +41,7 @@ SimpleGoalExecutorNode::SimpleGoalExecutorNode() : Node("go2_sdk2_direct_bridge"
   position_tolerance_ = declare_parameter("position_tolerance", 0.15);
   yaw_tolerance_ = declare_parameter("yaw_tolerance", 0.12);
   align_tolerance_ = declare_parameter("align_tolerance", 0.08);
+  waypoint_cross_track_tolerance_ = declare_parameter("waypoint_cross_track_tolerance", 0.30);
   linear_gain_ = declare_parameter("linear_gain", 1.0);
   lateral_gain_ = declare_parameter("lateral_gain", 1.0);
   yaw_gain_ = declare_parameter("yaw_gain", 1.5);
@@ -66,6 +65,7 @@ SimpleGoalExecutorNode::SimpleGoalExecutorNode() : Node("go2_sdk2_direct_bridge"
   if (!finite(command_rate_) || command_rate_ <= 0.0 || !finite(odom_timeout_) || odom_timeout_ <= 0.0 ||
     !finite(position_tolerance_) || position_tolerance_ < 0.0 || !finite(yaw_tolerance_) ||
     yaw_tolerance_ < 0.0 || !finite(align_tolerance_) || align_tolerance_ < 0.0 ||
+    !finite(waypoint_cross_track_tolerance_) || waypoint_cross_track_tolerance_ < 0.0 ||
     !finite(linear_gain_) || linear_gain_ <= 0.0 || !finite(lateral_gain_) || lateral_gain_ <= 0.0 ||
     !finite(yaw_gain_) || yaw_gain_ <= 0.0 ||
     !finite(max_vx_) || max_vx_ <= 0.0 || !finite(max_vy_) || max_vy_ <= 0.0 ||
@@ -76,6 +76,11 @@ SimpleGoalExecutorNode::SimpleGoalExecutorNode() : Node("go2_sdk2_direct_bridge"
   if (domain_id_ < 0 || domain_id_ > 232) {
     throw std::invalid_argument("domain_id must be in [0, 232]");
   }
+
+  navigation_.setConfig({
+      position_tolerance_, yaw_tolerance_, align_tolerance_,
+      waypoint_cross_track_tolerance_, linear_gain_, lateral_gain_, yaw_gain_,
+      max_vx_, max_vy_, max_yaw_rate_});
 
   unitree::robot::ChannelFactory::Instance()->Init(domain_id_, network_interface_);
   sport_client_ = std::make_unique<unitree::robot::go2::SportClient>();
@@ -132,16 +137,17 @@ void SimpleGoalExecutorNode::goalCallback(const geometry_msgs::msg::PoseStamped:
       msg->header.frame_id.c_str(), world_frame_.c_str());
     return;
   }
-  goal_ = *msg;
-  route_.clear();
-  route_index_ = 0;
-  phase_ = Phase::kAlignSegment;
-  if (odom_ && finiteOdom()) {
-    rebuildRoute();
+  navigation_.setGoal({msg->pose.position.x, msg->pose.position.y, yaw});
+  const auto current_yaw = currentYaw();
+  if (odom_ && current_yaw) {
+    navigation_.prepareRoute({
+        odom_->pose.pose.position.x, odom_->pose.pose.position.y, *current_yaw});
   }
   RCLCPP_INFO(
     get_logger(), "Accepted simple goal (%.3f, %.3f); route will be rebuilt from current odometry",
     msg->pose.position.x, msg->pose.position.y);
+  RCLCPP_INFO(
+    get_logger(), "Direct bridge route contains %zu translation targets", navigation_.route().size());
 }
 
 void SimpleGoalExecutorNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
@@ -179,7 +185,8 @@ void SimpleGoalExecutorNode::enableCallback(
   }
   armed_ = true;
   response->success = true;
-  response->message = goal_ ? "Direct Go2 bridge armed" : "Direct Go2 bridge armed; waiting for /goal_pose";
+  response->message = navigation_.hasGoal() ?
+    "Direct Go2 bridge armed" : "Direct Go2 bridge armed; waiting for /goal_pose";
 }
 
 void SimpleGoalExecutorNode::controlTick()
@@ -219,72 +226,12 @@ void SimpleGoalExecutorNode::controlTickImpl()
       get_logger(), *get_clock(), 3000, "Direct bridge stopped: body odometry stopped");
     return;
   }
-  if (!goal_) {
+  if (!navigation_.hasGoal()) {
     // Hold a zero-speed Move while armed between goals. StopMove() can leave
     // this Go2 firmware waiting for a fresh locomotion wake-up.
     if (command_active_) {
       (void)sendMove(0.0, 0.0, 0.0);
     }
-    return;
-  }
-  if (route_.empty() && route_index_ == 0) {
-    rebuildRoute();
-  }
-  if (!finiteGoal()) {
-    armed_ = false;
-    clearGoal("invalid goal");
-    stopRobot("invalid goal");
-    return;
-  }
-
-  advanceReachedSegments();
-  if (route_index_ >= route_.size()) {
-    const auto yaw = currentYaw();
-    const auto target_yaw = goalYaw();
-    if (!yaw || !target_yaw) {
-      armed_ = false;
-      clearGoal("invalid heading");
-      stopRobot("invalid heading");
-      return;
-    }
-    const double error = normalizeAngle(*target_yaw - *yaw);
-    if (std::abs(error) <= yaw_tolerance_) {
-      if (!sendMove(0.0, 0.0, 0.0)) {
-        return;
-      }
-      clearGoal("simple goal reached");
-      RCLCPP_INFO(get_logger(), "Direct-bridge goal reached; authorization remains armed");
-      return;
-    }
-    (void)sendMove(0.0, 0.0, clamp(yaw_gain_ * error, max_yaw_rate_));
-    return;
-  }
-
-  if (phase_ == Phase::kAlignSegment) {
-    const auto desired = desiredSegmentYaw();
-    const auto yaw = currentYaw();
-    if (!desired || !yaw) {
-      armed_ = false;
-      clearGoal("invalid segment heading");
-      stopRobot("invalid segment heading");
-      return;
-    }
-    const double error = normalizeAngle(*desired - *yaw);
-    if (std::abs(error) > align_tolerance_) {
-      (void)sendMove(0.0, 0.0, clamp(yaw_gain_ * error, max_yaw_rate_));
-      return;
-    }
-    phase_ = Phase::kTranslateSegment;
-    RCLCPP_INFO(
-      get_logger(), "Direct bridge segment heading aligned; continuing with translation");
-  }
-
-  const auto & target = route_[route_index_];
-  const double world_dx = target.x - odom_->pose.pose.position.x;
-  const double world_dy = target.y - odom_->pose.pose.position.y;
-  const double target_distance = std::hypot(world_dx, world_dy);
-  if (!finite(target_distance) || target_distance <= position_tolerance_) {
-    advanceReachedSegments();
     return;
   }
   const auto yaw = currentYaw();
@@ -294,15 +241,28 @@ void SimpleGoalExecutorNode::controlTickImpl()
     stopRobot("invalid body heading");
     return;
   }
-  const auto body_delta = targetDeltaInBody(
-    odom_->pose.pose.position.x, odom_->pose.pose.position.y, *yaw,
-    target.x, target.y);
-  const auto desired = desiredSegmentYaw();
-  const double yaw_error = desired ? normalizeAngle(*desired - *yaw) : 0.0;
-  (void)sendMove(
-    clamp(linear_gain_ * body_delta.x, max_vx_),
-    clamp(lateral_gain_ * body_delta.y, max_vy_),
-    clamp(yaw_gain_ * yaw_error, max_yaw_rate_));
+  const auto result = navigation_.update({
+      odom_->pose.pose.position.x, odom_->pose.pose.position.y, *yaw});
+  for (std::size_t i = 0; i < result.waypoints_reached; ++i) {
+    RCLCPP_INFO(
+      get_logger(), "Direct bridge right-angle waypoint reached; continuing with next segment");
+  }
+  if (result.segment_aligned) {
+    RCLCPP_INFO(
+      get_logger(), "Direct bridge segment heading aligned; continuing with translation");
+  }
+  if (!result.valid) {
+    armed_ = false;
+    clearGoal("invalid navigation command");
+    stopRobot("invalid navigation command");
+    return;
+  }
+  if (!sendMove(result.vx, result.vy, result.yaw_rate)) {
+    return;
+  }
+  if (result.goal_reached) {
+    RCLCPP_INFO(get_logger(), "Direct-bridge goal reached; authorization remains armed");
+  }
 }
 
 bool SimpleGoalExecutorNode::lowcmdPublisherPresent()
@@ -327,11 +287,6 @@ bool SimpleGoalExecutorNode::finiteOdom() const
   }
   const auto & p = odom_->pose.pose.position;
   return finite(p.x) && finite(p.y) && finite(p.z) && currentYaw().has_value();
-}
-
-bool SimpleGoalExecutorNode::finiteGoal() const
-{
-  return goal_ && finite(goal_->pose.position.x) && finite(goal_->pose.position.y) && goalYaw().has_value();
 }
 
 bool SimpleGoalExecutorNode::stopRobot(const char * reason) noexcept
@@ -386,48 +341,10 @@ bool SimpleGoalExecutorNode::sendMove(double vx, double vy, double yaw_rate)
 
 void SimpleGoalExecutorNode::clearGoal(const char * reason)
 {
-  if (goal_) {
+  if (navigation_.hasGoal()) {
     RCLCPP_INFO(get_logger(), "Direct-bridge goal cleared: %s", reason);
   }
-  goal_.reset();
-  route_.clear();
-  route_index_ = 0;
-  has_segment_start_ = false;
-  phase_ = Phase::kAlignSegment;
-}
-
-void SimpleGoalExecutorNode::rebuildRoute()
-{
-  if (!goal_ || !odom_ || !finiteOdom() || !finiteGoal()) {
-    return;
-  }
-  route_ = makeRightAngleRoute(
-    odom_->pose.pose.position.x, odom_->pose.pose.position.y, *currentYaw(),
-    goal_->pose.position.x, goal_->pose.position.y, position_tolerance_);
-  route_index_ = 0;
-  segment_start_ = {odom_->pose.pose.position.x, odom_->pose.pose.position.y};
-  has_segment_start_ = true;
-  phase_ = Phase::kAlignSegment;
-  RCLCPP_INFO(get_logger(), "Direct bridge route contains %zu translation targets", route_.size());
-}
-
-void SimpleGoalExecutorNode::advanceReachedSegments()
-{
-  while (route_index_ < route_.size()) {
-    const auto & target = route_[route_index_];
-    const double distance = std::hypot(
-      target.x - odom_->pose.pose.position.x,
-      target.y - odom_->pose.pose.position.y);
-    if (!finite(distance) || distance > position_tolerance_) {
-      return;
-    }
-    ++route_index_;
-    segment_start_ = target;
-    has_segment_start_ = true;
-    phase_ = Phase::kAlignSegment;
-    RCLCPP_INFO(
-      get_logger(), "Direct bridge right-angle waypoint reached; continuing with next segment");
-  }
+  navigation_.clearGoal();
 }
 
 std::optional<double> SimpleGoalExecutorNode::currentYaw() const
@@ -437,41 +354,6 @@ std::optional<double> SimpleGoalExecutorNode::currentYaw() const
   }
   const double value = quaternionYaw(odom_->pose.pose.orientation);
   return finite(value) ? std::optional<double>(value) : std::nullopt;
-}
-
-std::optional<double> SimpleGoalExecutorNode::goalYaw() const
-{
-  if (!goal_) {
-    return std::nullopt;
-  }
-  const double value = quaternionYaw(goal_->pose.orientation);
-  return finite(value) ? std::optional<double>(value) : std::nullopt;
-}
-
-std::optional<double> SimpleGoalExecutorNode::desiredSegmentYaw() const
-{
-  if (!odom_ || route_index_ >= route_.size()) {
-    return std::nullopt;
-  }
-  const auto & target = route_[route_index_];
-  const double start_x = has_segment_start_ ? segment_start_.x : odom_->pose.pose.position.x;
-  const double start_y = has_segment_start_ ? segment_start_.y : odom_->pose.pose.position.y;
-  const double dx = target.x - start_x;
-  const double dy = target.y - start_y;
-  if (std::hypot(dx, dy) <= position_tolerance_) {
-    return std::nullopt;
-  }
-  return std::atan2(dy, dx);
-}
-
-double SimpleGoalExecutorNode::normalizeAngle(double angle)
-{
-  return std::remainder(angle, 2.0 * kPi);
-}
-
-double SimpleGoalExecutorNode::clamp(double value, double limit)
-{
-  return std::clamp(value, -limit, limit);
 }
 
 }  // namespace utree_go2_sdk2_bridge

@@ -14,6 +14,7 @@ go2_sdk2_direct_bridge:
     position_tolerance: 0.15
     yaw_tolerance: 0.12
     align_tolerance: 0.08
+    waypoint_cross_track_tolerance: 0.30
     linear_gain: 1.0
     lateral_gain: 1.0
     yaw_gain: 1.5

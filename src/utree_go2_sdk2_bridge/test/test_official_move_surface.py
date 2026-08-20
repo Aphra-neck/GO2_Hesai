@@ -70,20 +70,17 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
 
     def test_direct_bridge_can_recover_after_passing_a_waypoint(self):
         source = NODE_SOURCES[1].read_text(encoding="utf-8")
+        controller = (
+            PACKAGE_ROOT / "src" / "simple_navigation_controller.cpp"
+        ).read_text(encoding="utf-8")
 
         self.assertNotIn(
             "std::clamp(segment_length - current_progress, 0.0, segment_length)",
-            source,
+            controller,
         )
-        self.assertIn(
-            "const double world_dx = target.x - odom_->pose.pose.position.x;",
-            source,
-        )
-        self.assertIn(
-            "const double world_dy = target.y - odom_->pose.pose.position.y;",
-            source,
-        )
-        self.assertIn("targetDeltaInBody(", source)
+        self.assertIn("targetDeltaInBody(", controller)
+        self.assertIn("progress >= segment_length", controller)
+        self.assertIn("SimpleNavigationController", source)
 
 
 if __name__ == "__main__":

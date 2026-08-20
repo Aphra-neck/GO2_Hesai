@@ -42,6 +42,10 @@ ament_target_dependencies(control_safety geometry_msgs)
 add_library(simple_navigation_geometry STATIC src/simple_navigation_geometry.cpp)
 target_include_directories(simple_navigation_geometry PUBLIC include)
 
+add_library(simple_navigation_controller STATIC src/simple_navigation_controller.cpp)
+target_include_directories(simple_navigation_controller PUBLIC include)
+target_link_libraries(simple_navigation_controller simple_navigation_geometry)
+
 add_executable(go2_sdk2_bridge_node
   src/go2_sdk2_bridge_node.cpp
   src/go2_sdk2_bridge_main.cpp)
@@ -56,7 +60,7 @@ add_executable(go2_sdk2_direct_bridge_node
   src/simple_goal_executor_main.cpp)
 target_include_directories(go2_sdk2_direct_bridge_node PRIVATE include)
 target_include_directories(go2_sdk2_direct_bridge_node PRIVATE ${UNITREE_DDSCXX_INCLUDE_DIR})
-target_link_libraries(go2_sdk2_direct_bridge_node simple_navigation_geometry unitree_sdk2)
+target_link_libraries(go2_sdk2_direct_bridge_node simple_navigation_controller unitree_sdk2)
 ament_target_dependencies(go2_sdk2_direct_bridge_node
   geometry_msgs nav_msgs rclcpp std_srvs)
 
@@ -65,6 +69,8 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_gtest(test_simple_navigation_geometry test/test_simple_navigation_geometry.cpp)
   target_link_libraries(test_simple_navigation_geometry simple_navigation_geometry)
+  ament_add_gtest(test_simple_navigation_controller test/test_simple_navigation_controller.cpp)
+  target_link_libraries(test_simple_navigation_controller simple_navigation_controller)
   ament_add_gtest(test_control_safety test/test_control_safety.cpp)
   target_link_libraries(test_control_safety control_safety)
   ament_add_pytest_test(
@@ -79,6 +85,8 @@ install(TARGETS go2_sdk2_bridge_node
   DESTINATION lib/${PROJECT_NAME})
 install(TARGETS go2_sdk2_direct_bridge_node
   DESTINATION lib/${PROJECT_NAME})
+install(TARGETS simple_navigation_geometry simple_navigation_controller
+  ARCHIVE DESTINATION lib)
 install(DIRECTORY config launch
   DESTINATION share/${PROJECT_NAME})
 
