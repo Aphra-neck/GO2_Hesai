@@ -60,6 +60,7 @@ protected:
       rclcpp::Parameter("map_frame", "world"),
       rclcpp::Parameter("body_frame", "base_link"),
       rclcpp::Parameter("planning_mode", planning_mode_),
+      rclcpp::Parameter("enable_legacy_terrain", enable_legacy_terrain_),
       rclcpp::Parameter("flat_ground_confirmed", flat_ground_confirmed_),
       rclcpp::Parameter("max_map_age", 1.0),
       rclcpp::Parameter("max_odom_age", 1.0),
@@ -233,6 +234,7 @@ protected:
   double max_goal_age_{2.0};
   double goal_retention_timeout_{30.0};
   std::string planning_mode_{"terrain"};
+  bool enable_legacy_terrain_{true};
   bool flat_ground_confirmed_{false};
 };
 
@@ -251,6 +253,7 @@ public:
   FlatObstaclePlannerNodeTest()
   {
     planning_mode_ = "flat_obstacle";
+    enable_legacy_terrain_ = false;
     flat_ground_confirmed_ = true;
   }
 
@@ -284,11 +287,10 @@ protected:
   }
 };
 
-TEST_F(BodyLatticePlannerNodeTest, RejectsUnconfirmedFlatObstacleMode)
+TEST_F(BodyLatticePlannerNodeTest, DefaultFlatObstacleModeRequiresGroundConfirmation)
 {
   rclcpp::NodeOptions options;
   options.parameter_overrides({
-    rclcpp::Parameter("planning_mode", "flat_obstacle"),
     rclcpp::Parameter("flat_ground_confirmed", false),
   });
 
@@ -302,6 +304,32 @@ TEST_F(BodyLatticePlannerNodeTest, RejectsUnknownPlanningMode)
   rclcpp::NodeOptions options;
   options.parameter_overrides({
     rclcpp::Parameter("planning_mode", "flat"),
+  });
+
+  EXPECT_THROW(
+    std::make_shared<BodyLatticePlannerNode>(options),
+    std::invalid_argument);
+}
+
+TEST_F(BodyLatticePlannerNodeTest, RejectsTerrainWithoutLegacyAuthorization)
+{
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "terrain"),
+  });
+
+  EXPECT_THROW(
+    std::make_shared<BodyLatticePlannerNode>(options),
+    std::invalid_argument);
+}
+
+TEST_F(BodyLatticePlannerNodeTest, RejectsLegacyAuthorizationOutsideTerrain)
+{
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat_obstacle"),
+    rclcpp::Parameter("enable_legacy_terrain", true),
+    rclcpp::Parameter("flat_ground_confirmed", true),
   });
 
   EXPECT_THROW(
@@ -564,6 +592,8 @@ TEST_F(BodyLatticePlannerNodeTest, RejectsWatchdogPeriodLongerThanFreshnessBudge
 {
   rclcpp::NodeOptions options;
   options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "terrain"),
+    rclcpp::Parameter("enable_legacy_terrain", true),
     rclcpp::Parameter("max_map_age", 0.5),
     rclcpp::Parameter("max_odom_age", 0.1),
     rclcpp::Parameter("input_watchdog_rate", 5.0),
@@ -578,6 +608,8 @@ TEST_F(BodyLatticePlannerNodeTest, RejectsInvalidGoalFreshnessBudgets)
 {
   rclcpp::NodeOptions stale_header_options;
   stale_header_options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "terrain"),
+    rclcpp::Parameter("enable_legacy_terrain", true),
     rclcpp::Parameter("max_goal_age", 0.0),
   });
   EXPECT_THROW(
@@ -586,6 +618,8 @@ TEST_F(BodyLatticePlannerNodeTest, RejectsInvalidGoalFreshnessBudgets)
 
   rclcpp::NodeOptions retention_options;
   retention_options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "terrain"),
+    rclcpp::Parameter("enable_legacy_terrain", true),
     rclcpp::Parameter(
       "goal_retention_timeout", std::numeric_limits<double>::quiet_NaN()),
   });
@@ -598,6 +632,8 @@ TEST_F(BodyLatticePlannerNodeTest, RejectsNonFiniteNominalBodyHeight)
 {
   rclcpp::NodeOptions options;
   options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "terrain"),
+    rclcpp::Parameter("enable_legacy_terrain", true),
     rclcpp::Parameter("nominal_body_height", std::numeric_limits<double>::quiet_NaN()),
   });
 

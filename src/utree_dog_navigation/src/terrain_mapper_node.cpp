@@ -119,10 +119,19 @@ TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
   body_frame_ = declare_parameter("body_frame", "base_link");
   cloud_topic_ = declare_parameter("cloud_topic", "/lio/cloud_world");
   odom_topic_ = declare_parameter("odom_topic", "/lio/body_odom");
-  planning_mode_ = declare_parameter("planning_mode", "terrain");
+  planning_mode_ = declare_parameter("planning_mode", "flat_obstacle");
+  const bool enable_legacy_terrain = declare_parameter("enable_legacy_terrain", false);
   const bool flat_ground_confirmed = declare_parameter("flat_ground_confirmed", false);
   if (planning_mode_ != "terrain" && planning_mode_ != "flat_obstacle") {
     throw std::invalid_argument("planning_mode must be 'terrain' or 'flat_obstacle'");
+  }
+  if (planning_mode_ == "terrain" && !enable_legacy_terrain) {
+    throw std::invalid_argument(
+            "terrain mode requires enable_legacy_terrain=true");
+  }
+  if (planning_mode_ != "terrain" && enable_legacy_terrain) {
+    throw std::invalid_argument(
+            "enable_legacy_terrain=true requires planning_mode='terrain'");
   }
   flat_obstacle_mode_ = planning_mode_ == "flat_obstacle";
   if (flat_obstacle_mode_ && !flat_ground_confirmed) {

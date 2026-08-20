@@ -56,6 +56,8 @@ protected:
     rclcpp::NodeOptions options;
     options.arguments({"--ros-args", "-r", "__ns:=" + namespace_name});
     options.parameter_overrides({
+      rclcpp::Parameter("planning_mode", "terrain"),
+      rclcpp::Parameter("enable_legacy_terrain", true),
       rclcpp::Parameter("cloud_topic", cloud_topic_),
       rclcpp::Parameter("odom_topic", odom_topic_),
       rclcpp::Parameter("publish_rate", 50.0),
@@ -526,6 +528,8 @@ TEST_F(TerrainMapperNodeTest, RejectsInvalidConfidenceWindowParameters)
   invalid_window_options.arguments(
     {"--ros-args", "-r", "__node:=terrain_mapper_invalid_window"});
   invalid_window_options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "terrain"),
+    rclcpp::Parameter("enable_legacy_terrain", true),
     rclcpp::Parameter("integration_window", 0.0),
   });
   EXPECT_THROW(
@@ -535,6 +539,8 @@ TEST_F(TerrainMapperNodeTest, RejectsInvalidConfidenceWindowParameters)
   invalid_frame_count_options.arguments(
     {"--ros-args", "-r", "__node:=terrain_mapper_invalid_frame_count"});
   invalid_frame_count_options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "terrain"),
+    rclcpp::Parameter("enable_legacy_terrain", true),
     rclcpp::Parameter("min_observed_frames", 65536),
   });
   EXPECT_THROW(
@@ -544,19 +550,20 @@ TEST_F(TerrainMapperNodeTest, RejectsInvalidConfidenceWindowParameters)
   invalid_radius_options.arguments(
     {"--ros-args", "-r", "__node:=terrain_mapper_invalid_rebuild_radius"});
   invalid_radius_options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "terrain"),
+    rclcpp::Parameter("enable_legacy_terrain", true),
     rclcpp::Parameter("confidence_rebuild.start_radius", 0.0),
   });
   EXPECT_THROW(
     std::make_shared<TerrainMapperNode>(invalid_radius_options), std::invalid_argument);
 }
 
-TEST_F(TerrainMapperNodeTest, FlatObstacleModeRequiresExplicitGroundConfirmation)
+TEST_F(TerrainMapperNodeTest, DefaultFlatObstacleModeRequiresGroundConfirmation)
 {
   rclcpp::NodeOptions options;
   options.arguments(
     {"--ros-args", "-r", "__node:=terrain_mapper_unconfirmed_flat"});
   options.parameter_overrides({
-    rclcpp::Parameter("planning_mode", "flat_obstacle"),
     rclcpp::Parameter("flat_ground_confirmed", false),
   });
   EXPECT_THROW(std::make_shared<TerrainMapperNode>(options), std::invalid_argument);
@@ -571,6 +578,32 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeRequiresTwoDistinctHitFrames)
     rclcpp::Parameter("flat_ground_confirmed", true),
     rclcpp::Parameter("flat_obstacle.hit_confirmation_frames", 1),
   });
+  EXPECT_THROW(std::make_shared<TerrainMapperNode>(options), std::invalid_argument);
+}
+
+TEST_F(TerrainMapperNodeTest, RejectsTerrainWithoutLegacyAuthorization)
+{
+  rclcpp::NodeOptions options;
+  options.arguments(
+    {"--ros-args", "-r", "__node:=terrain_mapper_unauthorized_terrain"});
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "terrain"),
+  });
+
+  EXPECT_THROW(std::make_shared<TerrainMapperNode>(options), std::invalid_argument);
+}
+
+TEST_F(TerrainMapperNodeTest, RejectsLegacyAuthorizationOutsideTerrain)
+{
+  rclcpp::NodeOptions options;
+  options.arguments(
+    {"--ros-args", "-r", "__node:=terrain_mapper_mismatched_legacy_authorization"});
+  options.parameter_overrides({
+    rclcpp::Parameter("planning_mode", "flat_obstacle"),
+    rclcpp::Parameter("enable_legacy_terrain", true),
+    rclcpp::Parameter("flat_ground_confirmed", true),
+  });
+
   EXPECT_THROW(std::make_shared<TerrainMapperNode>(options), std::invalid_argument);
 }
 

@@ -90,7 +90,7 @@ private:
   std::string body_frame_{"base_link"};
   std::string cloud_topic_;
   std::string odom_topic_;
-  std::string planning_mode_{"terrain"};
+  std::string planning_mode_{"flat_obstacle"};
   bool flat_obstacle_mode_{false};
   double min_range_{0.35};
   double max_range_{12.0};

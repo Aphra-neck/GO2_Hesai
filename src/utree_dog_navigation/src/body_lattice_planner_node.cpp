@@ -45,7 +45,8 @@ bool validRosTimestamp(const builtin_interfaces::msg::Time & stamp) noexcept
 BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & options)
 : Node("body_lattice_planner", options)
 {
-  const std::string planning_mode = declare_parameter("planning_mode", "terrain");
+  const std::string planning_mode = declare_parameter("planning_mode", "flat_obstacle");
+  const bool enable_legacy_terrain = declare_parameter("enable_legacy_terrain", false);
   flat_ground_confirmed_ = declare_parameter("flat_ground_confirmed", false);
   if (planning_mode == "terrain") {
     planning_mode_ = PlanningMode::kTerrain;
@@ -53,6 +54,14 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
     planning_mode_ = PlanningMode::kFlatObstacle;
   } else {
     throw std::invalid_argument("planning_mode must be 'terrain' or 'flat_obstacle'");
+  }
+  if (planning_mode_ == PlanningMode::kTerrain && !enable_legacy_terrain) {
+    throw std::invalid_argument(
+            "terrain mode requires enable_legacy_terrain=true");
+  }
+  if (planning_mode_ != PlanningMode::kTerrain && enable_legacy_terrain) {
+    throw std::invalid_argument(
+            "enable_legacy_terrain=true requires planning_mode='terrain'");
   }
   if (planning_mode_ == PlanningMode::kFlatObstacle && !flat_ground_confirmed_) {
     throw std::invalid_argument(

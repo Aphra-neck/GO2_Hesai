@@ -45,7 +45,7 @@ body-odometry frame/yaw offset or an inverted physical yaw response, not
 controller success criteria. This simulation does not emulate SDK2 firmware
 state, joystick ownership, or DDS transport.
 
-Run the normal SLAM and terrain-navigation commands first. Then start only this
+Run the normal SLAM and flat-obstacle planning commands first. Then start only this
 bridge instead of `start_sdk2_bridge.sh`:
 
 ```bash

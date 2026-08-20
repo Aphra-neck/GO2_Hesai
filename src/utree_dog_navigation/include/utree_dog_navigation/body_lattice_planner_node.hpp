@@ -57,7 +57,7 @@ private:
   double goal_retention_timeout_{30.0};
   double timestamp_future_tolerance_{0.2};
   double input_watchdog_rate_{10.0};
-  PlanningMode planning_mode_{PlanningMode::kTerrain};
+  PlanningMode planning_mode_{PlanningMode::kFlatObstacle};
   bool flat_ground_confirmed_{false};
   bool flat_body_height_locked_{false};
   double flat_body_height_z_{0.0};

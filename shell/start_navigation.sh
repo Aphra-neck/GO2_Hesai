@@ -4,19 +4,23 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 PLANNING_RVIZ="${PLANNING_RVIZ:-false}"
-PLANNING_MODE="${GO2_PLANNING_MODE:-terrain}"
+PLANNING_MODE="${GO2_PLANNING_MODE:-flat_obstacle}"
+ENABLE_LEGACY_TERRAIN="${GO2_ENABLE_LEGACY_TERRAIN:-false}"
+ALLOW_CUSTOM_RVIZ_CONFIG="${GO2_ALLOW_CUSTOM_NAVIGATION_RVIZ_CONFIG:-false}"
 FLAT_GROUND_CONFIRMED="${GO2_FLAT_GROUND_CONFIRMED:-false}"
 BODY_YAW_OFFSET="${GO2_BODY_YAW_OFFSET_RAD:--1.5707963267948966}"
 LIDAR_OFFSET_X="${GO2_LIDAR_OFFSET_X:-0.171}"
 LIDAR_OFFSET_Y="${GO2_LIDAR_OFFSET_Y:-0.0}"
 LIDAR_OFFSET_Z="${GO2_LIDAR_OFFSET_Z:-0.0908}"
 NAVIGATION_CONFIG="${GO2_NAVIGATION_CONFIG:-${WORKSPACE_DIR}/src/utree_dog_navigation/config/terrain_navigation.yaml}"
+FLAT_OBSTACLE_RVIZ_CONFIG="${WORKSPACE_DIR}/src/utree_dog_navigation/rviz/flat_obstacle_navigation.rviz"
+LEGACY_TERRAIN_RVIZ_CONFIG="${WORKSPACE_DIR}/src/utree_dog_navigation/rviz/hesai_navigation.rviz"
 if [[ -n "${GO2_NAVIGATION_RVIZ_CONFIG:-}" ]]; then
   NAVIGATION_RVIZ_CONFIG="${GO2_NAVIGATION_RVIZ_CONFIG}"
 elif [[ "${PLANNING_MODE}" == "flat_obstacle" ]]; then
-  NAVIGATION_RVIZ_CONFIG="${WORKSPACE_DIR}/src/utree_dog_navigation/rviz/flat_obstacle_navigation.rviz"
+  NAVIGATION_RVIZ_CONFIG="${FLAT_OBSTACLE_RVIZ_CONFIG}"
 else
-  NAVIGATION_RVIZ_CONFIG="${WORKSPACE_DIR}/src/utree_dog_navigation/rviz/hesai_navigation.rviz"
+  NAVIGATION_RVIZ_CONFIG="${LEGACY_TERRAIN_RVIZ_CONFIG}"
 fi
 VERIFIED_FLAT_START="${GO2_VERIFIED_FLAT_START:-false}"
 MAP_CAPTURE="${GO2_MAP_CAPTURE:-false}"
@@ -46,6 +50,37 @@ case "${PLANNING_MODE}" in
     exit 1
     ;;
 esac
+
+case "${ENABLE_LEGACY_TERRAIN}" in
+  true|false) ;;
+  *)
+    echo \
+      "GO2_ENABLE_LEGACY_TERRAIN must be true or false, got: ${ENABLE_LEGACY_TERRAIN}" \
+      >&2
+    exit 1
+    ;;
+esac
+
+case "${ALLOW_CUSTOM_RVIZ_CONFIG}" in
+  true|false) ;;
+  *)
+    echo \
+      "GO2_ALLOW_CUSTOM_NAVIGATION_RVIZ_CONFIG must be true or false, got: ${ALLOW_CUSTOM_RVIZ_CONFIG}" \
+      >&2
+    exit 1
+    ;;
+esac
+
+if [[ "${PLANNING_MODE}" == "terrain" && "${ENABLE_LEGACY_TERRAIN}" != "true" ]]; then
+  echo "Legacy terrain mode requires GO2_ENABLE_LEGACY_TERRAIN=true." >&2
+  echo "Normal 2D operation uses GO2_PLANNING_MODE=flat_obstacle." >&2
+  exit 1
+fi
+
+if [[ "${PLANNING_MODE}" != "terrain" && "${ENABLE_LEGACY_TERRAIN}" == "true" ]]; then
+  echo "GO2_ENABLE_LEGACY_TERRAIN=true requires GO2_PLANNING_MODE=terrain." >&2
+  exit 1
+fi
 
 case "${FLAT_GROUND_CONFIRMED}" in
   true|false) ;;
@@ -98,6 +133,39 @@ if [[ "${MAP_CAPTURE}" == "true" ]]; then
   esac
 fi
 
+for rviz_config in \
+  "${FLAT_OBSTACLE_RVIZ_CONFIG}" \
+  "${LEGACY_TERRAIN_RVIZ_CONFIG}" \
+  "${NAVIGATION_RVIZ_CONFIG}"
+do
+  if [[ ! -f "${rviz_config}" || ! -r "${rviz_config}" ]]; then
+    echo "Navigation RViz configuration is not readable: ${rviz_config}" >&2
+    exit 1
+  fi
+done
+
+if [[ "${PLANNING_MODE}" == "flat_obstacle" ]]; then
+  EXPECTED_RVIZ_CONFIG="${FLAT_OBSTACLE_RVIZ_CONFIG}"
+  INCOMPATIBLE_RVIZ_CONFIG="${LEGACY_TERRAIN_RVIZ_CONFIG}"
+  INCOMPATIBLE_RVIZ_MESSAGE="flat_obstacle mode cannot use legacy terrain RViz config"
+else
+  EXPECTED_RVIZ_CONFIG="${LEGACY_TERRAIN_RVIZ_CONFIG}"
+  INCOMPATIBLE_RVIZ_CONFIG="${FLAT_OBSTACLE_RVIZ_CONFIG}"
+  INCOMPATIBLE_RVIZ_MESSAGE="terrain mode cannot use flat-obstacle RViz config"
+fi
+
+if cmp -s -- "${NAVIGATION_RVIZ_CONFIG}" "${EXPECTED_RVIZ_CONFIG}"; then
+  :
+elif cmp -s -- "${NAVIGATION_RVIZ_CONFIG}" "${INCOMPATIBLE_RVIZ_CONFIG}"; then
+  echo "${INCOMPATIBLE_RVIZ_MESSAGE}: ${NAVIGATION_RVIZ_CONFIG}" >&2
+  exit 1
+elif [[ "${ALLOW_CUSTOM_RVIZ_CONFIG}" != "true" ]]; then
+  echo \
+    "Custom navigation RViz config requires GO2_ALLOW_CUSTOM_NAVIGATION_RVIZ_CONFIG=true: ${NAVIGATION_RVIZ_CONFIG}" \
+    >&2
+  exit 1
+fi
+
 source "${SCRIPT_DIR}/ros2_environment.sh"
 
 if ! ros2 pkg prefix utree_dog_navigation >/dev/null 2>&1; then
@@ -108,11 +176,6 @@ fi
 
 if [[ ! -r "${NAVIGATION_CONFIG}" ]]; then
   echo "Navigation configuration is not readable: ${NAVIGATION_CONFIG}" >&2
-  exit 1
-fi
-
-if [[ ! -r "${NAVIGATION_RVIZ_CONFIG}" ]]; then
-  echo "Navigation RViz configuration is not readable: ${NAVIGATION_RVIZ_CONFIG}" >&2
   exit 1
 fi
 
@@ -154,6 +217,8 @@ echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Planning RViz: ${PLANNING_RVIZ}"
 echo " Planning mode: ${PLANNING_MODE}"
+echo " Legacy terrain enabled: ${ENABLE_LEGACY_TERRAIN}"
+echo " Custom RViz config authorized: ${ALLOW_CUSTOM_RVIZ_CONFIG}"
 echo " Flat ground confirmed: ${FLAT_GROUND_CONFIRMED}"
 echo " Verified flat start: ${VERIFIED_FLAT_START}"
 echo " Body yaw offset: ${BODY_YAW_OFFSET} rad"
@@ -191,6 +256,8 @@ ros2 launch utree_dog_navigation terrain_navigation.launch.py \
   "lidar_offset_y:=${LIDAR_OFFSET_Y}" \
   "lidar_offset_z:=${LIDAR_OFFSET_Z}" \
   "planning_mode:=${PLANNING_MODE}" \
+  "enable_legacy_terrain:=${ENABLE_LEGACY_TERRAIN}" \
+  "allow_custom_rviz_config:=${ALLOW_CUSTOM_RVIZ_CONFIG}" \
   "flat_ground_confirmed:=${FLAT_GROUND_CONFIRMED}" \
   "verified_flat_start:=${VERIFIED_FLAT_START}" \
   "record_3d_maps:=${MAP_CAPTURE}" \

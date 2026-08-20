@@ -9,7 +9,9 @@ body_odom_adapter:
 
 terrain_mapper:
   ros__parameters:
-    planning_mode: terrain
+    # Operational default. Startup still requires flat_ground_confirmed=true.
+    planning_mode: flat_obstacle
+    enable_legacy_terrain: false
     flat_ground_confirmed: false
     map_frame: world
     body_frame: base_link
@@ -80,7 +82,9 @@ terrain_mapper:
 
 body_lattice_planner:
   ros__parameters:
-    planning_mode: terrain
+    # Operational default. Startup still requires flat_ground_confirmed=true.
+    planning_mode: flat_obstacle
+    enable_legacy_terrain: false
     flat_ground_confirmed: false
     terrain_map_topic: terrain_map
     odom_topic: /lio/body_odom

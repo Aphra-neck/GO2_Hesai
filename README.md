@@ -535,7 +535,8 @@ publisher 时启动。日常命令不需要在外层 source ROS 或重复 export
 ### 2. Jetson 终端 2：启动无界面规划
 
 等待 SLAM 出现 `Map init done`，确认机器狗仍然站立、静止，再新开 Jetson 终端。
-当前二维日常流程必须显式使用 `flat_obstacle`，不要省略模式与平地确认：
+当前二维日常流程默认使用 `flat_obstacle`。现场命令仍显式写出模式便于审计，且绝不能
+省略平地确认：
 
 ```bash
 cd ~/catkin_ws
@@ -594,20 +595,39 @@ scp -r unitree@192.168.151.213:/home/unitree/go2_map_exports/<session> `
 
 这些 PCD 及其临时文件不得加入主仓库或 `G02_log`，也不得通过 `go2-log upload` 上传。
 
-该脚本默认 `PLANNING_RVIZ=false`。只有临时改回 Jetson 本地可视化时才使用
-`PLANNING_RVIZ=true ./shell/start_navigation.sh`；分布式日常流程不要设置它。
+该脚本默认 `PLANNING_RVIZ=false`。只有临时改回 Jetson 本地可视化时才使用：
+
+```bash
+GO2_PLANNING_MODE=flat_obstacle \
+GO2_FLAT_GROUND_CONFIRMED=true \
+PLANNING_RVIZ=true \
+./shell/start_navigation.sh
+```
+
+分布式日常流程不要设置 `PLANNING_RVIZ=true`。
 
 `verified-flat-start` 同样默认关闭。只有后续重新研究 terrain 近场盲环，且机器人正常站立、
 保持静止并执行无运动验证时，才可显式启动该规划私有的近场补全与 Jetson 本地规划 RViz：
 
 ```bash
 cd ~/catkin_ws
-GO2_VERIFIED_FLAT_START=true PLANNING_RVIZ=true ./shell/start_navigation.sh
+GO2_PLANNING_MODE=terrain \
+GO2_ENABLE_LEGACY_TERRAIN=true \
+GO2_VERIFIED_FLAT_START=true \
+PLANNING_RVIZ=true \
+./shell/start_navigation.sh
 ```
+
+旧 terrain 必须同时通过启动脚本、launch 和 mapper/planner 节点的显式授权检查；只残留
+`GO2_PLANNING_MODE=terrain` 不会启动。规划模式与仓库内两份官方 RViz 配置不匹配时，
+启动脚本和 launch 预检都会直接拒绝，避免 flat 模式再次加载 `hesai_navigation.rviz`。
+正常启动只接受当前模式对应的官方 RViz 内容；确需自定义 RViz 时还必须显式设置
+`GO2_ALLOW_CUSTOM_NAVIGATION_RVIZ_CONFIG=true`，避免遗留或重命名配置静默混入。
 
 执行该命令前必须关闭 WSL2 RViz，避免同时运行两个 RViz。该命令不会启动或授权
 `utree_go2_sdk2_bridge`；SDK2 bridge 与 RL controller 必须继续保持关闭。分布式验证仍使用
-`PLANNING_RVIZ=false` 和唯一的 WSL2 RViz，只显式设置 `GO2_VERIFIED_FLAT_START=true`。
+`PLANNING_RVIZ=false` 和唯一的 WSL2 RViz，并保留上述 terrain 模式、遗留模式授权和
+`GO2_VERIFIED_FLAT_START=true` 三项显式设置。
 
 正常情况下会启动：
 
@@ -1108,7 +1128,10 @@ esac
 | `GO2_LIDAR_OFFSET_X/Y/Z` | `0.171 / 0 / 0.0908` | 同时驱动 XT-16 静态 TF 与三维清除射线原点，仅安装外参复测后修改 |
 | `PLANNING_RVIZ` | `false` | 仅显式设为 `true` 时在 Jetson 启动规划 RViz |
 | `GO2_VERIFIED_FLAT_START` | `false` | 仅显式设为 `true` 时启用当前 plan 私有的 verified-flat-start |
-| `GO2_PLANNING_MODE` | `terrain` | 平地二维障碍导航显式设为 `flat_obstacle` |
+| `GO2_PLANNING_MODE` | `flat_obstacle` | 日常二维障碍导航模式；未确认平地时 fail closed |
+| `GO2_ENABLE_LEGACY_TERRAIN` | `false` | 仅有意运行旧 terrain 诊断链路时与 `GO2_PLANNING_MODE=terrain` 同时设为 `true` |
+| `GO2_NAVIGATION_RVIZ_CONFIG` | 随规划模式选择 | 自定义规划 RViz 路径；必须同时显式授权，且不得交叉使用两份官方配置 |
+| `GO2_ALLOW_CUSTOM_NAVIGATION_RVIZ_CONFIG` | `false` | 仅审查自定义 RViz 后显式设为 `true`；默认锁定当前模式对应的官方配置 |
 | `GO2_FLAT_GROUND_CONFIRMED` | `false` | 机器狗已站立且平地条件已由操作员确认时显式设为 `true` |
 | `GO2_MAP_CAPTURE` | `false` | 临时记录规划前的三维确认体素地图 |
 | `GO2_MAP_CAPTURE_DIR` | `~/go2_map_exports` | PCD 会话根目录，启动脚本禁止放在 Git 工作区内 |
@@ -1135,7 +1158,10 @@ odom_topic: /lio/body_odom
 重复测试确认需要实验值时，才在规划终端覆盖：
 
 ```bash
-GO2_BODY_YAW_OFFSET_RAD=-1.525243233318 ./shell/start_navigation.sh
+GO2_BODY_YAW_OFFSET_RAD=-1.525243233318 \
+GO2_PLANNING_MODE=flat_obstacle \
+GO2_FLAT_GROUND_CONFIRMED=true \
+./shell/start_navigation.sh
 ```
 
 不要修改 `lio.extrinsic.lidar_imu` 来校正机身方向。

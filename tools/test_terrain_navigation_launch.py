@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 
@@ -15,6 +17,17 @@ LAUNCH_FILE = os.path.join(
     "utree_dog_navigation",
     "launch",
     "terrain_navigation.launch.py",
+)
+PACKAGE_SHARE = os.path.join(REPO_ROOT, "src", "utree_dog_navigation")
+FLAT_RVIZ_CONFIG = os.path.join(
+    PACKAGE_SHARE,
+    "rviz",
+    "flat_obstacle_navigation.rviz",
+)
+LEGACY_RVIZ_CONFIG = os.path.join(
+    PACKAGE_SHARE,
+    "rviz",
+    "hesai_navigation.rviz",
 )
 
 
@@ -33,6 +46,9 @@ class _LaunchConfiguration:
     def __init__(self, name):
         self.name = name
 
+    def perform(self, context):
+        return context[self.name]
+
 
 class _ParameterValue:
     def __init__(self, value, value_type=None):
@@ -43,6 +59,16 @@ class _ParameterValue:
 class _Path:
     def __init__(self, value):
         self.value = str(value)
+
+    def is_file(self):
+        return os.path.isfile(self.value)
+
+    def read_bytes(self):
+        with open(self.value, "rb") as stream:
+            return stream.read()
+
+    def samefile(self, other):
+        return os.path.samefile(self.value, str(other))
 
     def __truediv__(self, value):
         return _Path(os.path.join(self.value, str(value)))
@@ -64,13 +90,14 @@ def _load_launch_description():
         "ament_index_python": _module("ament_index_python"),
         "ament_index_python.packages": _module(
             "ament_index_python.packages",
-            get_package_share_directory=lambda name: os.path.join("/share", name),
+            get_package_share_directory=lambda name: PACKAGE_SHARE,
         ),
         "launch": _module("launch", LaunchDescription=_LaunchDescription),
         "launch.actions": _module(
             "launch.actions",
             DeclareLaunchArgument=_Entity,
             EmitEvent=_Entity,
+            OpaqueFunction=_Entity,
             RegisterEventHandler=_Entity,
         ),
         "launch.conditions": _module("launch.conditions", IfCondition=_Entity),
@@ -103,7 +130,121 @@ def _load_launch_description():
 
 
 class TerrainNavigationLaunchTest(unittest.TestCase):
-    def test_planning_mode_defaults_to_terrain_and_is_forwarded_to_map_and_planner(self):
+    def test_launch_preflight_rejects_mode_authorization_and_rviz_mismatches(self):
+        description = _load_launch_description()
+        preflight = next(
+            entity
+            for entity in description.entities
+            if callable(entity.kwargs.get("function"))
+        )
+        validate = preflight.kwargs["function"]
+        substitutions = preflight.kwargs["kwargs"]
+
+        def run(**overrides):
+            context = {
+                "rviz": "true",
+                "rviz_config": FLAT_RVIZ_CONFIG,
+                "planning_mode": "flat_obstacle",
+                "enable_legacy_terrain": "false",
+                "allow_custom_rviz_config": "false",
+                "flat_ground_confirmed": "true",
+            }
+            context.update(overrides)
+            return validate(context, **substitutions)
+
+        self.assertEqual(run(), [])
+        self.assertEqual(
+            run(
+                planning_mode="terrain",
+                enable_legacy_terrain="true",
+                flat_ground_confirmed="false",
+                rviz_config=LEGACY_RVIZ_CONFIG,
+            ),
+            [],
+        )
+        self.assertEqual(
+            run(
+                rviz="false",
+                planning_mode="terrain",
+                enable_legacy_terrain="true",
+                flat_ground_confirmed="false",
+                rviz_config=LEGACY_RVIZ_CONFIG,
+            ),
+            [],
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            custom_config = os.path.join(directory, "custom_navigation.rviz")
+            with open(custom_config, "w", encoding="utf-8") as stream:
+                stream.write("custom config\n")
+            self.assertEqual(
+                run(
+                    rviz_config=custom_config,
+                    allow_custom_rviz_config="true",
+                ),
+                [],
+            )
+
+            copied_flat_config = os.path.join(directory, "copied_flat.rviz")
+            shutil.copyfile(FLAT_RVIZ_CONFIG, copied_flat_config)
+            self.assertEqual(run(rviz_config=copied_flat_config), [])
+
+            renamed_legacy_config = os.path.join(
+                directory,
+                "flat_obstacle_navigation.rviz",
+            )
+            shutil.copyfile(LEGACY_RVIZ_CONFIG, renamed_legacy_config)
+            with self.assertRaisesRegex(RuntimeError, "legacy terrain RViz"):
+                run(
+                    rviz_config=renamed_legacy_config,
+                    allow_custom_rviz_config="true",
+                )
+
+            missing_config = os.path.join(directory, "missing.rviz")
+            with self.assertRaisesRegex(RuntimeError, "readable regular file"):
+                run(
+                    rviz_config=missing_config,
+                    allow_custom_rviz_config="true",
+                )
+
+            directory_config = os.path.join(directory, "directory.rviz")
+            os.mkdir(directory_config)
+            with self.assertRaisesRegex(RuntimeError, "readable regular file"):
+                run(
+                    rviz_config=directory_config,
+                    allow_custom_rviz_config="true",
+                )
+
+        invalid_cases = (
+            {"planning_mode": "terrain"},
+            {"enable_legacy_terrain": "true"},
+            {"flat_ground_confirmed": "false"},
+            {"rviz_config": LEGACY_RVIZ_CONFIG},
+            {"rviz_config": "/tmp/custom_navigation.rviz"},
+            {"rviz_config": "/tmp/flat_obstacle_navigation.rviz"},
+            {
+                "rviz": "false",
+                "planning_mode": "terrain",
+                "enable_legacy_terrain": "true",
+                "flat_ground_confirmed": "false",
+            },
+            {
+                "planning_mode": "terrain",
+                "enable_legacy_terrain": "true",
+                "flat_ground_confirmed": "false",
+            },
+            {"planning_mode": "flat"},
+            {"rviz": "TRUE"},
+            {"enable_legacy_terrain": "yes"},
+            {"allow_custom_rviz_config": "yes"},
+            {"flat_ground_confirmed": "1"},
+        )
+        for overrides in invalid_cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(RuntimeError):
+                    run(**overrides)
+
+    def test_planning_mode_defaults_to_flat_obstacle_and_is_forwarded(self):
         description = _load_launch_description()
         planning_mode_declarations = [
             entity
@@ -112,7 +253,36 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
         ]
         self.assertEqual(len(planning_mode_declarations), 1)
         self.assertEqual(
-            planning_mode_declarations[0].kwargs.get("default_value"), "terrain"
+            planning_mode_declarations[0].kwargs.get("default_value"),
+            "flat_obstacle",
+        )
+        legacy_declarations = [
+            entity
+            for entity in description.entities
+            if entity.args and entity.args[0] == "enable_legacy_terrain"
+        ]
+        self.assertEqual(len(legacy_declarations), 1)
+        self.assertEqual(
+            legacy_declarations[0].kwargs.get("default_value"), "false"
+        )
+        custom_rviz_declarations = [
+            entity
+            for entity in description.entities
+            if entity.args and entity.args[0] == "allow_custom_rviz_config"
+        ]
+        self.assertEqual(len(custom_rviz_declarations), 1)
+        self.assertEqual(
+            custom_rviz_declarations[0].kwargs.get("default_value"), "false"
+        )
+        rviz_config_declarations = [
+            entity
+            for entity in description.entities
+            if entity.args and entity.args[0] == "rviz_config"
+        ]
+        self.assertEqual(len(rviz_config_declarations), 1)
+        self.assertEqual(
+            rviz_config_declarations[0].kwargs.get("default_value"),
+            FLAT_RVIZ_CONFIG,
         )
         confirmation_declarations = [
             entity
@@ -140,6 +310,14 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             for node in nodes
             if node.kwargs.get("name") == "body_lattice_planner"
         )
+        for guarded_node, reason in (
+            (mapper, "terrain mapper exited"),
+            (planner, "body lattice planner exited"),
+        ):
+            on_exit = guarded_node.kwargs.get("on_exit")
+            self.assertEqual(len(on_exit), 1)
+            event = on_exit[0].kwargs.get("event")
+            self.assertEqual(event.kwargs.get("reason"), reason)
         recorder = next(
             node
             for node in nodes
@@ -161,6 +339,7 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             set(mapper_overrides[0]),
             {
                 "planning_mode",
+                "enable_legacy_terrain",
                 "body_frame",
                 "body_yaw_offset",
                 "flat_obstacle.lidar_offset.x",
@@ -170,6 +349,9 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             },
         )
         self.assertEqual(mapper_overrides[0]["planning_mode"].name, "planning_mode")
+        mapper_legacy = mapper_overrides[0]["enable_legacy_terrain"]
+        self.assertIs(mapper_legacy.value_type, bool)
+        self.assertEqual(mapper_legacy.value.name, "enable_legacy_terrain")
         self.assertEqual(mapper_overrides[0]["body_frame"].name, "body_frame")
         mapper_yaw_offset = mapper_overrides[0]["body_yaw_offset"]
         self.assertIs(mapper_yaw_offset.value_type, float)
@@ -204,12 +386,16 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
             set(planner_overrides[0]),
             {
                 "planning_mode",
+                "enable_legacy_terrain",
                 "body_frame",
                 "flat_ground_confirmed",
                 "verified_flat_start.enabled",
             },
         )
         self.assertEqual(planner_overrides[0]["planning_mode"].name, "planning_mode")
+        planner_legacy = planner_overrides[0]["enable_legacy_terrain"]
+        self.assertIs(planner_legacy.value_type, bool)
+        self.assertEqual(planner_legacy.value.name, "enable_legacy_terrain")
         self.assertEqual(planner_overrides[0]["body_frame"].name, "body_frame")
         planner_confirmation = planner_overrides[0]["flat_ground_confirmed"]
         self.assertIs(planner_confirmation.value_type, bool)
@@ -292,10 +478,12 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
 
         mapper = document["terrain_mapper"]["ros__parameters"]
         planner = document["body_lattice_planner"]["ros__parameters"]
-        self.assertEqual(mapper["planning_mode"], "terrain")
+        self.assertEqual(mapper["planning_mode"], "flat_obstacle")
+        self.assertIs(mapper["enable_legacy_terrain"], False)
         self.assertEqual(mapper["body_frame"], "base_link")
         self.assertIs(mapper["flat_ground_confirmed"], False)
-        self.assertEqual(planner["planning_mode"], "terrain")
+        self.assertEqual(planner["planning_mode"], "flat_obstacle")
+        self.assertIs(planner["enable_legacy_terrain"], False)
         self.assertIs(planner["flat_ground_confirmed"], False)
         self.assertEqual(
             {

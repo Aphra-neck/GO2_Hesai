@@ -2,7 +2,12 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, EmitEvent, RegisterEventHandler
+from launch.actions import (
+    DeclareLaunchArgument,
+    EmitEvent,
+    OpaqueFunction,
+    RegisterEventHandler,
+)
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
@@ -11,17 +16,123 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
+def _read_rviz_config(path):
+    config_path = Path(path)
+    try:
+        if not config_path.is_file():
+            raise OSError("not a regular file")
+        return config_path.read_bytes()
+    except (AttributeError, OSError):
+        raise RuntimeError(
+            f"RViz config must be a readable regular file: {path}"
+        ) from None
+
+
+def _validate_navigation_startup(
+    context,
+    *,
+    rviz,
+    rviz_config,
+    planning_mode,
+    enable_legacy_terrain,
+    allow_custom_rviz_config,
+    flat_ground_confirmed,
+    flat_obstacle_rviz_config,
+    legacy_terrain_rviz_config,
+):
+    rviz_value = rviz.perform(context)
+    rviz_config_value = rviz_config.perform(context)
+    planning_mode_value = planning_mode.perform(context)
+    legacy_value = enable_legacy_terrain.perform(context)
+    custom_rviz_value = allow_custom_rviz_config.perform(context)
+    confirmation_value = flat_ground_confirmed.perform(context)
+
+    if rviz_value not in ("true", "false"):
+        raise RuntimeError(f"rviz must be true or false, got: {rviz_value}")
+    if planning_mode_value not in ("terrain", "flat_obstacle"):
+        raise RuntimeError(
+            "planning_mode must be terrain or flat_obstacle, got: "
+            f"{planning_mode_value}"
+        )
+    if legacy_value not in ("true", "false"):
+        raise RuntimeError(
+            "enable_legacy_terrain must be true or false, got: "
+            f"{legacy_value}"
+        )
+    if custom_rviz_value not in ("true", "false"):
+        raise RuntimeError(
+            "allow_custom_rviz_config must be true or false, got: "
+            f"{custom_rviz_value}"
+        )
+    if confirmation_value not in ("true", "false"):
+        raise RuntimeError(
+            "flat_ground_confirmed must be true or false, got: "
+            f"{confirmation_value}"
+        )
+    if planning_mode_value == "terrain" and legacy_value != "true":
+        raise RuntimeError("terrain mode requires enable_legacy_terrain=true")
+    if planning_mode_value != "terrain" and legacy_value == "true":
+        raise RuntimeError(
+            "enable_legacy_terrain=true requires planning_mode=terrain"
+        )
+    if planning_mode_value == "flat_obstacle" and confirmation_value != "true":
+        raise RuntimeError(
+            "flat_obstacle mode requires flat_ground_confirmed=true"
+        )
+
+    candidate_rviz_content = _read_rviz_config(rviz_config_value)
+    flat_obstacle_rviz_content = _read_rviz_config(
+        flat_obstacle_rviz_config
+    )
+    legacy_terrain_rviz_content = _read_rviz_config(
+        legacy_terrain_rviz_config
+    )
+    if flat_obstacle_rviz_content == legacy_terrain_rviz_content:
+        raise RuntimeError(
+            "official flat-obstacle and legacy terrain RViz configs "
+            "must not be identical"
+        )
+
+    if planning_mode_value == "flat_obstacle":
+        expected_rviz_content = flat_obstacle_rviz_content
+        incompatible_rviz_content = legacy_terrain_rviz_content
+        incompatible_message = (
+            "flat_obstacle mode cannot use legacy terrain RViz config"
+        )
+    else:
+        expected_rviz_content = legacy_terrain_rviz_content
+        incompatible_rviz_content = flat_obstacle_rviz_content
+        incompatible_message = (
+            "terrain mode cannot use flat-obstacle RViz config"
+        )
+
+    if candidate_rviz_content == expected_rviz_content:
+        return []
+    if candidate_rviz_content == incompatible_rviz_content:
+        raise RuntimeError(
+            f"{incompatible_message}: {rviz_config_value}"
+        )
+    if custom_rviz_value != "true":
+        raise RuntimeError(
+            "custom navigation RViz config requires "
+            "allow_custom_rviz_config=true: "
+            f"{rviz_config_value}"
+        )
+    return []
+
+
 def generate_launch_description():
+    package_share = Path(get_package_share_directory("utree_dog_navigation"))
     default_config = str(
-        Path(get_package_share_directory("utree_dog_navigation"))
-        / "config"
-        / "terrain_navigation.yaml"
+        package_share / "config" / "terrain_navigation.yaml"
     )
-    default_rviz_config = str(
-        Path(get_package_share_directory("utree_dog_navigation"))
-        / "rviz"
-        / "hesai_navigation.rviz"
+    flat_obstacle_rviz_config = str(
+        package_share / "rviz" / "flat_obstacle_navigation.rviz"
     )
+    legacy_terrain_rviz_config = str(
+        package_share / "rviz" / "hesai_navigation.rviz"
+    )
+    default_rviz_config = flat_obstacle_rviz_config
     config = LaunchConfiguration("config")
     rviz = LaunchConfiguration("rviz")
     rviz_config = LaunchConfiguration("rviz_config")
@@ -31,6 +142,8 @@ def generate_launch_description():
     lidar_offset_y = LaunchConfiguration("lidar_offset_y")
     lidar_offset_z = LaunchConfiguration("lidar_offset_z")
     planning_mode = LaunchConfiguration("planning_mode")
+    enable_legacy_terrain = LaunchConfiguration("enable_legacy_terrain")
+    allow_custom_rviz_config = LaunchConfiguration("allow_custom_rviz_config")
     flat_ground_confirmed = LaunchConfiguration("flat_ground_confirmed")
     verified_flat_start = LaunchConfiguration("verified_flat_start")
     record_3d_maps = LaunchConfiguration("record_3d_maps")
@@ -87,7 +200,9 @@ def generate_launch_description():
             DeclareLaunchArgument("lidar_offset_x", default_value="0.171"),
             DeclareLaunchArgument("lidar_offset_y", default_value="0.0"),
             DeclareLaunchArgument("lidar_offset_z", default_value="0.0908"),
-            DeclareLaunchArgument("planning_mode", default_value="terrain"),
+            DeclareLaunchArgument("planning_mode", default_value="flat_obstacle"),
+            DeclareLaunchArgument("enable_legacy_terrain", default_value="false"),
+            DeclareLaunchArgument("allow_custom_rviz_config", default_value="false"),
             DeclareLaunchArgument("flat_ground_confirmed", default_value="false"),
             DeclareLaunchArgument(
                 "verified_flat_start",
@@ -109,6 +224,19 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "record_3d_maps_source_git_sha",
                 default_value="unknown",
+            ),
+            OpaqueFunction(
+                function=_validate_navigation_startup,
+                kwargs={
+                    "rviz": rviz,
+                    "rviz_config": rviz_config,
+                    "planning_mode": planning_mode,
+                    "enable_legacy_terrain": enable_legacy_terrain,
+                    "allow_custom_rviz_config": allow_custom_rviz_config,
+                    "flat_ground_confirmed": flat_ground_confirmed,
+                    "flat_obstacle_rviz_config": flat_obstacle_rviz_config,
+                    "legacy_terrain_rviz_config": legacy_terrain_rviz_config,
+                },
             ),
             RegisterEventHandler(
                 OnProcessExit(
@@ -154,10 +282,17 @@ def generate_launch_description():
                 executable="terrain_mapper_node",
                 name="terrain_mapper",
                 output="screen",
+                on_exit=[
+                    EmitEvent(event=Shutdown(reason="terrain mapper exited"))
+                ],
                 parameters=[
                     config,
                     {
                         "planning_mode": planning_mode,
+                        "enable_legacy_terrain": ParameterValue(
+                            enable_legacy_terrain,
+                            value_type=bool,
+                        ),
                         "body_frame": body_frame,
                         "body_yaw_offset": ParameterValue(
                             body_yaw_offset,
@@ -231,10 +366,19 @@ def generate_launch_description():
                 executable="body_lattice_planner_node",
                 name="body_lattice_planner",
                 output="screen",
+                on_exit=[
+                    EmitEvent(
+                        event=Shutdown(reason="body lattice planner exited")
+                    )
+                ],
                 parameters=[
                     config,
                     {
                         "planning_mode": planning_mode,
+                        "enable_legacy_terrain": ParameterValue(
+                            enable_legacy_terrain,
+                            value_type=bool,
+                        ),
                         "body_frame": body_frame,
                         "flat_ground_confirmed": ParameterValue(
                             flat_ground_confirmed,
