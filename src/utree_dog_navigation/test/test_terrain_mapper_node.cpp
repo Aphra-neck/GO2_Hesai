@@ -655,7 +655,7 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeAdvertisesFilteredObstacleLayers)
   executor_.remove_node(flat_mapper);
 }
 
-TEST_F(TerrainMapperNodeTest, FlatObstacleModeNeedsTwoExactStampFramesBeforePublishing)
+TEST_F(TerrainMapperNodeTest, FlatObstacleModePublishesRawTerrainAndInflatedVisualization)
 {
   const std::string namespace_name =
     "/flat_mapper_data_" + std::to_string(instance_count_);
@@ -676,6 +676,7 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeNeedsTwoExactStampFramesBeforePubl
     rclcpp::Parameter("size_y", 4.0),
     rclcpp::Parameter("origin_x", -2.0),
     rclcpp::Parameter("origin_y", -2.0),
+    rclcpp::Parameter("flat_obstacle.obstacle_clearance", 0.10),
     rclcpp::Parameter("publish_rate", 50.0),
   });
   auto flat_mapper = std::make_shared<TerrainMapperNode>(options);
@@ -772,7 +773,7 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeNeedsTwoExactStampFramesBeforePubl
                maps.back().header.stamp.sec == second_stamp.sec &&
                maps.back().header.stamp.nanosec == second_stamp.nanosec &&
                !raw_layers.empty() && raw_layers.back().cells.size() == 1U &&
-               !inflated_layers.empty() && !inflated_layers.back().cells.empty() &&
+               !inflated_layers.empty() && inflated_layers.back().cells.size() == 9U &&
                !filtered_points.empty() && filtered_points.back().width == 2U &&
                !filtered_maps.empty() && filtered_maps.back().width == 1U;
       },
@@ -781,6 +782,20 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModeNeedsTwoExactStampFramesBeforePubl
   const std::size_t obstacle_cell = cellIndex(maps.back(), 0.85, 0.35);
   EXPECT_NEAR(maps.back().elevation[obstacle_cell], 0.0F, 1.0e-4F);
   EXPECT_FLOAT_EQ(maps.back().traversability[obstacle_cell], 0.0F);
+  EXPECT_EQ(
+    std::count(
+      maps.back().traversability.begin(), maps.back().traversability.end(), 0.0F),
+    1);
+  const auto & raw_cell = raw_layers.back().cells.front();
+  for (const auto & inflated_cell : inflated_layers.back().cells) {
+    const bool is_raw_cell =
+      std::abs(inflated_cell.x - raw_cell.x) < 1.0e-9 &&
+      std::abs(inflated_cell.y - raw_cell.y) < 1.0e-9;
+    EXPECT_FLOAT_EQ(
+      maps.back().traversability[
+        cellIndex(maps.back(), inflated_cell.x, inflated_cell.y)],
+      is_raw_cell ? 0.0F : 1.0F);
+  }
   const auto live_points = pointCloudPoints(filtered_points.back());
   const auto contains_point = [](const auto & points, const auto & expected) {
       return std::any_of(

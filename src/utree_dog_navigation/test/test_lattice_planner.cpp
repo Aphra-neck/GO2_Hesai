@@ -145,6 +145,49 @@ void markFlatObstacle(
   map->traversability[y * map->width + x] = 0.0F;
 }
 
+::testing::AssertionResult footprintClearsRawObstacles(
+  const utree_dog_msgs::msg::TerrainGrid & map, double world_x, double world_y,
+  double yaw, double footprint_length, double footprint_width, double clearance)
+{
+  const double half_length = 0.5 * footprint_length + clearance;
+  const double half_width = 0.5 * footprint_width + clearance;
+  const double half_cell = 0.5 * map.resolution;
+  const double cosine = std::cos(yaw);
+  const double sine = std::sin(yaw);
+
+  for (std::size_t y = 0; y < map.height; ++y) {
+    for (std::size_t x = 0; x < map.width; ++x) {
+      const float traversability = map.traversability[y * map.width + x];
+      if (traversability == map.unknown_value || traversability > 0.0F) {continue;}
+
+      const double obstacle_x =
+        map.origin_x + (static_cast<double>(x) + 0.5) * map.resolution;
+      const double obstacle_y =
+        map.origin_y + (static_cast<double>(y) + 0.5) * map.resolution;
+      const double dx = obstacle_x - world_x;
+      const double dy = obstacle_y - world_y;
+
+      // Separating-axis test between the oriented operational footprint and
+      // the raw axis-aligned obstacle cell.
+      const bool separated =
+        std::abs(cosine * dx + sine * dy) >
+        half_length + half_cell * (std::abs(cosine) + std::abs(sine)) ||
+        std::abs(-sine * dx + cosine * dy) >
+        half_width + half_cell * (std::abs(cosine) + std::abs(sine)) ||
+        std::abs(dx) > half_cell + half_length * std::abs(cosine) +
+        half_width * std::abs(sine) ||
+        std::abs(dy) > half_cell + half_length * std::abs(sine) +
+        half_width * std::abs(cosine);
+      if (!separated) {
+        return ::testing::AssertionFailure()
+               << "footprint at (" << world_x << ", " << world_y << ", "
+               << yaw << ") overlaps raw obstacle cell (" << x << ", " << y << ")";
+      }
+    }
+  }
+  return ::testing::AssertionSuccess();
+}
+
 }  // namespace
 
 TEST(LatticePlanner, FindsPathAcrossFlatTraversableMap)
@@ -619,6 +662,80 @@ TEST(LatticePlanner, FlatObstacleModeChecksCompleteLateralSweep)
   blocked_planner.setMap(blocked_map);
 
   EXPECT_FALSE(blocked_planner.plan({0.65, 1.05, 0.0}, {0.65, 3.05, 0.0}).success);
+}
+
+TEST(LatticePlanner, FlatObstacleModeDetoursAroundRawObstacleWithOperationalFootprint)
+{
+  constexpr double kPi = 3.14159265358979323846;
+  constexpr double kFootprintLength = 0.60;
+  constexpr double kFootprintWidth = 0.30;
+  constexpr double kObstacleClearance = 0.00;
+  constexpr double kRouteY = 3.10;
+  auto map = makeFlatObstacleMap(0.2F, 40, 32);
+  markFlatObstacle(map, 15, 15);
+
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.yaw_bins = 16;
+  config.motion_step = 0.2;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  config.flat_obstacle.footprint_length = kFootprintLength;
+  config.flat_obstacle.footprint_width = kFootprintWidth;
+  config.flat_obstacle.obstacle_clearance = kObstacleClearance;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  ASSERT_FALSE(footprintClearsRawObstacles(
+      *map, 3.10, kRouteY, 0.0, kFootprintLength, kFootprintWidth,
+      kObstacleClearance));
+  const auto result = planner.plan({0.70, kRouteY, 0.0}, {6.10, kRouteY, 0.0});
+
+  ASSERT_TRUE(result.success) << planningFailureReasonName(result.failure_reason);
+  ASSERT_GT(result.states.size(), 2U);
+  EXPECT_EQ(result.states.back().x, 30);
+  EXPECT_EQ(result.states.back().y, 15);
+  double maximum_lateral_detour = 0.0;
+  for (const auto & state : result.states) {
+    const double world_y =
+      map->origin_y + (static_cast<double>(state.y) + 0.5) * map->resolution;
+    maximum_lateral_detour =
+      std::max(maximum_lateral_detour, std::abs(world_y - kRouteY));
+  }
+  EXPECT_GT(maximum_lateral_detour, 0.25);
+
+  for (std::size_t index = 1; index < result.states.size(); ++index) {
+    const auto & before = result.states[index - 1U];
+    const auto & after = result.states[index];
+    const double before_x =
+      map->origin_x + (static_cast<double>(before.x) + 0.5) * map->resolution;
+    const double before_y =
+      map->origin_y + (static_cast<double>(before.y) + 0.5) * map->resolution;
+    const double after_x =
+      map->origin_x + (static_cast<double>(after.x) + 0.5) * map->resolution;
+    const double after_y =
+      map->origin_y + (static_cast<double>(after.y) + 0.5) * map->resolution;
+    const double before_yaw = planner.yawAngle(before.yaw);
+    const double after_yaw = planner.yawAngle(after.yaw);
+    const double distance = std::hypot(after_x - before_x, after_y - before_y);
+    const double yaw_delta = std::remainder(after_yaw - before_yaw, 2.0 * kPi);
+    ASSERT_TRUE(distance < 1.0e-9 || std::abs(yaw_delta) < 1.0e-9);
+
+    const int intervals = distance > 1.0e-9 ?
+      std::max(1, static_cast<int>(std::ceil(distance / 0.02))) :
+      std::max(1, static_cast<int>(std::ceil(std::abs(yaw_delta) / (kPi / 180.0))));
+    for (int sample = 0; sample <= intervals; ++sample) {
+      const double fraction = static_cast<double>(sample) / intervals;
+      SCOPED_TRACE(::testing::Message()
+        << "segment=" << index << " sample=" << sample << '/' << intervals);
+      EXPECT_TRUE(footprintClearsRawObstacles(
+          *map,
+          before_x + fraction * (after_x - before_x),
+          before_y + fraction * (after_y - before_y),
+          before_yaw + fraction * yaw_delta,
+          kFootprintLength, kFootprintWidth, kObstacleClearance));
+    }
+  }
 }
 
 TEST(LatticePlanner, FlatObstacleModeChecksIntermediateRotationFootprint)

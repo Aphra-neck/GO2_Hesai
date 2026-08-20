@@ -296,9 +296,9 @@ change to one does not imply or replace a change to the other.
 The endpoint JSON keeps both square-context counts and the Euclidean-radius
 counts used by `LatticePlanner`. Candidate distance is measured from the
 original endpoint world pose to each candidate cell center, so crossing a grid
-boundary cannot change the result through integer cell offsets alone. The XT-16
-profile uses `start_snap_radius=0.55 m` for the robot's near-field blind ring;
-goals remain bounded by `snap_radius=0.50 m`. Older records without these fields
+boundary cannot change the result through integer cell offsets alone. The current
+XT-16 profile uses `start_snap_radius=0.80 m` for the robot's near-field blind ring;
+goals are also bounded by `snap_radius=0.80 m`. Older records without these fields
 remain readable by the analyzer. `snap_grid_distance_m` is retained only for
 quantization diagnostics and may exceed the endpoint radius; acceptance uses
 `snap_world_to_center_distance_m`. Configurations that omit

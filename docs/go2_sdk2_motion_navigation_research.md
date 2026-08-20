@@ -17,14 +17,17 @@
    `mcf`。官方当前高层示例直接初始化并调用 `SportClient`，没有把
    `MotionSwitcherClient::SelectMode()` 或 `ReleaseMode()` 作为前置步骤。
 3. `Move()` 是机体系速度接口。最新命令维持 1 秒，运控不替调用者滤波；因此本工程以 20 Hz
-   发送经过限幅/滤波的速度，并在结束时调用 `StopMove()`，符合官方接口语义。
+   发送经过限幅/滤波的速度，在 armed 等待和正常完成时持续发送零速 `Move()`，并在显式
+   禁用、安全故障或退出时调用 `StopMove()`，符合官方接口语义。
 4. `BalanceStand()` 的作用是从“站立锁定”切到“平衡站立”，但官方速度示例没有把它列为
-   `Move()` 的前置调用。当前 bridge 不再自动调用它，也不根据 `rt/sportmodestate` 自动选择
-   姿态或步态；操作员必须在 arm 前通过原生遥控器或官方 App 确认普通可行走站立状态。
+   `Move()` 的前置调用。当前 bridge 不自动调用它，也不根据 `rt/sportmodestate` 自动选择
+   姿态或步态；只读门控仅允许实机确认过的 `100/1013`，其余状态停车并解除授权。操作员仍
+   必须在 arm 前通过原生遥控器或官方 App 确认普通可行走站立状态。
 5. `SwitchJoystick(false)` 是官方提供的原生遥控器仲裁接口，但官方没有要求速度控制程序必须
-   调用它。现场 A/B 中，最初只调用 `Move/StopMove` 的 bridge 能运动；加入遥控器屏蔽和状态
-   门控后，机器人回报过 `2009 (jump run)` 并拒绝继续。现有证据不能证明因果，但足以把新增
-   RPC 从当前恢复版本移除。原生遥控器保持可用，自动执行期间不得同时发送普通摇杆运动命令。
+   调用它。现场 A/B 中，最初只调用 `Move/StopMove` 的 bridge 能运动；加入遥控器屏蔽等状态
+   改变 RPC 后，机器人回报过 `2009 (jump run)`，只读门控将其停车。现有证据不能证明因果，
+   但足以把新增状态改变 RPC 从当前恢复版本移除，同时保留只读 fail-closed 门控。原生遥控器
+   保持可用，自动执行期间不得同时发送普通摇杆运动命令。
 6. `ReleaseMode()` 在官方 Go2 低层电机示例中用于关闭高层运控服务，然后才发布
    `rt/lowcmd`。高层 `SportClient` 桥接器不应调用它；否则会关闭桥接器依赖的运控服务。
 7. 宇树官方 SLAM 导航服务是另一套端到端栈。官方明确说明其 SDK2、`unitree_slam`、雷达驱动
@@ -49,8 +52,8 @@
 | domain `0`、指定机器狗网卡初始化 SDK2 | `ChannelFactory::Init(domain_id_, network_interface_)` | 已一致 |
 | 初始化 `go2::SportClient` | 构造、`SetTimeout()`、`Init()` | 已一致 |
 | 发送机体系 `vx`、`vy`、`vyaw` | 把 ROS `/body_path` 与 `/lio/body_odom` 转为 `Move(...)` | 架构正确 |
-| 周期刷新速度 | bridge 以配置的控制频率重复 `Move(...)` | 已一致 |
-| 结束时停止 | 到达、超时、禁用和退出路径调用 `StopMove()` | 已一致 |
+| 周期刷新速度 | 控制循环按配置频率提交；worker 串行 SDK RPC 并只保留最新待发 `Move(...)` | 已一致 |
+| 停止与等待 | armed 等待/正常完成发送 `Move(0,0,0)`；禁用、故障和退出调用 `StopMove()` | 已一致 |
 | 原生遥控器是否响应 | 可选 `SwitchJoystick(bool)` | 不是 `Move()` 前置步骤；当前不调用 |
 | 高层/低层运控切换 | `MotionSwitcherClient` | 高层 bridge 不 `ReleaseMode()`，不发布 `/lowcmd` |
 
@@ -61,9 +64,11 @@
 `ReleaseMode()`。因此这两篇文章可以指导桥接器的 SDK 调用面，但不能支持把这些状态改变 RPC
 作为“不运动”的试错前置步骤。
 
-这两篇文档也不能把 `/sdk2_command` 当成物理运动反馈。当前 bridge 仅在 `Move()` RPC 返回
-成功后发布该 ROS 诊断话题；它证明路径到速度的计算和 SDK 服务请求已通过，不证明电机已经
-执行。剩余问题必须从 `rt/sportmodestate`、遥控器响应、机器人固件和运行时 SDK2/API 版本
+这两篇文档也不能把 `/sdk2_command` 当成物理运动反馈。当前 bridge 仅在 ROS 循环
+观测到 `Move()` RPC 成功 completion 后发布该诊断话题；其时间戳是 completion 处理时间，
+不是命令生成、入队或 SDK 线路发送时间。被合并或停车抢占的待发 `Move()` 不会发布。
+因此频率下降可以表示 SDK RPC 变慢，却不等于 ROS timer 或 odom 回调被阻塞；它也不证明
+电机已经执行。剩余问题必须从 `rt/sportmodestate`、遥控器响应、机器人固件和运行时 SDK2/API 版本
 继续核对，而不是继续修改规划器。
 
 ## SDK、服务 API 与固件版本边界
@@ -183,8 +188,9 @@ arm 前建立和确认。
 常规行走、常规跑步和常规续航。官方资料没有把其中任何一个列为 `Move()` 的前置条件。因此
 桥接器不应为了修复“不运动”而自动选择这些步态。
 
-当前 bridge 不订阅 `rt/sportmodestate`，也不把任何状态码解释成自动姿态或步态操作。需要
-核对状态时使用独立只读探针，不能让诊断结果触发 `BalanceStand()`、特殊动作或模式切换。
+当前 bridge 只读订阅 `rt/sportmodestate`，只允许现场已确认可执行的 `100/1013`；其他、未知
+或过期状态只会触发 `StopMove()` 和 disarm，不会被解释成自动姿态或步态操作。独立同步探针
+用于比较命令与反馈，诊断结果也不能触发 `BalanceStand()`、特殊动作或模式切换。
 
 ### 5. `StopMove()`
 
@@ -207,10 +213,11 @@ V2.0 文档的定义非常明确：
 
 1. 操作员先用原生遥控器或官方 App 把机器人置于普通可行走站立状态，并确认没有 `/lowcmd`
    发布者。
-2. bridge 等待显式授权、新鲜路径和有效里程计；未满足时不发送运动 RPC。
+2. bridge 在 disarmed 时不发送运动 RPC；只读 sport state 为新鲜 `100/1013` 且 armed、等待
+   新路径时周期发送零速 `Move()`。
 3. 执行期间按控制周期发送经限幅和滤波的 `Move(vx, vy, vyaw)`。
-4. 到达、禁用、超时、异常或退出时，对本进程可能发出的运动调用 `StopMove()`；未确认停车时
-   保持禁用并重试。
+4. 正常到达时继续发送零速 `Move()` 并等待新路径；显式禁用、超时、异常或退出时，对本进程
+   可能发出的运动调用 `StopMove()`，未确认停车时保持禁用并重试。
 5. bridge 不调用 `SwitchJoystick()`。原生遥控器保持响应，安全员在自动执行期间不同时发送
    普通摇杆运动命令，只在需要人工接管或急停时操作。
 
@@ -267,11 +274,12 @@ V2.0 文档的定义非常明确：
 - 本地核对的是官方提交 `21d0a3b...`。在取得 Jetson 已安装头文件、动态库以及机器人固件的
   版本或哈希前，不能假定运行端与该提交完全一致。
 
-因此当前桥接器只保留 `Move(...)` 和 `StopMove()`，在自动恢复、启动、停车、禁用、故障和
+因此当前桥接器的运动调用只保留 `Move(...)` 和 `StopMove()`，另有只读 sport state 订阅；
+在自动恢复、启动、停车、禁用、故障和
 退出路径中均不得调用 `BalanceStand(...)`、`SwitchJoystick(...)`、`HandStand(...)`、
-`FreeJump(...)` 或任何步态/模式切换 API。桥接器本身不再解释 `2009`、`2011` 等状态；发现
-特殊姿态时由操作员先禁用 bridge，再使用原生遥控器或官方 App 恢复正常站立，确认后才重新
-授权。不要用相反参数调用特殊动作 API 猜测复位。
+`FreeJump(...)` 或任何步态/模式切换 API。`2009`、`2011` 及未知状态只作为 fail-closed 条件；
+发现特殊姿态时 bridge 停车并解除授权，由操作员确认 bridge 已禁用后再使用原生遥控器或官方
+App 恢复正常站立，确认后才重新授权。不要用相反参数调用特殊动作 API 猜测复位。
 
 ### 8. `MotionSwitcherClient`
 
@@ -321,13 +329,15 @@ service”：见
 把节点职责直接定义为“把几何 body path 转成有界的 Go2 `SportClient` 速度命令”。实现中的
 关键位置是：
 
-- `src/utree_go2_sdk2_bridge/src/go2_sdk2_bridge_node.cpp:93`：以配置的 domain 和网卡初始化
-  SDK2 `ChannelFactory`，然后构造、设置超时并初始化 `SportClient`。
-- 同文件 `:94`：订阅 `/body_path`；`:100`：订阅 `/lio/body_odom`；`:103`：创建
-  `/sdk2_command` 诊断发布器。
-- 同文件 `:551`：直接调用 `SportClient::Move()`；只有 SDK 返回成功后才发布
-  `/sdk2_command`。
-- 同文件 `:603`：仅在本进程可能已经发出运动时调用并确认 `StopMove()`。
+- 节点构造阶段以配置的 domain 和网卡初始化 SDK2 `ChannelFactory`，构造
+  `SportClient` 后将它交给独立的 `SdkCommandWorker`，并订阅 `/body_path`、
+  `/lio/body_odom` 和只读 `rt/sportmodestate`。
+- ROS 回调不直接调用阻塞式 SDK RPC。`sendMove()` 把最新速度提交给串行、
+  可合并的 worker mailbox；worker backend 是生产代码中唯一调用
+  `SportClient::Move()`/`StopMove()` 的路径。
+- 只有 worker 返回成功的 `Move()` completion 才会发布 `/sdk2_command`。待发
+  `Move()` 会保留最新值，`StopMove()` 优先并清除尚未执行的移动命令；退出时
+  worker 对最终停车做有界重试。
 - 生产源码没有 `BalanceStand()`、`SwitchJoystick()`、特殊动作、步态或模式切换调用；该约束由
   `test/test_official_move_surface.py` 锁定。
 
@@ -344,7 +354,7 @@ service”：见
 | 应在桥接器里调用 `ReleaseMode()` 吗？ | 否；官方低层示例用它关闭高层运控服务。 |
 | `mcf` 是否异常？ | 否；它是 `>= V1.1.6` 的官方运控模式名。 |
 | `Move()` 用法是否正确？ | 正确；机体系速度、周期刷新、结束停车。 |
-| 当前恢复策略是什么？ | 回到已实机运动过的官方最小调用面，只发 `Move()` 和 `StopMove()`。 |
+| 当前恢复策略是什么？ | 运动调用保持 `Move/StopMove`；只读状态门控允许 `100/1013`，其余状态停车且不自动复位。 |
 | 还需实机确认什么？ | Jetson 安装的 SDK2/固件组合在直接调用面下是否恢复物理运动。 |
 | 实际修改位置在哪里？ | `src/utree_go2_sdk2_bridge/src/go2_sdk2_bridge_node.cpp` 的 SDK2 调用面。 |
 

@@ -23,6 +23,7 @@ find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(unitree_sdk2 REQUIRED)
+find_package(Threads REQUIRED)
 
 # Some SDK2 releases omit the CycloneDDS C++ include directory from the
 # exported target even though the SportClient headers include generated DDS
@@ -39,6 +40,10 @@ add_library(control_safety STATIC src/control_safety.cpp)
 target_include_directories(control_safety PUBLIC include)
 ament_target_dependencies(control_safety geometry_msgs)
 
+add_library(sdk_command_worker STATIC src/sdk_command_worker.cpp)
+target_include_directories(sdk_command_worker PUBLIC include)
+target_link_libraries(sdk_command_worker Threads::Threads)
+
 add_library(simple_navigation_geometry STATIC src/simple_navigation_geometry.cpp)
 target_include_directories(simple_navigation_geometry PUBLIC include)
 
@@ -51,7 +56,7 @@ add_executable(go2_sdk2_bridge_node
   src/go2_sdk2_bridge_main.cpp)
 target_include_directories(go2_sdk2_bridge_node PRIVATE include)
 target_include_directories(go2_sdk2_bridge_node PRIVATE ${UNITREE_DDSCXX_INCLUDE_DIR})
-target_link_libraries(go2_sdk2_bridge_node control_safety unitree_sdk2)
+target_link_libraries(go2_sdk2_bridge_node control_safety sdk_command_worker unitree_sdk2)
 ament_target_dependencies(go2_sdk2_bridge_node
   geometry_msgs nav_msgs rclcpp rcl_interfaces std_srvs tf2 tf2_geometry_msgs)
 
@@ -73,6 +78,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_simple_navigation_controller simple_navigation_controller)
   ament_add_gtest(test_control_safety test/test_control_safety.cpp)
   target_link_libraries(test_control_safety control_safety)
+  ament_add_gtest(test_sdk_command_worker test/test_sdk_command_worker.cpp)
+  target_include_directories(test_sdk_command_worker PRIVATE include)
+  target_link_libraries(test_sdk_command_worker sdk_command_worker)
   ament_add_pytest_test(
     test_go2_sdk2_bridge_launch
     test/test_go2_sdk2_bridge_launch.py)

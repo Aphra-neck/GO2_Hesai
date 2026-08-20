@@ -12,8 +12,21 @@ LOG_REPO="${FIXTURE_ROOT}/log-repo"
 REMOTE_REPO="${FIXTURE_ROOT}/remote.git"
 SEED_REPO="${FIXTURE_ROOT}/seed"
 REMOTE_URL="file://${REMOTE_REPO}"
+FAKE_BIN="${FIXTURE_ROOT}/bin"
+
+mkdir -p -- "${FAKE_BIN}"
+cat > "${FAKE_BIN}/ros2" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == topic && "${2:-}" == info && "${!#}" == /lowcmd ]]; then
+  printf 'Type: unitree_go/msg/LowCmd\nPublisher count: 0\nSubscription count: 0\n'
+  exit 0
+fi
+exit 1
+SH
+chmod +x "${FAKE_BIN}/ros2"
 
 run_go2_log() {
+  PATH="${FAKE_BIN}:${PATH}" \
   GO2_LOG_ROOT="${LOG_ROOT}" \
   GO2_LOG_REPO="${LOG_REPO}" \
   GO2_LOG_REMOTE="${REMOTE_URL}" \

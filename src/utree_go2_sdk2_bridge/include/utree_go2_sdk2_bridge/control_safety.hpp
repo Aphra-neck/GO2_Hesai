@@ -32,6 +32,7 @@ struct ControlParameters
   double command_rate;
   double path_timeout;
   double odom_timeout;
+  double sport_state_timeout;
   double timestamp_future_tolerance;
   double lookahead_distance;
   double goal_position_tolerance;
@@ -93,11 +94,43 @@ private:
   double segment_fraction_{0.0};
 };
 
+enum class GoalGenerationDecision
+{
+  kAccept,
+  kCompletedReplay,
+  kSuperseded,
+  kInvalid,
+};
+
+struct SportStateSample
+{
+  std::uint32_t state_code;
+  std::uint8_t mode;
+  std::uint8_t gait_type;
+};
+
+// The deployed firmware reports the high-level motion state through the
+// historical error_code field of rt/sportmodestate.
+bool isExecutableSportState(std::uint32_t state_code);
+
+const char * sportStateName(std::uint32_t state_code);
+
+// Preserve an unsafe transient until the ROS control loop can fail closed.
+class UnsafeSportStateLatch
+{
+public:
+  void observe(const SportStateSample & sample);
+  std::optional<SportStateSample> take();
+
+private:
+  std::optional<SportStateSample> pending_sample_;
+};
+
 class CompletedGoalLatch
 {
 public:
   void markCompleted(std::int64_t goal_generation);
-  bool accept(std::int64_t candidate_generation);
+  GoalGenerationDecision evaluate(std::int64_t candidate_generation);
   void clear();
   bool active() const;
 

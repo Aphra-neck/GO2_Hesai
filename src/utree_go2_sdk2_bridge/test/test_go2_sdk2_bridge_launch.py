@@ -120,7 +120,7 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
         )
         self.assertNotIn("transient_local()", subscription)
 
-    def test_empty_path_clear_precedes_executable_path_freshness(self):
+    def test_empty_path_clear_defers_move_to_the_gated_control_tick(self):
         with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
             source = stream.read()
         callback = source[
@@ -139,8 +139,108 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
         )
         self.assertLess(empty_path, freshness)
         self.assertIn('waitForNewPath("empty path")', empty_path_branch)
+        self.assertNotIn("sendMove(", empty_path_branch)
         self.assertIn("return;", empty_path_branch)
         self.assertLess(freshness, stale_path_failsafe)
+
+        wait_helper = source[
+            source.index("bool Go2Sdk2BridgeNode::waitForNewPath") : source.index(
+                "bool Go2Sdk2BridgeNode::holdZeroMoveWhileWaiting"
+            )
+        ]
+        self.assertIn("command_worker_->discardPendingMove()", wait_helper)
+        self.assertNotIn("holdZeroMoveWhileWaiting", wait_helper)
+        self.assertNotIn("sendMove(", wait_helper)
+
+    def test_rearming_with_stale_cached_path_fails_safe_when_already_armed(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        callback = source[
+            source.index("void Go2Sdk2BridgeNode::enableCallback") : source.index(
+                "void Go2Sdk2BridgeNode::controlTick"
+            )
+        ]
+        stale_start = callback.index("if (path_ && !pathFresh(current_time))")
+        inner_armed_check = callback.index(
+            "if (motion_authorization_.armed())", stale_start
+        )
+        following_armed_check = callback.index(
+            "if (motion_authorization_.armed())", inner_armed_check + 1
+        )
+        branch = callback[stale_start:following_armed_check]
+
+        armed_check = branch.index("if (motion_authorization_.armed())")
+        fail_safe = branch.index('failSafe("path timeout while enabling motion")')
+        failure = branch.index("response->success = false")
+        stale_discard = branch.index(
+            'waitForNewPath("discarding stale path before arming")'
+        )
+        self.assertLess(armed_check, fail_safe)
+        self.assertLess(fail_safe, failure)
+        self.assertLess(failure, stale_discard)
+
+    def test_disable_reports_pending_stop_as_unconfirmed(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        callback = source[
+            source.index("void Go2Sdk2BridgeNode::enableCallback") : source.index(
+                "void Go2Sdk2BridgeNode::controlTick"
+            )
+        ]
+        disable_branch = callback[
+            callback.index("if (!request->data)") : callback.index(
+                "if (!sdk_completions_healthy)"
+            )
+        ]
+
+        self.assertIn("response->success = stopped;", disable_branch)
+        self.assertIn("StopMove confirmation is pending", disable_branch)
+        self.assertNotIn("stopped || stop_queued", disable_branch)
+
+    def test_superseded_path_does_not_clear_the_active_path(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        callback = source[
+            source.index("void Go2Sdk2BridgeNode::pathCallback") : source.index(
+                "void Go2Sdk2BridgeNode::odomCallback"
+            )
+        ]
+        branch = callback[
+            callback.index("case GoalGenerationDecision::kSuperseded") :
+            callback.index("case GoalGenerationDecision::kInvalid")
+        ]
+
+        self.assertIn("without interrupting the active path", branch)
+        self.assertNotIn("waitForNewPath", branch)
+        self.assertNotIn("path_.reset", branch)
+        self.assertNotIn("path_progress_tracker_.reset", branch)
+
+    def test_sport_state_gate_precedes_every_control_tick_move(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        constructor = source[
+            source.index("Go2Sdk2BridgeNode::Go2Sdk2BridgeNode") : source.index(
+                "Go2Sdk2BridgeNode::~Go2Sdk2BridgeNode"
+            )
+        ]
+        control = source[
+            source.index("void Go2Sdk2BridgeNode::controlTickImpl") : source.index(
+                "void Go2Sdk2BridgeNode::failSafe"
+            )
+        ]
+
+        self.assertIn('"rt/sportmodestate"', constructor)
+        lowcmd_gate = control.index("if (lowcmdPublisherPresent())")
+        state_read = control.index("const auto sport_state = freshSportState()")
+        state_gate = control.index("if (!isExecutableSportState")
+        odom_gate = control.index("if (!odomFresh(current_time))")
+        waiting_move = control.index('holdZeroMoveWhileWaiting("waiting for a path")')
+        path_move = control.index("sendMove(command->vx")
+        self.assertLess(lowcmd_gate, waiting_move)
+        self.assertLess(state_read, state_gate)
+        self.assertLess(state_gate, waiting_move)
+        self.assertLess(odom_gate, waiting_move)
+        self.assertLess(state_gate, path_move)
 
     def test_velocity_arguments_do_not_override_yaml_by_default(self):
         description = _load_launch_description()

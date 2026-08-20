@@ -9,8 +9,9 @@ XT-16 激光雷达和 Go2 内部 IMU 接入 ROS 2 Humble，并通过 Super-LIO �
 ### 二维导航阶段状态（2026-08-11）
 
 `ROS2-2D-navigation` 阶段已经在 Jetson 实机完成以下闭环验证：XT-16 与
-Super-LIO 世界系点云、带三维射线清除的确认障碍地图、二维投影与机身 footprint
-膨胀、WSL2 分布式 RViz、`/body_path` 规划，以及 SDK2 低速路径执行。二维模式会在
+Super-LIO 世界系点云、带三维射线清除的确认障碍地图、二维标量净空膨胀、规划器独立的
+yaw-aware 机身 footprint 碰撞检查、WSL2 分布式 RViz、`/body_path` 规划，以及 SDK2
+低速路径执行。二维模式会在
 点云或里程计过期时撤销路径，运动桥仍需每次进程启动后由操作员显式授权一次。
 
 该结论只覆盖操作员确认的平地、机器狗站立状态和当前低速实测范围。terrain 模式、
@@ -247,8 +248,8 @@ Go2 LowState
 /lio/body_odom + /lio/cloud_world + /goal_pose
   -> utree_dog_navigation
   -> /flat_obstacle_filtered_map_3d (world XYZ confirmed/cleared obstacles)
-  -> /flat_obstacle_inflated (2D footprint clearance)
-  -> /body_path
+  -> /flat_obstacle_inflated (mapper scalar-clearance visualization/costmap)
+  -> /body_path (raw obstacles checked with a yaw-aware rectangular footprint)
 
 /body_path + /lio/body_odom
   -> utree_go2_sdk2_bridge (default: disabled)
@@ -706,14 +707,20 @@ RViz 配置固定使用：
 - `/lio/cloud_world`：Best Effort、Volatile、Decay Time `10` 秒，显示默认关闭
 - `/flat_obstacle_filtered_map_3d`：Reliable、Volatile，红色三维确认障碍，默认开启
 - `/flat_obstacle_filtered_points`：Best Effort、Volatile，橙色当前帧过滤结果，默认关闭
-- `/flat_obstacle_inflated`：Reliable、Transient Local，紫色二维膨胀安全区，默认开启
+- `/flat_obstacle_inflated`：Reliable、Transient Local，紫色二维标量净空膨胀区，默认开启
 - `/flat_obstacle_raw`：Reliable、Transient Local，未膨胀二维障碍，默认关闭
 - `/lio/body_odom`
 - `/body_path`：Reliable、Transient Local
 - Set Goal：发布 `/goal_pose`
 
 红色点不是另一套独立建图：它们来自 Super-LIO 世界点云，经高度/范围裁剪、多帧确认和
-世界系三维清除后形成；紫色单元是这些确认障碍投影到二维后按 Go2 footprint 膨胀的结果。
+世界系三维清除后形成。当前 mapper 默认 `obstacle_clearance: 0.00 m`，因此紫色
+`/flat_obstacle_inflated` 层不在 raw obstacle grid 外再增加栅格；若以后显式增大该参数，
+它只会改变 RViz 和 `/terrain_costmap` 的标量净空显示。planner 不直接消费这个
+inflated mask，而是对 raw obstacle grid 执行独立的 `0.60 x 0.30 m` yaw-aware
+矩形 footprint 位姿、平移和旋转扫掠碰撞检查。
+这组 `0.60 x 0.30 m + 0.00 m` 参数只是开阔场地调试用的躯干包络，不包含腿部外伸、
+定位/跟踪误差或额外动态裕量；在恢复并实测含腿 footprint 前，不得用于贴近障碍物的运动验证。
 `GO2_MAP_CAPTURE` 只控制 PCD 诊断写盘，不参与障碍判断，因此开关它不应改变 RViz 地图或路径。
 
 WSLg 可能输出一条 GLSL sampler 警告。只要 RViz 进程仍存活且点云可见，该警告
@@ -977,9 +984,11 @@ Set Goal 设置 `0.5-1.0 m` 内、平地、完全可见的目标。检查器会�
 连续地面不连通；`*_frame_mismatch`、`*_stale` 或 `*_stamp_from_future` 表示坐标契约或
 时间新鲜度不满足，`*_elevation_invalid_for_ground_topology` 表示吸附格缺少有效高程。
 旧日志可能保留名称 `*_snap_square`。新检查器与 C++ 规划器均从原始端点世界坐标到候选
-格中心计算真实欧氏距离，避免机器人跨过栅格边界时仅因整数格偏移而改变结论。XT-16 平地
-配置只对当前机器人起点使用 `start_snap_radius=0.55 m`，RViz 目标仍使用
-`snap_radius=0.50 m`；该修改没有放宽坡度、粗糙度、通行度或台阶阈值。
+格中心计算真实欧氏距离，避免机器人跨过栅格边界时仅因整数格偏移而改变结论。当前
+`flat_obstacle` 开阔场地调试配置对起点和 RViz 目标分别使用
+`start_snap_radius=0.80 m`、`snap_radius=0.80 m`；这会在该半径内选择可用格，不能被误解为
+额外障碍膨胀，也不适合贴近障碍物的目标验证。上文 `0.55 m`/`0.50 m` 数值只属于保留的
+terrain 历史实验。该调试配置没有放宽坡度、粗糙度、通行度或台阶阈值。
 此操作只应让规划节点生成 `/body_path`，不会自动控制机器人，因为 SDK2 bridge 尚未启动。
 
 退出码 `0` 只表示起点检查通过，或起终点属于同一连续地面区域；其他诊断结论返回 `2`，
@@ -1014,6 +1023,10 @@ echo "path_echo_exit=$?"
 只有在 RViz 障碍层与测试目标路径均符合现场、官方遥控器安全员已就位且没有
 `/lowcmd` 发布者时才进入运动。Jetson 终端 3 启动 bridge：
 
+日常避障只能使用下面的标准 bridge；它消费 planner 生成并完成碰撞检查的 `/body_path`。
+`start_sdk2_direct_bridge.sh` 是忽略地图和 `/body_path` 的无避障调试工具，默认禁止，不能用于
+有障碍环境。
+
 ```bash
 cd ~/catkin_ws
 ./shell/start_sdk2_bridge.sh
@@ -1030,15 +1043,26 @@ ros2 service call /go2_sdk2_bridge/enable_motion \
   std_srvs/srv/SetBool '{data: true}'
 ```
 
-授权可以发生在新路径到达前；此时 bridge 停车并等待。此后每次在 RViz 发布一个新的有效
+授权可以发生在新路径到达前；此时 bridge 周期发送 `Move(0, 0, 0)` 保持 SDK2 locomotion
+stream 并等待。此后每次在 RViz 发布一个新的有效
 目标，规划器生成新鲜 `/body_path` 后会自动执行，不需要为每个目标重复调用 `data: true`。
 bridge 使用与 Unitree 官方速度示例及最初实机可运动版本相同的调用面：控制周期内只调用
-`SportClient::Move()`，结束时调用 `StopMove()`。它不会自动调用 `BalanceStand()`、
+`SportClient::Move()`。等待路径、正常到达和新鲜空路径期间发送零速 `Move()`；显式禁用、
+路径/里程计超时、非法输入、SDK 错误或退出时才调用 `StopMove()`。它不会自动调用 `BalanceStand()`、
 `SwitchJoystick()`、特殊动作或步态/模式切换接口。arm 前必须由操作员通过原生遥控器或官方
 App 确认机器狗已经处于正常、可行走的四足站立状态；自动执行期间不要同时推动运动摇杆，
 但遥控器必须始终在安全员手中用于人工接管。
-正常到达目标或收到规划器显式发布的新鲜空路径时，bridge 会停车但保留本次授权并等待
-下一条新路径。路径缓存超时、里程计超时或其他安全故障会立即停车并解除授权，排除原因后
+bridge 只读订阅 `rt/sportmodestate`：只有现场已确认的 `100 (agile)` 或
+`1013 (balance standing)` 才允许发送 `Move()`；状态缺失、超过 `1.0 s` 未更新、`2009`、
+`2011` 或任何其他/未知状态都会立即 disarm、清除待发 `Move()`，并排队优先
+`StopMove()`；确认停车前拒绝再次授权。该门控绝不触发自动姿态、步态或模式恢复。
+阻塞式 SDK2 RPC 由独立串行 worker 执行，ROS 路径、里程计和控制定时回调不等待
+`Move()`/`StopMove()`。worker 只保留最新的待发 `Move()`，`StopMove()` 会清除待发移动并
+优先执行。`/sdk2_command` 只在某次 `Move()` RPC 返回成功后发布；它是 SDK 请求成功
+记录，不是入队时间，也不是机器狗已产生物理运动的反馈。
+正常到达目标或收到规划器显式发布的新鲜空路径时，bridge 会发送零速 `Move()`、保留本次授权并等待
+下一条新路径。路径缓存超时、里程计超时或其他安全故障会立即解除授权并发起
+优先停车，排除原因后
 必须重新显式 arm，不能让中断前的旧目标自动恢复。
 配置参数 `enabled` 是只读的启动保护并始终为 `false`，不代表运行期 armed 状态；以 service
 响应和 bridge 终端中的 `armed`/`waiting for a path` 日志为准。
@@ -1053,8 +1077,9 @@ App 确认机器狗已经处于正常、可行走的四足站立状态；自动�
 局部航向误差达到 `45 deg` 时进入只转不平移，降到 `15 deg` 以内才恢复平移，避免阈值附近
 反复切换。
 
-里程计缺失/过期、非法或异常时间戳路径、SDK2 停车失败、检测到 `/lowcmd` 发布者，或人工
-调用 `data: false` 都会 disarm；处理原因后必须重新显式授权。任何时候都可人工禁用并停车：
+里程计缺失/过期、Unitree sport state 缺失/过期/不在白名单、非法或异常时间戳路径、SDK2
+停车失败、检测到 `/lowcmd` 发布者，或人工
+调用 `data: false` 都会 disarm；处理原因后必须重新显式授权。任何时候都可人工禁用并发起停车：
 
 ```bash
 cd ~/catkin_ws
@@ -1063,6 +1088,11 @@ source ./shell/ros2_environment.sh
 ros2 service call /go2_sdk2_bridge/enable_motion \
   std_srvs/srv/SetBool '{data: false}'
 ```
+
+若仍出现 `/sdk2_command` 连续但机器狗中途不响应、轻推遥控器后又恢复的现象，使用
+[`docs/go2_sdk2_motion_stall_probe.md`](docs/go2_sdk2_motion_stall_probe.md) 中的只读同步探针，
+同时采集 command、body odom、`rt/sportmodestate` 和 LowState 遥控器数据。探针不 arm、
+不发布控制命令，也不调用任何运动或模式切换 API。
 
 二维规划优先让机头朝向局部路径段：长距离反向/横向运动会承担持续航向代价，直角转折在
 真正到达拐点后使用下一段航向；运动桥在航向误差较大时只转向，进入对齐范围后才恢复平移。
@@ -1191,7 +1221,8 @@ cd ~/catkin_ws
 ```
 
 脚本会拒绝与 RL `/lowcmd` 控制器并行运行；节点运行期间也会持续检查
-`/lowcmd` 发布者，一旦发现便立即禁用 SportClient 并停车。节点启动后仍为 disarmed；确认
+`/lowcmd` 发布者，一旦发现便立即 disarm、清除待发移动并排队优先停车。
+节点启动后仍为 disarmed；确认
 `/body_path`、`/lio/body_odom` 和机器人周边安全后，才可显式 arm：
 
 `enabled:=true` 启动配置会被拒绝，不能绕过人工授权。路径、里程计或控制参数包含
@@ -1206,11 +1237,11 @@ ros2 service call /go2_sdk2_bridge/enable_motion \
 ```
 
 该调用只需在 bridge 进程启动后执行一次。正常到达、规划器显式空路径或等待新目标时会
-停车并保持 armed；后续新 goal generation 的新鲜路径会自动恢复执行，即使操作员再次选择
+周期发送零速 `Move()` 并保持 armed；后续新 goal generation 的新鲜路径会自动恢复执行，即使操作员再次选择
 相同的几何终点也无需重复 arm。路径或里程计超时、非法输入、路径跟踪偏差及其他安全故障会
 disarm，必须排除故障后重新调用。
 
-随时禁用并停车：
+随时禁用并发起停车：
 
 ```bash
 cd ~/catkin_ws

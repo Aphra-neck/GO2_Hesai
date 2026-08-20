@@ -6,10 +6,13 @@
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <stdexcept>
+#include <utility>
 
 #include "rcl_interfaces/msg/parameter_descriptor.hpp"
 #include "unitree/robot/channel/channel_factory.hpp"
+#include "unitree/robot/go2/sport/sport_client.hpp"
 
 namespace utree_go2_sdk2_bridge
 {
@@ -21,6 +24,29 @@ double normalizeAngle(double angle)
 {
   return std::remainder(angle, 2.0 * kPi);
 }
+
+class SportClientCommandBackend final : public SdkCommandBackend
+{
+public:
+  explicit SportClientCommandBackend(
+    std::unique_ptr<unitree::robot::go2::SportClient> sport_client)
+  : sport_client_(std::move(sport_client))
+  {
+  }
+
+  std::int32_t move(const SdkVelocityCommand & command) override
+  {
+    return sport_client_->Move(command.vx, command.vy, command.yaw_rate);
+  }
+
+  std::int32_t stop() override
+  {
+    return sport_client_->StopMove();
+  }
+
+private:
+  std::unique_ptr<unitree::robot::go2::SportClient> sport_client_;
+};
 }  // namespace
 
 Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
@@ -36,6 +62,7 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   command_rate_ = declare_parameter("command_rate", 20.0);
   path_timeout_ = declare_parameter("path_timeout", 1.0);
   odom_timeout_ = declare_parameter("odom_timeout", 0.5);
+  sport_state_timeout_ = declare_parameter("sport_state_timeout", 1.0);
   timestamp_future_tolerance_ = declare_parameter("timestamp_future_tolerance", 0.2);
   lookahead_distance_ = declare_parameter("lookahead_distance", 0.6);
   goal_position_tolerance_ = declare_parameter("goal_position_tolerance", 0.15);
@@ -76,7 +103,7 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
             "world_frame, body_frame, path_topic, and odom_topic must not be empty");
   }
   const ControlParameters parameters{
-    command_rate_, path_timeout_, odom_timeout_, timestamp_future_tolerance_,
+    command_rate_, path_timeout_, odom_timeout_, sport_state_timeout_, timestamp_future_tolerance_,
     lookahead_distance_, goal_position_tolerance_, goal_yaw_tolerance_,
     heading_alignment_enter_angle_, heading_alignment_exit_angle_,
     explicit_rotation_tolerance_,
@@ -87,9 +114,17 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   }
   // SDK2 owns its DDS participant. Initialize it once before constructing SportClient.
   unitree::robot::ChannelFactory::Instance()->Init(domain_id_, network_interface_);
-  sport_client_ = std::make_unique<unitree::robot::go2::SportClient>();
-  sport_client_->SetTimeout(0.5F);
-  sport_client_->Init();
+  auto sport_client = std::make_unique<unitree::robot::go2::SportClient>();
+  sport_client->SetTimeout(0.5F);
+  sport_client->Init();
+  command_worker_ = std::make_unique<SdkCommandWorker>(
+    std::make_shared<SportClientCommandBackend>(std::move(sport_client)));
+
+  sport_state_sub_ = std::make_shared<
+    unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(
+    "rt/sportmodestate");
+  sport_state_sub_->InitChannel(
+    std::bind(&Go2Sdk2BridgeNode::sportStateCallback, this, std::placeholders::_1), 1);
 
   path_sub_ = create_subscription<nav_msgs::msg::Path>(
     // Execute only paths published after this bridge subscription is matched.
@@ -120,36 +155,20 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
 
 Go2Sdk2BridgeNode::~Go2Sdk2BridgeNode() noexcept
 {
-  if (!sport_client_ || !command_active_) {
+  if (!command_worker_) {
     return;
   }
 
-  constexpr int kStopAttempts = 3;
   try {
-    for (int attempt = 1; attempt <= kStopAttempts; ++attempt) {
-      try {
-        const int32_t status = sport_client_->StopMove();
-        if (status == 0) {
-          command_active_ = false;
-          RCLCPP_WARN(get_logger(), "Go2 stopped during SDK2 bridge shutdown");
-          return;
-        }
-        RCLCPP_ERROR(
-          get_logger(), "Shutdown StopMove attempt %d/%d failed with status %d",
-          attempt, kStopAttempts, status);
-      } catch (const std::exception & exception) {
-        RCLCPP_ERROR(
-          get_logger(), "Shutdown StopMove attempt %d/%d threw: %s",
-          attempt, kStopAttempts, exception.what());
-      } catch (...) {
-        RCLCPP_ERROR(
-          get_logger(), "Shutdown StopMove attempt %d/%d threw an unknown exception",
-          attempt, kStopAttempts);
-      }
+    motion_authorization_.disarm();
+    command_worker_->shutdown();
+    const auto status = command_worker_->status();
+    if (status.stop_state == SdkStopState::kConfirmed) {
+      command_active_ = false;
+      RCLCPP_WARN(get_logger(), "Go2 stopped during SDK2 bridge shutdown");
+    } else {
+      RCLCPP_FATAL(get_logger(), "Unable to confirm StopMove during SDK2 bridge shutdown");
     }
-    RCLCPP_FATAL(
-      get_logger(), "Unable to confirm StopMove after %d shutdown attempts",
-      kStopAttempts);
   } catch (const std::exception & exception) {
     std::fprintf(
       stderr, "go2_sdk2_bridge: shutdown stop failed while logging: %s\n", exception.what());
@@ -174,10 +193,14 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
       return;
     }
     if (msg->poses.empty()) {
-      // An empty path cannot command motion. Stop and wait even if the clear
-      // sentinel was delayed, without consuming the operator's authorization.
+      // A path callback never submits Move directly. The next fully gated
+      // control tick holds zero while preserving the operator authorization.
       path_progress_tracker_.reset();
-      waitForNewPath("empty path");
+      if (!waitForNewPath("empty path")) {
+        RCLCPP_ERROR(
+          get_logger(), "Body path cleared, but StopMove remains unconfirmed while disarmed");
+        return;
+      }
       if (motion_authorization_.armed()) {
         RCLCPP_INFO(
           get_logger(), "Body path cleared; waiting for a new path while remaining armed");
@@ -223,14 +246,32 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
         "Rejected body path because pose stamps do not contain one valid goal generation");
       return;
     }
-    if (!completed_goal_latch_.accept(*goal_generation)) {
-      path_progress_tracker_.reset();
-      waitForNewPath("repeated or superseded goal generation");
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "Ignored body path for completed or superseded goal generation %lld",
-        static_cast<long long>(*goal_generation));
-      return;
+    switch (completed_goal_latch_.evaluate(*goal_generation)) {
+      case GoalGenerationDecision::kAccept:
+        break;
+      case GoalGenerationDecision::kCompletedReplay:
+        path_progress_tracker_.reset();
+        if (!waitForNewPath("completed goal generation replay")) {
+          RCLCPP_ERROR(
+            get_logger(), "Completed goal replay was rejected, but StopMove remains unconfirmed");
+        }
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "Ignored body path for completed goal generation %lld",
+          static_cast<long long>(*goal_generation));
+        return;
+      case GoalGenerationDecision::kSuperseded:
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "Ignored superseded body path generation %lld without interrupting the active path",
+          static_cast<long long>(*goal_generation));
+        return;
+      case GoalGenerationDecision::kInvalid:
+        failSafe("invalid path goal generation decision");
+        RCLCPP_ERROR(
+          get_logger(), "Rejected invalid body path goal generation %lld",
+          static_cast<long long>(*goal_generation));
+        return;
     }
     path_ = msg;
     path_goal_generation_ = *goal_generation;
@@ -308,6 +349,21 @@ void Go2Sdk2BridgeNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr ms
   }
 }
 
+void Go2Sdk2BridgeNode::sportStateCallback(const void * message)
+{
+  if (!message) {
+    return;
+  }
+  const auto * state =
+    static_cast<const unitree_go::msg::dds_::SportModeState_ *>(message);
+  const SportStateSample sample{
+    state->error_code(), state->mode(), state->gait_type()};
+  const std::lock_guard<std::mutex> lock(sport_state_mutex_);
+  sport_state_ = sample;
+  unsafe_sport_state_latch_.observe(sample);
+  sport_state_received_at_ = std::chrono::steady_clock::now();
+}
+
 void Go2Sdk2BridgeNode::enableCallback(
   const std_srvs::srv::SetBool::Request::SharedPtr request,
   std_srvs::srv::SetBool::Response::SharedPtr response)
@@ -317,6 +373,7 @@ void Go2Sdk2BridgeNode::enableCallback(
       failSafe("invalid enable service request");
       return;
     }
+    const bool sdk_completions_healthy = processSdkCompletions();
     if (!request->data) {
       motion_authorization_.disarm();
       path_.reset();
@@ -325,9 +382,19 @@ void Go2Sdk2BridgeNode::enableCallback(
       completed_goal_latch_.clear();
       heading_alignment_active_ = false;
       const bool stopped = stopRobot("motion disabled by service");
+      const auto worker_status = command_worker_->status();
+      const bool stop_queued =
+        worker_status.stop_state == SdkStopState::kPending && pending_stop_sequence_.has_value();
       response->success = stopped;
-      response->message = command_active_ ?
-        "Disable requested, but StopMove is not yet confirmed" : "Go2 motion disabled";
+      response->message = stopped ? "Go2 motion disabled" :
+        (stop_queued ? "Motion authorization disabled; StopMove confirmation is pending" :
+        "Disable requested, but StopMove could not be queued");
+      return;
+    }
+    if (!sdk_completions_healthy) {
+      response->success = false;
+      response->message =
+        "Cannot arm: an SDK2 command failure was processed; verify state and call again";
       return;
     }
     if (lowcmdPublisherPresent()) {
@@ -355,16 +422,43 @@ void Go2Sdk2BridgeNode::enableCallback(
       return;
     }
     if (path_ && !pathFresh(current_time)) {
-      if (!waitForNewPath("path timeout while enabling motion")) {
+      if (motion_authorization_.armed()) {
+        failSafe("path timeout while enabling motion");
+        response->success = false;
+        response->message =
+          "Cannot remain armed: cached body path timed out; re-arm after a fresh path";
+        return;
+      }
+      if (!waitForNewPath("discarding stale path before arming")) {
         response->success = false;
         response->message = "Cannot arm: StopMove is not confirmed";
         return;
       }
     }
+    const auto sport_state = freshSportState();
+    if (!sport_state) {
+      failSafe("missing or stale Unitree sport state while enabling motion");
+      response->success = false;
+      response->message = "Cannot arm: rt/sportmodestate is missing or stale";
+      return;
+    }
+    if (!isExecutableSportState(sport_state->state_code)) {
+      failSafe("Unitree sport state is not executable while enabling motion");
+      response->success = false;
+      response->message =
+        "Cannot arm: Unitree motion state " + std::to_string(sport_state->state_code) +
+        " (" + sportStateName(sport_state->state_code) + ") is not executable";
+      return;
+    }
     if (motion_authorization_.armed()) {
       response->success = true;
       response->message = motion_authorization_.executionAuthorized() ?
         "Go2 motion is already armed" : "Go2 motion is already armed and waiting for a path";
+      return;
+    }
+    if (!command_worker_->resetFaultAfterConfirmedStop()) {
+      response->success = false;
+      response->message = "Cannot arm: SDK2 StopMove is not confirmed";
       return;
     }
     motion_authorization_.arm(path_ != nullptr);
@@ -403,6 +497,9 @@ void Go2Sdk2BridgeNode::controlTick()
 
 void Go2Sdk2BridgeNode::controlTickImpl()
 {
+  if (!processSdkCompletions()) {
+    return;
+  }
   if (lowcmdPublisherPresent()) {
     failSafe("a /lowcmd publisher appeared");
     RCLCPP_ERROR_THROTTLE(
@@ -412,6 +509,21 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   }
   if (!motion_authorization_.armed()) {
     stopRobot("retrying unconfirmed stop while motion is disabled");
+    return;
+  }
+  const auto sport_state = freshSportState();
+  if (!sport_state) {
+    failSafe("Unitree sport state timeout");
+    RCLCPP_ERROR(get_logger(), "Stopped because rt/sportmodestate is missing or stale");
+    return;
+  }
+  if (!isExecutableSportState(sport_state->state_code)) {
+    failSafe("Unitree sport state became non-executable");
+    RCLCPP_ERROR(
+      get_logger(), "Stopped in Unitree motion state %u (%s), mode=%u gait_type=%u",
+      sport_state->state_code, sportStateName(sport_state->state_code),
+      static_cast<unsigned>(sport_state->mode),
+      static_cast<unsigned>(sport_state->gait_type));
     return;
   }
   const rclcpp::Time current_time = now();
@@ -425,7 +537,10 @@ void Go2Sdk2BridgeNode::controlTickImpl()
     return;
   }
   if (!path_) {
-    waitForNewPath("waiting for a path");
+    if (!holdZeroMoveWhileWaiting("waiting for a path")) {
+      motion_authorization_.disarm();
+      odom_.reset();
+    }
     return;
   }
   if (!cachedPathValid()) {
@@ -481,7 +596,7 @@ void Go2Sdk2BridgeNode::controlTickImpl()
       return;
     }
     completed_goal_latch_.markCompleted(*path_goal_generation_);
-    waitForNewPath("goal reached");
+    (void)waitForNewPath("goal reached");
     return;
   }
   const double world_dx = tracking_target->target_x - current.position.x;
@@ -543,34 +658,67 @@ void Go2Sdk2BridgeNode::controlTickImpl()
     return;
   }
 
-  // Move may have reached the robot even when its RPC reports an error. Mark the
-  // command active first so every failure path issues StopMove conservatively.
-  command_active_ = true;
-  int32_t status = -1;
-  try {
-    status = sport_client_->Move(command->vx, command->vy, command->yaw_rate);
-  } catch (const std::exception & exception) {
-    failSafe("SDK2 Move threw an exception");
-    RCLCPP_ERROR(get_logger(), "SportClient::Move threw: %s", exception.what());
-    return;
-  } catch (...) {
-    failSafe("SDK2 Move threw an unknown exception");
-    RCLCPP_ERROR(get_logger(), "SportClient::Move threw an unknown exception");
+  if (!sendMove(command->vx, command->vy, command->yaw_rate)) {
+    failSafe("SDK2 Move could not be queued");
     return;
   }
-  if (status != 0) {
-    failSafe("SDK2 Move returned an error");
-    RCLCPP_ERROR(get_logger(), "SportClient::Move failed with status %d", status);
-    return;
+}
+
+bool Go2Sdk2BridgeNode::processSdkCompletions()
+{
+  if (!command_worker_) {
+    return false;
   }
 
-  geometry_msgs::msg::TwistStamped command_message;
-  command_message.header.stamp = current_time;
-  command_message.header.frame_id = body_frame_;
-  command_message.twist.linear.x = command->vx;
-  command_message.twist.linear.y = command->vy;
-  command_message.twist.angular.z = command->yaw_rate;
-  command_pub_->publish(command_message);
+  bool healthy = true;
+  SdkCommandCompletion completion;
+  while (command_worker_->tryPopCompletion(completion)) {
+    if (completion.outcome == SdkCommandOutcome::kSuperseded ||
+      completion.outcome == SdkCommandOutcome::kDiscarded ||
+      completion.outcome == SdkCommandOutcome::kPreemptedByStop)
+    {
+      continue;
+    }
+
+    if (completion.kind == SdkCommandKind::kStop) {
+      if (pending_stop_sequence_ && *pending_stop_sequence_ == completion.sequence) {
+        pending_stop_sequence_.reset();
+      }
+      if (completion.outcome == SdkCommandOutcome::kSucceeded) {
+        command_active_ = false;
+        const std::string reason = pending_stop_reason_.empty() ?
+          "SDK2 stop request" : pending_stop_reason_;
+        pending_stop_reason_.clear();
+        RCLCPP_WARN(get_logger(), "Go2 stopped: %s", reason.c_str());
+      } else {
+        healthy = false;
+        RCLCPP_ERROR_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "SportClient::StopMove worker failed with status %d; will retry",
+          completion.sdk_status);
+      }
+      continue;
+    }
+
+    if (completion.outcome == SdkCommandOutcome::kSucceeded) {
+      geometry_msgs::msg::TwistStamped command_message;
+      command_message.header.stamp = now();
+      command_message.header.frame_id = body_frame_;
+      command_message.twist.linear.x = completion.command.vx;
+      command_message.twist.linear.y = completion.command.vy;
+      command_message.twist.angular.z = completion.command.yaw_rate;
+      command_pub_->publish(command_message);
+      continue;
+    }
+
+    healthy = false;
+    RCLCPP_ERROR(
+      get_logger(), "SportClient::Move worker failed with status %d%s",
+      completion.sdk_status,
+      completion.outcome == SdkCommandOutcome::kSdkException ? " after an exception" : "");
+    failSafe("SDK2 Move worker reported an error");
+  }
+  return healthy;
 }
 
 void Go2Sdk2BridgeNode::failSafe(const char * reason)
@@ -587,50 +735,103 @@ void Go2Sdk2BridgeNode::failSafe(const char * reason)
 
 bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
 {
+  if (command_worker_) {
+    // Prevent a coalesced nonzero command from outliving the path that
+    // produced it. This changes only the worker mailbox and performs no RPC.
+    (void)command_worker_->discardPendingMove();
+  }
   path_.reset();
   path_goal_generation_.reset();
   path_progress_tracker_.reset();
   motion_authorization_.waitForPath();
   heading_alignment_active_ = false;
-  const bool stopped = stopRobot(reason);
-  if (!stopped) {
-    motion_authorization_.disarm();
-    odom_.reset();
+
+  if (motion_authorization_.armed()) {
+    // This helper is also called from subscription callbacks. Never enqueue a
+    // Move here: the next control tick must pass every safety gate first.
+    return true;
   }
-  return stopped;
+  return stopRobot(reason);
+}
+
+bool Go2Sdk2BridgeNode::holdZeroMoveWhileWaiting(const char * reason)
+{
+  if (!motion_authorization_.armed()) {
+    return stopRobot(reason);
+  }
+
+  // Keep the locomotion stream active without a StopMove transition. This is
+  // an A/B test for the observed wake symptom; hardware feedback must confirm
+  // whether it changes physical execution.
+  if (sendMove(0.0, 0.0, 0.0)) {
+    return true;
+  }
+
+  stopRobot("zero-speed wait command failed");
+  return false;
+}
+
+bool Go2Sdk2BridgeNode::sendMove(double vx, double vy, double yaw_rate)
+{
+  if (!command_worker_) {
+    return false;
+  }
+  try {
+    const auto sequence = command_worker_->submitMove(
+      SdkVelocityCommand{
+        static_cast<float>(vx), static_cast<float>(vy), static_cast<float>(yaw_rate)});
+    if (!sequence) {
+      RCLCPP_ERROR(get_logger(), "SDK2 worker rejected Move while stopping or faulted");
+      return false;
+    }
+    // The RPC may reach the robot before its completion is observed. Treat the
+    // command as active as soon as it enters the serialized SDK mailbox.
+    command_active_ = true;
+    return true;
+  } catch (const std::exception & exception) {
+    RCLCPP_ERROR(get_logger(), "Could not queue SDK2 Move: %s", exception.what());
+    return false;
+  } catch (...) {
+    RCLCPP_ERROR(get_logger(), "Could not queue SDK2 Move after an unknown exception");
+    return false;
+  }
 }
 
 bool Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
 {
   if (!command_active_) {return true;}
   try {
-    const int32_t status = sport_client_->StopMove();
-    if (status != 0) {
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "SportClient::StopMove failed with status %d (%s); will retry",
-        status, reason);
+    if (pending_stop_sequence_) {
       return false;
     }
-    command_active_ = false;
-    RCLCPP_WARN(get_logger(), "Go2 stopped: %s", reason);
-    return true;
+    const auto sequence = command_worker_->submitStop();
+    if (!sequence) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "SDK2 worker rejected StopMove (%s); will retry", reason);
+      return false;
+    }
+    pending_stop_sequence_ = *sequence;
+    if (pending_stop_reason_.empty()) {
+      pending_stop_reason_ = reason;
+    }
+    return false;
   } catch (const std::exception & exception) {
     try {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 3000,
-        "SportClient::StopMove threw (%s): %s; will retry", reason, exception.what());
+        "Could not queue SDK2 StopMove (%s): %s; will retry", reason, exception.what());
     } catch (...) {
-      std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw: %s\n", exception.what());
+      std::fprintf(stderr, "go2_sdk2_bridge: could not queue StopMove: %s\n", exception.what());
     }
     return false;
   } catch (...) {
     try {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 3000,
-        "SportClient::StopMove threw an unknown exception (%s); will retry", reason);
+        "Could not queue SDK2 StopMove after an unknown exception (%s); will retry", reason);
     } catch (...) {
-      std::fprintf(stderr, "go2_sdk2_bridge: StopMove threw an unknown exception\n");
+      std::fprintf(stderr, "go2_sdk2_bridge: could not queue StopMove\n");
     }
     return false;
   }
@@ -684,6 +885,33 @@ bool Go2Sdk2BridgeNode::messageStampFresh(
 {
   const double age = messageAgeSeconds(message_time, current_time);
   return std::isfinite(age) && age >= -timestamp_future_tolerance_ && age <= timeout;
+}
+
+std::optional<SportStateSample> Go2Sdk2BridgeNode::freshSportState()
+{
+  SportStateSample sample{};
+  std::chrono::steady_clock::time_point received_at;
+  {
+    const std::lock_guard<std::mutex> lock(sport_state_mutex_);
+    if (motion_authorization_.armed()) {
+      if (const auto unsafe_sample = unsafe_sport_state_latch_.take()) {
+        return unsafe_sample;
+      }
+    } else {
+      (void)unsafe_sport_state_latch_.take();
+    }
+    if (!sport_state_) {
+      return std::nullopt;
+    }
+    sample = *sport_state_;
+    received_at = sport_state_received_at_;
+  }
+  const double age = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - received_at).count();
+  if (!std::isfinite(age) || age < 0.0 || age > sport_state_timeout_) {
+    return std::nullopt;
+  }
+  return sample;
 }
 
 bool Go2Sdk2BridgeNode::lowcmdPublisherPresent()

@@ -95,7 +95,20 @@ common_environment=(
   UNITREE_SDK_LIBRARY_DIR="${unitree_lib}"
 )
 
-env "${common_environment[@]}" "${workspace}/shell/start_sdk2_direct_bridge.sh"
+set +e
+default_output="$(
+  env "${common_environment[@]}" \
+    "${workspace}/shell/start_sdk2_direct_bridge.sh" 2>&1
+)"
+default_status=$?
+set -e
+test "${default_status}" -ne 0
+[[ "${default_output}" == *"Obstacle-unaware direct bridge is disabled by default"* ]]
+[[ "${default_output}" == *"Use ./shell/start_sdk2_bridge.sh to follow the planner-produced, obstacle-checked /body_path"* ]]
+
+env "${common_environment[@]}" \
+  GO2_ALLOW_OBSTACLE_UNAWARE_DIRECT_BRIDGE=true \
+  "${workspace}/shell/start_sdk2_direct_bridge.sh"
 grep -Fq \
   'launch utree_go2_sdk2_bridge go2_sdk2_direct_bridge.launch.py' \
   "${ros2_trace}"
@@ -105,7 +118,9 @@ grep -Fq 'go2_sdk2_direct_bridge_node' "${pgrep_trace}"
 
 set +e
 old_bridge_output="$(
-  env "${common_environment[@]}" FAKE_OLD_BRIDGE_RUNNING=true \
+  env "${common_environment[@]}" \
+    GO2_ALLOW_OBSTACLE_UNAWARE_DIRECT_BRIDGE=true \
+    FAKE_OLD_BRIDGE_RUNNING=true \
     "${workspace}/shell/start_sdk2_direct_bridge.sh" 2>&1
 )"
 old_bridge_status=$?
@@ -113,4 +128,4 @@ set -e
 test "${old_bridge_status}" -ne 0
 [[ "${old_bridge_output}" == *"An SDK2 motion bridge is already running"* ]]
 
-echo "PASS: direct SDK2 bridge reuses navigation odometry without stopping the planner"
+echo "PASS: obstacle-unaware direct SDK2 bridge requires explicit commissioning authorization"

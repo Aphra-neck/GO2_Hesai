@@ -11,7 +11,7 @@ namespace
 ControlParameters validParameters()
 {
   return ControlParameters{
-    20.0, 1.0, 0.5, 0.2, 0.6, 0.15, 0.2,
+    20.0, 1.0, 0.5, 1.0, 0.2, 0.6, 0.15, 0.2,
     0.7853981633974483, 0.2617993877991494,
     0.05, 1.0, 1.5, 0.6, 0.35, 0.8};
 }
@@ -62,6 +62,10 @@ TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
 
   parameters = validParameters();
   parameters.path_timeout = std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(validateControlParameters(parameters).empty());
+
+  parameters = validParameters();
+  parameters.sport_state_timeout = 0.0;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
 
   parameters = validParameters();
@@ -630,16 +634,41 @@ TEST(CompletedGoal, BlocksEveryReplanOfTheCompletedGoalGeneration)
 {
   CompletedGoalLatch latch;
 
-  EXPECT_TRUE(latch.accept(100));
-  EXPECT_TRUE(latch.accept(100));
+  EXPECT_EQ(latch.evaluate(100), GoalGenerationDecision::kAccept);
+  EXPECT_EQ(latch.evaluate(100), GoalGenerationDecision::kAccept);
   latch.markCompleted(100);
 
   EXPECT_TRUE(latch.active());
-  EXPECT_FALSE(latch.accept(100));
+  EXPECT_EQ(latch.evaluate(100), GoalGenerationDecision::kCompletedReplay);
   EXPECT_TRUE(latch.active());
-  EXPECT_TRUE(latch.accept(101));
+  EXPECT_EQ(latch.evaluate(101), GoalGenerationDecision::kAccept);
   EXPECT_FALSE(latch.active());
-  EXPECT_FALSE(latch.accept(100));
+  EXPECT_EQ(latch.evaluate(100), GoalGenerationDecision::kSuperseded);
+  EXPECT_EQ(latch.evaluate(0), GoalGenerationDecision::kInvalid);
+}
+
+TEST(SportStateSafety, AllowsOnlyTheObservedExecutableStates)
+{
+  EXPECT_TRUE(isExecutableSportState(100U));
+  EXPECT_TRUE(isExecutableSportState(1013U));
+  for (const std::uint32_t state_code : {1002U, 1015U, 2009U, 2011U, 9999U}) {
+    EXPECT_FALSE(isExecutableSportState(state_code)) << "state_code=" << state_code;
+  }
+  EXPECT_STREQ(sportStateName(2009U), "jump run");
+  EXPECT_STREQ(sportStateName(2011U), "handstand");
+  EXPECT_STREQ(sportStateName(9999U), "unknown");
+}
+
+TEST(SportStateSafety, LatchesAnUnsafeTransientUntilConsumed)
+{
+  UnsafeSportStateLatch latch;
+  latch.observe(SportStateSample{2011U, 0U, 0U});
+  latch.observe(SportStateSample{100U, 0U, 0U});
+
+  const auto unsafe = latch.take();
+  ASSERT_TRUE(unsafe.has_value());
+  EXPECT_EQ(unsafe->state_code, 2011U);
+  EXPECT_FALSE(latch.take().has_value());
 }
 
 TEST(CompletedGoal, EmptyPathDoesNotReauthorizeTheCompletedGeneration)
@@ -649,11 +678,11 @@ TEST(CompletedGoal, EmptyPathDoesNotReauthorizeTheCompletedGeneration)
 
   // An empty Path does not call clear(); the completed generation remains blocked.
   EXPECT_TRUE(latch.active());
-  EXPECT_FALSE(latch.accept(42));
+  EXPECT_EQ(latch.evaluate(42), GoalGenerationDecision::kCompletedReplay);
 
   latch.clear();
   EXPECT_FALSE(latch.active());
-  EXPECT_TRUE(latch.accept(42));
+  EXPECT_EQ(latch.evaluate(42), GoalGenerationDecision::kAccept);
 }
 
 TEST(MotionAuthorization, StartsDisarmedAndCanArmWhileWaitingForAPath)

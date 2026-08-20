@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -10,8 +12,10 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_srvs/srv/set_bool.hpp"
-#include "unitree/robot/go2/sport/sport_client.hpp"
+#include "unitree/idl/go2/SportModeState_.hpp"
+#include "unitree/robot/channel/channel_subscriber.hpp"
 #include "utree_go2_sdk2_bridge/control_safety.hpp"
+#include "utree_go2_sdk2_bridge/sdk_command_worker.hpp"
 
 namespace utree_go2_sdk2_bridge
 {
@@ -28,13 +32,17 @@ public:
 private:
   void pathCallback(const nav_msgs::msg::Path::SharedPtr msg);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
+  void sportStateCallback(const void * message);
   void enableCallback(
     const std_srvs::srv::SetBool::Request::SharedPtr request,
     std_srvs::srv::SetBool::Response::SharedPtr response);
   void controlTick();
   void controlTickImpl();
+  bool processSdkCompletions();
   void failSafe(const char * reason);
   bool waitForNewPath(const char * reason);
+  bool holdZeroMoveWhileWaiting(const char * reason);
+  bool sendMove(double vx, double vy, double yaw_rate);
   bool stopRobot(const char * reason) noexcept;
   bool cachedPathValid() const;
   bool cachedOdomValid() const;
@@ -47,6 +55,7 @@ private:
     const rclcpp::Time & message_time,
     const rclcpp::Time & current_time,
     double timeout) const;
+  std::optional<SportStateSample> freshSportState();
   bool lowcmdPublisherPresent();
 
   std::string network_interface_;
@@ -54,11 +63,14 @@ private:
   std::string body_frame_;
   int domain_id_{0};
   MotionAuthorization motion_authorization_;
-  // Cleared only after SportClient confirms StopMove.
+  // Cleared only after the SDK worker confirms StopMove.
   bool command_active_{false};
+  std::optional<SdkCommandSequence> pending_stop_sequence_;
+  std::string pending_stop_reason_;
   double command_rate_{20.0};
   double path_timeout_{1.0};
   double odom_timeout_{0.5};
+  double sport_state_timeout_{1.0};
   double timestamp_future_tolerance_{0.2};
   double lookahead_distance_{0.6};
   double goal_position_tolerance_{0.15};
@@ -77,7 +89,13 @@ private:
   std::optional<std::int64_t> path_goal_generation_;
   nav_msgs::msg::Path::SharedPtr path_;
   nav_msgs::msg::Odometry::SharedPtr odom_;
-  std::unique_ptr<unitree::robot::go2::SportClient> sport_client_;
+  mutable std::mutex sport_state_mutex_;
+  UnsafeSportStateLatch unsafe_sport_state_latch_;
+  std::optional<SportStateSample> sport_state_;
+  std::chrono::steady_clock::time_point sport_state_received_at_{};
+  std::unique_ptr<SdkCommandWorker> command_worker_;
+  unitree::robot::ChannelSubscriberPtr<unitree_go::msg::dds_::SportModeState_>
+  sport_state_sub_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr command_pub_;

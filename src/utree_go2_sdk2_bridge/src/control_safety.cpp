@@ -23,6 +23,57 @@ bool inPositiveRange(double value, double maximum)
 }
 }  // namespace
 
+bool isExecutableSportState(std::uint32_t state_code)
+{
+  return state_code == 100U || state_code == 1013U;
+}
+
+const char * sportStateName(std::uint32_t state_code)
+{
+  switch (state_code) {
+    case 100U: return "agile";
+    case 1001U: return "damping";
+    case 1002U: return "standing lock";
+    case 1004U:
+    case 2006U: return "crouch";
+    case 1006U: return "special action";
+    case 1007U: return "sit";
+    case 1008U: return "front jump";
+    case 1009U: return "front pounce";
+    case 1013U: return "balance standing";
+    case 1015U: return "regular walking";
+    case 1016U: return "regular running";
+    case 1017U: return "regular endurance";
+    case 1091U: return "pose";
+    case 2007U: return "avoidance";
+    case 2008U: return "bound run";
+    case 2009U: return "jump run";
+    case 2010U: return "classic walk";
+    case 2011U: return "handstand";
+    case 2012U: return "front flip";
+    case 2013U: return "back flip";
+    case 2014U: return "left flip";
+    case 2016U: return "cross step";
+    case 2017U: return "upright";
+    case 2019U: return "towing";
+    default: return "unknown";
+  }
+}
+
+void UnsafeSportStateLatch::observe(const SportStateSample & sample)
+{
+  if (!isExecutableSportState(sample.state_code) && !pending_sample_) {
+    pending_sample_ = sample;
+  }
+}
+
+std::optional<SportStateSample> UnsafeSportStateLatch::take()
+{
+  const auto sample = pending_sample_;
+  pending_sample_.reset();
+  return sample;
+}
+
 MotionAuthorizationState MotionAuthorization::state() const
 {
   return state_;
@@ -75,6 +126,9 @@ std::string validateControlParameters(const ControlParameters & parameters)
   }
   if (!inPositiveRange(parameters.odom_timeout, 60.0)) {
     return "odom_timeout must be finite and in (0, 60] seconds";
+  }
+  if (!inPositiveRange(parameters.sport_state_timeout, 60.0)) {
+    return "sport_state_timeout must be finite and in (0, 60] seconds";
   }
   if (!inClosedRange(parameters.timestamp_future_tolerance, 0.0, 5.0)) {
     return "timestamp_future_tolerance must be finite and in [0, 5] seconds";
@@ -556,20 +610,21 @@ void CompletedGoalLatch::markCompleted(std::int64_t goal_generation)
   completed_generation_ = goal_generation;
 }
 
-bool CompletedGoalLatch::accept(std::int64_t candidate_generation)
+GoalGenerationDecision CompletedGoalLatch::evaluate(std::int64_t candidate_generation)
 {
   if (candidate_generation <= 0) {
-    return false;
+    return GoalGenerationDecision::kInvalid;
   }
   if (!latest_generation_ || candidate_generation > *latest_generation_) {
     latest_generation_ = candidate_generation;
     completed_generation_.reset();
-    return true;
+    return GoalGenerationDecision::kAccept;
   }
   if (candidate_generation < *latest_generation_) {
-    return false;
+    return GoalGenerationDecision::kSuperseded;
   }
-  return !completed_generation_ || candidate_generation != *completed_generation_;
+  return completed_generation_ && candidate_generation == *completed_generation_ ?
+         GoalGenerationDecision::kCompletedReplay : GoalGenerationDecision::kAccept;
 }
 
 void CompletedGoalLatch::clear()

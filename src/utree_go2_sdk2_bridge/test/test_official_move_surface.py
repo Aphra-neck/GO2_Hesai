@@ -11,6 +11,12 @@ NODE_SOURCES = (
 )
 DIRECT_LAUNCH = PACKAGE_ROOT / "launch" / "go2_sdk2_direct_bridge.launch.py"
 DIRECT_START = PACKAGE_ROOT.parents[1] / "shell" / "start_sdk2_direct_bridge.sh"
+DIRECT_HEADER = (
+    PACKAGE_ROOT
+    / "include"
+    / "utree_go2_sdk2_bridge"
+    / "simple_goal_executor_node.hpp"
+)
 
 
 class OfficialMoveSurfaceTest(unittest.TestCase):
@@ -67,9 +73,18 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
         self.assertNotIn('stopRobot("waiting for goal")', source)
         self.assertNotIn('stopRobot("simple goal reached")', source)
         self.assertIn("Hold a zero-speed Move while armed between goals", source)
+        self.assertNotIn("if (command_active_) {\n      (void)sendMove(0.0", source)
+
+    def test_path_bridge_keeps_zero_move_stream_while_armed_without_a_path(self):
+        source = NODE_SOURCES[0].read_text(encoding="utf-8")
+
+        self.assertIn("holdZeroMoveWhileWaiting", source)
+        self.assertIn("sendMove(0.0, 0.0, 0.0", source)
+        self.assertNotIn('waitForNewPath("waiting for a path")', source)
 
     def test_direct_bridge_can_recover_after_passing_a_waypoint(self):
         source = NODE_SOURCES[1].read_text(encoding="utf-8")
+        header = DIRECT_HEADER.read_text(encoding="utf-8")
         controller = (
             PACKAGE_ROOT / "src" / "simple_navigation_controller.cpp"
         ).read_text(encoding="utf-8")
@@ -80,7 +95,7 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
         )
         self.assertIn("targetDeltaInBody(", controller)
         self.assertIn("progress >= segment_length", controller)
-        self.assertIn("SimpleNavigationController", source)
+        self.assertIn("SimpleNavigationController navigation_", header)
 
 
 if __name__ == "__main__":

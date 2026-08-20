@@ -100,7 +100,7 @@ TEST(SimpleNavigationController, OvershotWaypointAdvancesToNextSegment)
   EXPECT_GT(aligned.vy, 0.0);
 }
 
-TEST(SimpleNavigationController, CornerEmitsNextTranslationInSameTick)
+TEST(SimpleNavigationController, CornerEmitsNextAlignmentInSameTick)
 {
   SimpleNavigationController controller;
   controller.setConfig(testConfig());
@@ -110,16 +110,17 @@ TEST(SimpleNavigationController, CornerEmitsNextTranslationInSameTick)
   ASSERT_TRUE(first.valid);
   ASSERT_GT(first.vx, 0.0);
 
-  // The corner is already reached at the beginning of this update.  The
-  // controller must advance and emit the next leg immediately, rather than
-  // returning an invalid/zero command for one 20 Hz cycle.
+  // The corner is already reached at the beginning of this update. The
+  // controller must advance and emit the next leg's alignment command in the
+  // same tick, without translating before the body faces that leg.
   const auto corner = controller.update({2.0, 0.0, 0.0});
   EXPECT_TRUE(corner.valid);
-  EXPECT_TRUE(corner.segment_aligned);
+  EXPECT_FALSE(corner.segment_aligned);
   EXPECT_EQ(corner.waypoints_reached, 1U);
-  EXPECT_EQ(corner.phase, SimpleNavigationPhase::kTranslateSegment);
-  EXPECT_GT(corner.vy, 0.0);
-  EXPECT_LE(std::abs(corner.vx), 1.0e-12);
+  EXPECT_EQ(corner.phase, SimpleNavigationPhase::kAlignSegment);
+  EXPECT_NEAR(corner.vx, 0.0, 1.0e-12);
+  EXPECT_NEAR(corner.vy, 0.0, 1.0e-12);
+  EXPECT_GT(corner.yaw_rate, 0.0);
 }
 
 TEST(SimpleNavigationController, FinalTargetOvershootCommandsBackInsteadOfCompleting)

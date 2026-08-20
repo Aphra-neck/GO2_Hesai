@@ -229,9 +229,7 @@ void SimpleGoalExecutorNode::controlTickImpl()
   if (!navigation_.hasGoal()) {
     // Hold a zero-speed Move while armed between goals. StopMove() can leave
     // this Go2 firmware waiting for a fresh locomotion wake-up.
-    if (command_active_) {
-      (void)sendMove(0.0, 0.0, 0.0);
-    }
+    (void)sendMove(0.0, 0.0, 0.0);
     return;
   }
   const auto yaw = currentYaw();
