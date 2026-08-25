@@ -26,8 +26,13 @@ using SportState = unitree_go::msg::dds_::SportModeState_;
 
 volatile std::sig_atomic_t keep_running = 1;
 std::atomic<std::uint64_t> sport_frames{0};
+std::atomic<std::uint64_t> lowstate_frames{0};
 std::atomic<std::uint64_t> remote_frames{0};
+std::atomic<std::uint64_t> invalid_remote_frames{0};
+std::atomic<std::int64_t> last_invalid_remote_diagnostic_ns{0};
 std::mutex output_mutex;
+
+constexpr std::int64_t kInvalidRemoteDiagnosticIntervalNs = 1000000000LL;
 
 std::int64_t monotonicNanoseconds()
 {
@@ -62,6 +67,21 @@ void emitLifecycle(const char * event)
   output << "{\"schema\":1,\"source\":\"reader\",\"event\":\""
          << event << "\",\"mono_ns\":" << monotonicNanoseconds() << '}';
   emitLine(output.str());
+}
+
+bool claimInvalidRemoteDiagnostic(const std::int64_t now_ns)
+{
+  auto previous_ns = last_invalid_remote_diagnostic_ns.load(std::memory_order_relaxed);
+  while (previous_ns == 0 ||
+    now_ns - previous_ns >= kInvalidRemoteDiagnosticIntervalNs)
+  {
+    if (last_invalid_remote_diagnostic_ns.compare_exchange_weak(
+        previous_ns, now_ns, std::memory_order_relaxed))
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
 void sportCallback(const void * data)
@@ -102,11 +122,38 @@ void lowStateCallback(const void * data)
     return;
   }
   const auto & message = *static_cast<const LowState *>(data);
+  const auto lowstate_sequence =
+    lowstate_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+  const auto callback_time_ns = monotonicNanoseconds();
   const std::array<std::uint8_t, 40> bytes = message.wireless_remote();
   const std::uint16_t packet_head =
     static_cast<std::uint16_t>(bytes[0]) |
     (static_cast<std::uint16_t>(bytes[1]) << 8U);
   if (packet_head != 0x5551U) {
+    const auto invalid_sequence =
+      invalid_remote_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (claimInvalidRemoteDiagnostic(callback_time_ns)) {
+      std::size_t nonzero_bytes = 0;
+      for (const auto byte : bytes) {
+        if (byte != 0U) {
+          ++nonzero_bytes;
+        }
+      }
+      std::ostringstream output;
+      output << "{\"schema\":1,\"source\":\"lowstate\""
+             << ",\"topic\":\"rt/lowstate\""
+             << ",\"field\":\"wireless_remote\""
+             << ",\"event\":\"invalid_wireless_remote_packet\""
+             << ",\"mono_ns\":" << callback_time_ns
+             << ",\"lowstate_frames\":" << lowstate_sequence
+             << ",\"invalid_remote_frames\":" << invalid_sequence
+             << ",\"valid_remote_frames\":"
+             << remote_frames.load(std::memory_order_relaxed)
+             << ",\"packet_head\":" << packet_head
+             << ",\"nonzero_bytes\":" << nonzero_bytes
+             << '}';
+      emitLine(output.str());
+    }
     return;
   }
   const auto sequence = remote_frames.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -119,7 +166,7 @@ void lowStateCallback(const void * data)
          << "{\"schema\":1,\"source\":\"remote\""
          << ",\"topic\":\"rt/lowstate\""
          << ",\"field\":\"wireless_remote\""
-         << ",\"mono_ns\":" << monotonicNanoseconds()
+         << ",\"mono_ns\":" << callback_time_ns
          << ",\"sequence\":" << sequence
          << ",\"packet_head\":" << packet_head
          << ",\"buttons\":" << remote.RF_RX.btn.value
@@ -172,12 +219,17 @@ int main(int argc, char ** argv)
   }
 
   if (sport_frames.load(std::memory_order_relaxed) == 0U ||
+    lowstate_frames.load(std::memory_order_relaxed) == 0U ||
     remote_frames.load(std::memory_order_relaxed) == 0U)
   {
     std::cerr << "reader_missing_stream sport_frames="
               << sport_frames.load(std::memory_order_relaxed)
+              << " lowstate_frames="
+              << lowstate_frames.load(std::memory_order_relaxed)
               << " remote_frames="
-              << remote_frames.load(std::memory_order_relaxed) << '\n';
+              << remote_frames.load(std::memory_order_relaxed)
+              << " invalid_remote_frames="
+              << invalid_remote_frames.load(std::memory_order_relaxed) << '\n';
     return 3;
   }
   return 0;

@@ -1128,6 +1128,13 @@ class EventStore:
         with self._lock:
             return any(event.get("source") == source for event in self._events)
 
+    def latest_source(self, source: str) -> dict[str, Any] | None:
+        with self._lock:
+            for event in reversed(self._events):
+                if event.get("source") == source:
+                    return dict(event)
+        return None
+
     def limit_reason(self) -> str | None:
         with self._lock:
             return self._limit_reason
@@ -1195,6 +1202,40 @@ def _reader_error_thread(stream: Any, errors: BoundedDiagnosticStore) -> None:
         line = line.strip()
         if line:
             errors.append(line)
+
+
+def _remote_discovery_problem(store: EventStore) -> str | None:
+    if store.has_source("remote"):
+        return None
+    lowstate = store.latest_source("lowstate")
+    if lowstate is None:
+        return "missing rt/lowstate"
+
+    def nonnegative_integer(name: str) -> int | None:
+        value = lowstate.get(name)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        return value
+
+    details = []
+    lowstate_count = nonnegative_integer("lowstate_frames")
+    invalid_count = nonnegative_integer("invalid_remote_frames")
+    packet_head = nonnegative_integer("packet_head")
+    nonzero_bytes = nonnegative_integer("nonzero_bytes")
+    if lowstate_count is not None:
+        details.append(f"observed_lowstate_frames>={lowstate_count}")
+    if invalid_count is not None:
+        details.append(f"invalid_remote_frames>={invalid_count}")
+    if packet_head is not None:
+        details.append(f"latest_packet_head=0x{packet_head:04x}")
+    if nonzero_bytes is not None:
+        details.append(f"latest_nonzero_bytes={nonzero_bytes}")
+    details.append("expected_packet_head=0x5551")
+    return (
+        "rt/lowstate present but wireless_remote packets are invalid ("
+        + ", ".join(details)
+        + ")"
+    )
 
 
 def capture_live(
@@ -1388,16 +1429,17 @@ def capture_live(
                 discovered = True
                 break
         if capture_invalidation_reason is None and not discovered:
-            missing = []
+            problems = []
             if node.count_publishers("/sdk2_command") == 0:
-                missing.append("/sdk2_command publisher")
+                problems.append("missing /sdk2_command publisher")
             if node.count_publishers("/lio/body_odom") == 0:
-                missing.append("/lio/body_odom publisher")
+                problems.append("missing /lio/body_odom publisher")
             if not store.has_source("sport"):
-                missing.append("rt/sportmodestate")
-            if not store.has_source("remote"):
-                missing.append("rt/lowstate.wireless_remote")
-            raise RuntimeError("discovery timeout; missing " + ", ".join(missing))
+                problems.append("missing rt/sportmodestate")
+            remote_problem = _remote_discovery_problem(store)
+            if remote_problem is not None:
+                problems.append(remote_problem)
+            raise RuntimeError("discovery timeout; " + "; ".join(problems))
 
         if capture_invalidation_reason is None:
             store.clear()

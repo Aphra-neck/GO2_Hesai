@@ -51,6 +51,12 @@ wrapper 只允许覆盖 `--duration` 和 `--discovery-timeout`；reader、网卡
 诊断文本合计最多 `4 MiB`。触发事件或诊断上限时会保存已采集的主事件证据和明确的截断原因，
 但结果标记为 `insufficient_capture`，不作为排除卡住的依据。
 
+若发现阶段超时，`missing rt/lowstate` 表示 SDK2 reader 没有收到任何 LowState；
+`rt/lowstate present but wireless_remote packets are invalid` 表示 LowState 正在到达，但 40 字节
+`wireless_remote` 字段没有出现要求的 `0x5551` 包头。后一种错误同时报告至少观察到的
+LowState/无效遥控帧数、最近包头和非零字节数，用于区分全零字段与格式不匹配；这种情况下
+继续增大发现超时不会让采集进入 `READY`。
+
 若采集期间 collector 停止、active-session 改变，或会话出现 `.uploaded` / `ended_at.txt`，
 探针会立即终止 reader 和 ROS 订阅，原子发布已捕获的证据文件，并在 `report.json` 写入
 `capture_invalidated`。这类运行返回非零，`required_streams_complete=false` 且

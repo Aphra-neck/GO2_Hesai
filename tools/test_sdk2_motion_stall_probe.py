@@ -22,6 +22,7 @@ from sdk2_motion_stall_probe import (
     EventStore,
     MAX_CAPTURE_BYTES,
     SessionWatch,
+    _remote_discovery_problem,
     analyze_events,
     capture_live,
     main,
@@ -949,6 +950,41 @@ class ReadOnlySurfaceTests(unittest.TestCase):
         self.assertEqual(with_newline.snapshot(), [sample])
         self.assertIsNone(with_newline.limit_reason())
 
+    def test_remote_discovery_reports_missing_lowstate_separately(self) -> None:
+        store = EventStore()
+
+        self.assertEqual(_remote_discovery_problem(store), "missing rt/lowstate")
+
+    def test_remote_discovery_reports_invalid_wireless_packet_details(self) -> None:
+        store = EventStore()
+        store.append(
+            event(
+                "lowstate",
+                1.0,
+                lowstate_frames=1450,
+                invalid_remote_frames=1450,
+                packet_head=0,
+                nonzero_bytes=0,
+            )
+        )
+
+        problem = _remote_discovery_problem(store)
+
+        self.assertIsNotNone(problem)
+        assert problem is not None
+        self.assertIn("rt/lowstate present", problem)
+        self.assertIn("observed_lowstate_frames>=1450", problem)
+        self.assertIn("invalid_remote_frames>=1450", problem)
+        self.assertIn("latest_packet_head=0x0000", problem)
+        self.assertIn("latest_nonzero_bytes=0", problem)
+        self.assertIn("expected_packet_head=0x5551", problem)
+
+    def test_remote_discovery_accepts_a_valid_remote_source(self) -> None:
+        store = EventStore()
+        store.append(event("remote", 1.0))
+
+        self.assertIsNone(_remote_discovery_problem(store))
+
     def test_cli_does_not_abbreviate_reserved_live_options(self) -> None:
         with self.assertRaises(SystemExit):
             parse_args(
@@ -1043,9 +1079,14 @@ class ReadOnlySurfaceTests(unittest.TestCase):
         self.assertIn('"rt/sportmodestate"', reader)
         self.assertIn('"rt/lowstate"', reader)
         self.assertIn("message.wireless_remote()", reader)
+        self.assertIn("lowstate_frames.fetch_add", reader)
+        self.assertIn("invalid_remote_frames.fetch_add", reader)
+        self.assertIn('"{\\"schema\\":1,\\"source\\":\\"lowstate\\""', reader)
         gate_index = reader.index("if (packet_head != 0x5551U)")
         gate_return_index = reader.index("return;", gate_index)
-        sequence_index = reader.index("remote_frames.fetch_add", gate_index)
+        sequence_index = reader.index(
+            "const auto sequence = remote_frames.fetch_add", gate_index
+        )
         decode_index = reader.index("std::memcpy", gate_index)
         emit_index = reader.index('"{\\"schema\\":1,\\"source\\":\\"remote\\""')
         self.assertLess(gate_index, gate_return_index)
