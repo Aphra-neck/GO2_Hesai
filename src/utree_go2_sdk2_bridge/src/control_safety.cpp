@@ -462,6 +462,51 @@ std::optional<VelocityCommand> makeHeadingAwareCommand(
     raw_yaw_rate, max_vx, max_vy, max_yaw_rate);
 }
 
+const char * pathTrackingFailureName(PathTrackingFailure failure)
+{
+  switch (failure) {
+    case PathTrackingFailure::kNone:
+      return "none";
+    case PathTrackingFailure::kInvalidInput:
+      return "invalid_input";
+    case PathTrackingFailure::kInvalidPose:
+      return "invalid_pose";
+    case PathTrackingFailure::kInvalidTrackerState:
+      return "invalid_tracker_state";
+    case PathTrackingFailure::kNonFiniteFinalDistance:
+      return "non_finite_final_distance";
+    case PathTrackingFailure::kFinalPoseTooFar:
+      return "final_pose_too_far";
+    case PathTrackingFailure::kNonFiniteSegmentLength:
+      return "non_finite_segment_length";
+    case PathTrackingFailure::kNonFiniteEdgeLength:
+      return "non_finite_edge_length";
+    case PathTrackingFailure::kNonFiniteWaypointDistance:
+      return "non_finite_waypoint_distance";
+    case PathTrackingFailure::kRotationWaypointTooFar:
+      return "rotation_waypoint_too_far";
+    case PathTrackingFailure::kInvalidRotationQuaternion:
+      return "invalid_rotation_quaternion";
+    case PathTrackingFailure::kNonFiniteYawError:
+      return "non_finite_yaw_error";
+    case PathTrackingFailure::kNonFiniteProgress:
+      return "non_finite_progress";
+    case PathTrackingFailure::kNonFiniteProjectionDistance:
+      return "non_finite_projection_distance";
+    case PathTrackingFailure::kProjectionTooFar:
+      return "projection_too_far";
+    case PathTrackingFailure::kDegenerateProgressEdge:
+      return "degenerate_progress_edge";
+    case PathTrackingFailure::kInvalidPlannedYaw:
+      return "invalid_planned_yaw";
+    case PathTrackingFailure::kNonFiniteForwardAlignment:
+      return "non_finite_forward_alignment";
+    case PathTrackingFailure::kIterationLimit:
+      return "iteration_limit";
+  }
+  return "unknown";
+}
+
 void PathProgressTracker::reset()
 {
   initialized_ = false;
@@ -475,22 +520,54 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
   double current_y,
   double current_yaw,
   double lookahead_distance,
-  double explicit_rotation_tolerance)
+  double explicit_rotation_tolerance,
+  PathTrackingDiagnostics * diagnostics)
 {
   constexpr double same_position_tolerance = 1.0e-6;
   constexpr double same_direction_tolerance = 1.0e-6;
+  constexpr double diagnostic_nan = std::numeric_limits<double>::quiet_NaN();
+  if (diagnostics != nullptr) {
+    *diagnostics = PathTrackingDiagnostics{};
+    diagnostics->tracker_initialized = initialized_;
+    diagnostics->path_pose_count = poses.size();
+    diagnostics->pose_index = pose_index_;
+    diagnostics->segment_fraction = segment_fraction_;
+    diagnostics->current_x = current_x;
+    diagnostics->current_y = current_y;
+    diagnostics->current_yaw = current_yaw;
+    if (!poses.empty()) {
+      diagnostics->path_start_x = poses.front().pose.position.x;
+      diagnostics->path_start_y = poses.front().pose.position.y;
+      diagnostics->path_final_x = poses.back().pose.position.x;
+      diagnostics->path_final_y = poses.back().pose.position.y;
+    }
+  }
+  const auto sync_cursor_diagnostics = [this, diagnostics]() {
+      if (diagnostics != nullptr) {
+        diagnostics->tracker_initialized = initialized_;
+        diagnostics->pose_index = pose_index_;
+        diagnostics->segment_fraction = segment_fraction_;
+      }
+    };
+  const auto fail = [&sync_cursor_diagnostics, diagnostics](PathTrackingFailure failure) {
+      sync_cursor_diagnostics();
+      if (diagnostics != nullptr) {
+        diagnostics->failure = failure;
+      }
+      return std::optional<PathTrackingTarget>{};
+    };
   if (poses.empty() || !std::isfinite(current_x) || !std::isfinite(current_y) ||
     !std::isfinite(current_yaw) ||
     !inPositiveRange(lookahead_distance, std::numeric_limits<double>::max()) ||
     !inClosedRange(explicit_rotation_tolerance, 0.0, kPi))
   {
-    return std::nullopt;
+    return fail(PathTrackingFailure::kInvalidInput);
   }
   if (!std::all_of(
       poses.begin(), poses.end(),
       [](const geometry_msgs::msg::PoseStamped & pose) {return isFinitePose(pose.pose);}))
   {
-    return std::nullopt;
+    return fail(PathTrackingFailure::kInvalidPose);
   }
 
   if (!initialized_) {
@@ -499,8 +576,9 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
     segment_fraction_ = 0.0;
   }
   if (pose_index_ >= poses.size() || !inClosedRange(segment_fraction_, 0.0, 1.0)) {
-    return std::nullopt;
+    return fail(PathTrackingFailure::kInvalidTrackerState);
   }
+  sync_cursor_diagnostics();
 
   const auto has_pending_rotation = [&poses](std::size_t first_pose) {
       for (std::size_t index = first_pose; index + 1U < poses.size(); ++index) {
@@ -518,11 +596,35 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
   // Each pass either consumes one reached corner/rotation or returns a target.
   // The bound prevents malformed zero-length paths from looping indefinitely.
   for (std::size_t pass = 0U; pass <= poses.size(); ++pass) {
+    if (diagnostics != nullptr) {
+      diagnostics->block_end = pose_index_;
+      diagnostics->segment_start_x = diagnostic_nan;
+      diagnostics->segment_start_y = diagnostic_nan;
+      diagnostics->segment_end_x = diagnostic_nan;
+      diagnostics->segment_end_y = diagnostic_nan;
+      diagnostics->segment_length = diagnostic_nan;
+      diagnostics->block_length = diagnostic_nan;
+      diagnostics->previous_progress = diagnostic_nan;
+      diagnostics->current_progress = diagnostic_nan;
+      diagnostics->maximum_progress = diagnostic_nan;
+      diagnostics->projected_progress = diagnostic_nan;
+      diagnostics->cross_track = diagnostic_nan;
+      diagnostics->projection_distance = diagnostic_nan;
+      diagnostics->waypoint_distance = diagnostic_nan;
+      diagnostics->final_distance = diagnostic_nan;
+    }
+    sync_cursor_diagnostics();
     if (pose_index_ + 1U >= poses.size()) {
       const auto & final = poses.back().pose.position;
       const double final_distance = std::hypot(current_x - final.x, current_y - final.y);
+      if (diagnostics != nullptr) {
+        diagnostics->final_distance = final_distance;
+      }
       if (!std::isfinite(final_distance) || final_distance > kMaximumPathCrossTrack) {
-        return std::nullopt;
+        return fail(
+          !std::isfinite(final_distance) ?
+          PathTrackingFailure::kNonFiniteFinalDistance :
+          PathTrackingFailure::kFinalPoseTooFar);
       }
       return PathTrackingTarget{
         final.x, final.y, pose_index_, segment_fraction_, poses.size() - 1U,
@@ -534,26 +636,39 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
     const double first_dx = next.x - start.x;
     const double first_dy = next.y - start.y;
     const double first_length = std::hypot(first_dx, first_dy);
+    if (diagnostics != nullptr) {
+      diagnostics->segment_start_x = start.x;
+      diagnostics->segment_start_y = start.y;
+      diagnostics->segment_end_x = next.x;
+      diagnostics->segment_end_y = next.y;
+      diagnostics->segment_length = first_length;
+    }
     if (!std::isfinite(first_length)) {
-      return std::nullopt;
+      return fail(PathTrackingFailure::kNonFiniteSegmentLength);
     }
 
     if (first_length <= same_position_tolerance) {
       const double waypoint_distance = std::hypot(
         current_x - start.x, current_y - start.y);
+      if (diagnostics != nullptr) {
+        diagnostics->waypoint_distance = waypoint_distance;
+      }
       if (!std::isfinite(waypoint_distance) ||
         waypoint_distance > kRotationWaypointTolerance)
       {
-        return std::nullopt;
+        return fail(
+          !std::isfinite(waypoint_distance) ?
+          PathTrackingFailure::kNonFiniteWaypointDistance :
+          PathTrackingFailure::kRotationWaypointTooFar);
       }
       const auto target_yaw = quaternionYaw(
         poses[pose_index_ + 1U].pose.orientation);
       if (!target_yaw) {
-        return std::nullopt;
+        return fail(PathTrackingFailure::kInvalidRotationQuaternion);
       }
       const double yaw_error = std::remainder(*target_yaw - current_yaw, 2.0 * kPi);
       if (!std::isfinite(yaw_error)) {
-        return std::nullopt;
+        return fail(PathTrackingFailure::kNonFiniteYawError);
       }
       if (std::abs(yaw_error) > explicit_rotation_tolerance) {
         return PathTrackingTarget{
@@ -576,7 +691,16 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       const double edge_dy = edge_end.y - edge_start.y;
       const double edge_length = std::hypot(edge_dx, edge_dy);
       if (!std::isfinite(edge_length)) {
-        return std::nullopt;
+        if (diagnostics != nullptr) {
+          diagnostics->block_end = block_end;
+          diagnostics->segment_start_x = edge_start.x;
+          diagnostics->segment_start_y = edge_start.y;
+          diagnostics->segment_end_x = edge_end.x;
+          diagnostics->segment_end_y = edge_end.y;
+          diagnostics->segment_length = edge_length;
+          diagnostics->block_length = block_length;
+        }
+        return fail(PathTrackingFailure::kNonFiniteEdgeLength);
       }
       if (edge_length <= same_position_tolerance) {
         break;
@@ -597,8 +721,15 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       current_offset_x * direction_x + current_offset_y * direction_y;
     const double cross_track = std::abs(
       -current_offset_x * direction_y + current_offset_y * direction_x);
+    if (diagnostics != nullptr) {
+      diagnostics->block_end = block_end;
+      diagnostics->block_length = block_length;
+      diagnostics->previous_progress = previous_progress;
+      diagnostics->current_progress = current_progress;
+      diagnostics->cross_track = cross_track;
+    }
     if (!std::isfinite(current_progress) || !std::isfinite(cross_track)) {
-      return std::nullopt;
+      return fail(PathTrackingFailure::kNonFiniteProgress);
     }
 
     const double maximum_progress = std::min(
@@ -609,10 +740,18 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
     const double projected_y = start.y + direction_y * projected_progress;
     const double projection_distance = std::hypot(
       current_x - projected_x, current_y - projected_y);
+    if (diagnostics != nullptr) {
+      diagnostics->maximum_progress = maximum_progress;
+      diagnostics->projected_progress = projected_progress;
+      diagnostics->projection_distance = projection_distance;
+    }
     if (!std::isfinite(projection_distance) ||
       projection_distance > kMaximumPathCrossTrack)
     {
-      return std::nullopt;
+      return fail(
+        !std::isfinite(projection_distance) ?
+        PathTrackingFailure::kNonFiniteProjectionDistance :
+        PathTrackingFailure::kProjectionTooFar);
     }
 
     const bool reached_block_end =
@@ -643,21 +782,22 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
     const double progress_edge_length = std::hypot(
       progress_end.x - progress_start.x, progress_end.y - progress_start.y);
     if (progress_edge_length <= same_position_tolerance) {
-      return std::nullopt;
+      return fail(PathTrackingFailure::kDegenerateProgressEdge);
     }
     pose_index_ = progress_pose;
     segment_fraction_ = std::clamp(progress_on_edge / progress_edge_length, 0.0, 1.0);
+    sync_cursor_diagnostics();
 
     const double target_progress = std::min(
       projected_progress + lookahead_distance, block_length);
     const auto planned_yaw = quaternionYaw(poses[pose_index_].pose.orientation);
     if (!planned_yaw) {
-      return std::nullopt;
+      return fail(PathTrackingFailure::kInvalidPlannedYaw);
     }
     const double forward_alignment =
       std::cos(*planned_yaw) * direction_x + std::sin(*planned_yaw) * direction_y;
     if (!std::isfinite(forward_alignment)) {
-      return std::nullopt;
+      return fail(PathTrackingFailure::kNonFiniteForwardAlignment);
     }
     const PlannedTranslationDirection translation_direction =
       std::abs(forward_alignment) <= kLateralForwardAlignmentTolerance ?
@@ -671,7 +811,7 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       has_pending_rotation(pose_index_),
       translation_direction};
   }
-  return std::nullopt;
+  return fail(PathTrackingFailure::kIterationLimit);
 }
 
 std::optional<double> filterLongitudinalCommand(

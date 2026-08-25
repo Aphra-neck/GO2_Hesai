@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -118,6 +119,64 @@ struct PathTrackingTarget
   PlannedTranslationDirection translation_direction;
 };
 
+enum class PathTrackingFailure
+{
+  kNone,
+  kInvalidInput,
+  kInvalidPose,
+  kInvalidTrackerState,
+  kNonFiniteFinalDistance,
+  kFinalPoseTooFar,
+  kNonFiniteSegmentLength,
+  kNonFiniteEdgeLength,
+  kNonFiniteWaypointDistance,
+  kRotationWaypointTooFar,
+  kInvalidRotationQuaternion,
+  kNonFiniteYawError,
+  kNonFiniteProgress,
+  kNonFiniteProjectionDistance,
+  kProjectionTooFar,
+  kDegenerateProgressEdge,
+  kInvalidPlannedYaw,
+  kNonFiniteForwardAlignment,
+  kIterationLimit,
+};
+
+const char * pathTrackingFailureName(PathTrackingFailure failure);
+
+// Captures the exact fail-closed branch and the geometric values available at
+// that branch. It is diagnostic-only and does not participate in decisions.
+struct PathTrackingDiagnostics
+{
+  PathTrackingFailure failure{PathTrackingFailure::kNone};
+  bool tracker_initialized{false};
+  std::size_t path_pose_count{0U};
+  std::size_t pose_index{0U};
+  std::size_t block_end{0U};
+  double segment_fraction{0.0};
+  double current_x{std::numeric_limits<double>::quiet_NaN()};
+  double current_y{std::numeric_limits<double>::quiet_NaN()};
+  double current_yaw{std::numeric_limits<double>::quiet_NaN()};
+  double path_start_x{std::numeric_limits<double>::quiet_NaN()};
+  double path_start_y{std::numeric_limits<double>::quiet_NaN()};
+  double path_final_x{std::numeric_limits<double>::quiet_NaN()};
+  double path_final_y{std::numeric_limits<double>::quiet_NaN()};
+  double segment_start_x{std::numeric_limits<double>::quiet_NaN()};
+  double segment_start_y{std::numeric_limits<double>::quiet_NaN()};
+  double segment_end_x{std::numeric_limits<double>::quiet_NaN()};
+  double segment_end_y{std::numeric_limits<double>::quiet_NaN()};
+  double segment_length{std::numeric_limits<double>::quiet_NaN()};
+  double block_length{std::numeric_limits<double>::quiet_NaN()};
+  double previous_progress{std::numeric_limits<double>::quiet_NaN()};
+  double current_progress{std::numeric_limits<double>::quiet_NaN()};
+  double maximum_progress{std::numeric_limits<double>::quiet_NaN()};
+  double projected_progress{std::numeric_limits<double>::quiet_NaN()};
+  double cross_track{std::numeric_limits<double>::quiet_NaN()};
+  double projection_distance{std::numeric_limits<double>::quiet_NaN()};
+  double waypoint_distance{std::numeric_limits<double>::quiet_NaN()};
+  double final_distance{std::numeric_limits<double>::quiet_NaN()};
+};
+
 // Maintains bounded, monotonic progress on one Path message. Reset it whenever
 // a new Path is accepted; the first update searches only the path prefix.
 class PathProgressTracker
@@ -131,7 +190,8 @@ public:
     double current_y,
     double current_yaw,
     double lookahead_distance,
-    double explicit_rotation_tolerance);
+    double explicit_rotation_tolerance,
+    PathTrackingDiagnostics * diagnostics = nullptr);
 
 private:
   bool initialized_{false};

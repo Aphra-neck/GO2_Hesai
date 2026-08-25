@@ -91,6 +91,7 @@ private:
   PathProgressTracker path_progress_tracker_;
   MotionResponseWatchdog motion_response_watchdog_;
   CompletedGoalLatch completed_goal_latch_;
+  std::uint64_t accepted_path_sequence_{0U};
   std::optional<std::int64_t> path_goal_generation_;
   nav_msgs::msg::Path::SharedPtr path_;
   nav_msgs::msg::Odometry::SharedPtr odom_;

@@ -289,6 +289,7 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
     }
     path_ = msg;
     path_goal_generation_ = *goal_generation;
+    ++accepted_path_sequence_;
     path_progress_tracker_.reset();
     motion_authorization_.pathAvailable();
   } catch (const std::exception & exception) {
@@ -594,16 +595,46 @@ void Go2Sdk2BridgeNode::controlTickImpl()
     failSafe("non-finite goal calculation");
     return;
   }
+  PathTrackingDiagnostics tracking_diagnostics;
   const auto tracking_target = path_progress_tracker_.update(
     path_->poses, current.position.x, current.position.y, *current_yaw,
-    lookahead_distance_, explicit_rotation_tolerance_);
+    lookahead_distance_, explicit_rotation_tolerance_, &tracking_diagnostics);
   const auto completion_ready = goalCompletionReady(
     goal_distance, goal_yaw_error, goal_position_tolerance_, goal_yaw_tolerance_,
     tracking_target);
   if (!completion_ready) {
+    const rclcpp::Time path_time(path_->header.stamp, current_time.get_clock_type());
+    const double path_age = messageAgeSeconds(path_time, current_time);
+    const std::size_t path_pose_count = path_->poses.size();
+    const std::int64_t goal_generation = path_goal_generation_.value_or(-1);
     failSafe("path progress could not be confirmed");
     RCLCPP_ERROR(
-      get_logger(), "Stopped because bounded monotonic path progress could not be confirmed");
+      get_logger(),
+      "Stopped because bounded monotonic path progress could not be confirmed: "
+      "failure=%s target=%s path_sequence=%llu goal_generation=%lld path_age=%.6f "
+      "pose_count=%zu tracker_initialized=%s tracker_pose=%zu tracker_fraction=%.9f "
+      "current_progress=%.9f cross_track=%.9f projection_distance=%.9f "
+      "waypoint_distance=%.9f final_distance=%.9f previous_progress=%.9f "
+      "maximum_progress=%.9f projected_progress=%.9f block_end=%zu block_length=%.9f "
+      "current=(%.9f,%.9f,%.9f) segment=(%.9f,%.9f)->(%.9f,%.9f) "
+      "path_start=(%.9f,%.9f) path_final=(%.9f,%.9f)",
+      pathTrackingFailureName(tracking_diagnostics.failure),
+      tracking_target ? "present" : "absent",
+      static_cast<unsigned long long>(accepted_path_sequence_),
+      static_cast<long long>(goal_generation), path_age, path_pose_count,
+      tracking_diagnostics.tracker_initialized ? "true" : "false",
+      tracking_diagnostics.pose_index, tracking_diagnostics.segment_fraction,
+      tracking_diagnostics.current_progress, tracking_diagnostics.cross_track,
+      tracking_diagnostics.projection_distance, tracking_diagnostics.waypoint_distance,
+      tracking_diagnostics.final_distance, tracking_diagnostics.previous_progress,
+      tracking_diagnostics.maximum_progress, tracking_diagnostics.projected_progress,
+      tracking_diagnostics.block_end, tracking_diagnostics.block_length,
+      tracking_diagnostics.current_x, tracking_diagnostics.current_y,
+      tracking_diagnostics.current_yaw, tracking_diagnostics.segment_start_x,
+      tracking_diagnostics.segment_start_y, tracking_diagnostics.segment_end_x,
+      tracking_diagnostics.segment_end_y, tracking_diagnostics.path_start_x,
+      tracking_diagnostics.path_start_y, tracking_diagnostics.path_final_x,
+      tracking_diagnostics.path_final_y);
     return;
   }
   if (*completion_ready) {

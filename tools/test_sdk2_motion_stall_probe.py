@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import io
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -22,6 +23,8 @@ from sdk2_motion_stall_probe import (
     EventStore,
     MAX_CAPTURE_BYTES,
     SessionWatch,
+    _goal_event,
+    _path_event,
     _remote_discovery_problem,
     analyze_events,
     capture_live,
@@ -77,6 +80,83 @@ def complete_remote_stream(
             )
         )
     return result
+
+
+def stamped_pose(
+    generation_ns: int, x: float, y: float, yaw: float = 0.0
+) -> object:
+    return types.SimpleNamespace(
+        header=types.SimpleNamespace(
+            stamp=types.SimpleNamespace(
+                sec=generation_ns // NS, nanosec=generation_ns % NS
+            ),
+            frame_id="world",
+        ),
+        pose=types.SimpleNamespace(
+            position=types.SimpleNamespace(x=x, y=y, z=0.0),
+            orientation=types.SimpleNamespace(
+                x=0.0,
+                y=0.0,
+                z=math.sin(yaw / 2.0),
+                w=math.cos(yaw / 2.0),
+            ),
+        ),
+    )
+
+
+class PlanningEvidenceTests(unittest.TestCase):
+    def test_goal_and_full_path_geometry_are_recorded(self) -> None:
+        generation_ns = 1_787_635_299_123_456_789
+        goal_message = stamped_pose(generation_ns, 1.25, -0.50, 0.25)
+        path_message = types.SimpleNamespace(
+            header=types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=1787635299, nanosec=200_000_000),
+                frame_id="world",
+            ),
+            poses=[
+                stamped_pose(generation_ns, 0.0, 0.0, 0.0),
+                stamped_pose(generation_ns, 0.2, -0.1, -0.5),
+            ],
+        )
+
+        goal = _goal_event(goal_message, 10 * NS)
+        path = _path_event(path_message, 11 * NS, 7)
+        report = analyze_events([goal, path])
+
+        self.assertEqual(goal["goal_generation_ns"], generation_ns)
+        self.assertAlmostEqual(goal["x"], 1.25)
+        self.assertAlmostEqual(goal["yaw"], 0.25)
+        self.assertEqual(path["sequence"], 7)
+        self.assertEqual(path["goal_generation_ns"], generation_ns)
+        self.assertEqual(path["pose_count"], 2)
+        self.assertEqual(path["poses"][1]["index"], 1)
+        self.assertAlmostEqual(path["poses"][1]["x"], 0.2)
+        self.assertAlmostEqual(path["poses"][1]["y"], -0.1)
+        self.assertAlmostEqual(path["poses"][1]["yaw"], -0.5)
+        self.assertIn("qx", path["poses"][1])
+        self.assertIn("qw", path["poses"][1])
+        self.assertEqual(report["planning"]["status"], "path_observed")
+        self.assertEqual(report["planning"]["goal_count"], 1)
+        self.assertEqual(report["planning"]["path_count"], 1)
+        self.assertEqual(report["planning"]["path_sequences"], [7])
+        self.assertFalse(report["required_streams_complete"])
+
+    def test_mixed_pose_generations_are_explicitly_invalid(self) -> None:
+        first_generation = 100 * NS
+        path_message = types.SimpleNamespace(
+            header=types.SimpleNamespace(
+                stamp=types.SimpleNamespace(sec=100, nanosec=1),
+                frame_id="world",
+            ),
+            poses=[
+                stamped_pose(first_generation, 0.0, 0.0),
+                stamped_pose(first_generation + 1, 0.1, 0.0),
+            ],
+        )
+
+        path = _path_event(path_message, 5 * NS, 1)
+
+        self.assertIsNone(path["goal_generation_ns"])
 
 
 class StallClassificationTests(unittest.TestCase):
@@ -787,17 +867,21 @@ class ReadOnlySurfaceTests(unittest.TestCase):
         rclpy_node = types.ModuleType("rclpy.node")
         rclpy_node.Node = FakeNode
         rclpy_qos = types.ModuleType("rclpy.qos")
-        rclpy_qos.DurabilityPolicy = types.SimpleNamespace(VOLATILE=1)
+        rclpy_qos.DurabilityPolicy = types.SimpleNamespace(
+            VOLATILE=1, TRANSIENT_LOCAL=2
+        )
         rclpy_qos.QoSProfile = lambda **_kwargs: object()
         rclpy_qos.ReliabilityPolicy = types.SimpleNamespace(
             RELIABLE=1, BEST_EFFORT=2
         )
         geometry_msgs = types.ModuleType("geometry_msgs")
         geometry_msgs_msg = types.ModuleType("geometry_msgs.msg")
+        geometry_msgs_msg.PoseStamped = object
         geometry_msgs_msg.TwistStamped = object
         nav_msgs = types.ModuleType("nav_msgs")
         nav_msgs_msg = types.ModuleType("nav_msgs.msg")
         nav_msgs_msg.Odometry = object
+        nav_msgs_msg.Path = object
         modules = {
             "rclpy": rclpy,
             "rclpy.node": rclpy_node,
@@ -1017,10 +1101,12 @@ class ReadOnlySurfaceTests(unittest.TestCase):
         rclpy_qos.ReliabilityPolicy = object
         geometry_msgs = types.ModuleType("geometry_msgs")
         geometry_msgs_msg = types.ModuleType("geometry_msgs.msg")
+        geometry_msgs_msg.PoseStamped = object
         geometry_msgs_msg.TwistStamped = object
         nav_msgs = types.ModuleType("nav_msgs")
         nav_msgs_msg = types.ModuleType("nav_msgs.msg")
         nav_msgs_msg.Odometry = object
+        nav_msgs_msg.Path = object
         modules = {
             "rclpy": rclpy,
             "rclpy.node": rclpy_node,
@@ -1113,7 +1199,12 @@ class ReadOnlySurfaceTests(unittest.TestCase):
         ]
         self.assertEqual(
             [node.func.attr for node in create_calls],
-            ["create_subscription", "create_subscription"],
+            [
+                "create_subscription",
+                "create_subscription",
+                "create_subscription",
+                "create_subscription",
+            ],
         )
 
     def test_replay_cli_is_deterministic_and_requires_no_ros_import(self) -> None:
@@ -1129,6 +1220,17 @@ class ReadOnlySurfaceTests(unittest.TestCase):
                 event("sport", timestamp, vx=0.1, vy=0.0, yaw_rate=0.0)
             )
         events.extend(complete_remote_stream(1.0))
+        events.append(event("goal", 0.10, goal_generation_ns=123))
+        events.append(
+            event(
+                "path",
+                0.20,
+                sequence=1,
+                goal_generation_ns=123,
+                pose_count=2,
+                poses=[],
+            )
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory) / "events.jsonl"
@@ -1145,6 +1247,7 @@ class ReadOnlySurfaceTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("required_streams=complete", completed.stdout)
         self.assertIn("stall=not_observed", completed.stdout)
+        self.assertIn("planning=path_observed goals=1 paths=1", completed.stdout)
 
 
 if __name__ == "__main__":

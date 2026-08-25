@@ -215,6 +215,31 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
         self.assertNotIn("path_.reset", branch)
         self.assertNotIn("path_progress_tracker_.reset", branch)
 
+    def test_path_progress_stop_records_the_exact_diagnostic_branch(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        control = source[
+            source.index("void Go2Sdk2BridgeNode::controlTickImpl") : source.index(
+                "void Go2Sdk2BridgeNode::failSafe"
+            )
+        ]
+        failure = control[
+            control.index("PathTrackingDiagnostics tracking_diagnostics") : control.index(
+                "if (*completion_ready)"
+            )
+        ]
+
+        self.assertIn("&tracking_diagnostics", failure)
+        self.assertIn("pathTrackingFailureName(tracking_diagnostics.failure)", failure)
+        self.assertIn("path_sequence=%llu", failure)
+        self.assertIn("goal_generation=%lld", failure)
+        self.assertIn("path_age=%.6f", failure)
+        self.assertIn("projection_distance=%.9f", failure)
+        self.assertLess(
+            failure.index('failSafe("path progress could not be confirmed")'),
+            failure.index("RCLCPP_ERROR("),
+        )
+
     def test_sport_state_gate_precedes_every_control_tick_move(self):
         with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
             source = stream.read()

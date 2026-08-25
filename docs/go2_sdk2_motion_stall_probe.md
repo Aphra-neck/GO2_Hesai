@@ -4,9 +4,10 @@
 
 1. ROS bridge 的 `/sdk2_command` 是否连续，还是发生了发布间隙；
 2. 指令连续时，`/lio/body_odom` 和 `rt/sportmodestate` 是否产生运动响应；
-3. 是否出现原生遥控器输入与反馈变化的时间重叠，以及偏航响应符号是否与指令一致。
+3. 是否出现原生遥控器输入与反馈变化的时间重叠，以及偏航响应符号是否与指令一致；
+4. 停车前收到了哪个目标、哪一版 `/body_path`，以及该路径的完整几何和目标代次。
 
-探针是只读工具。它只创建四个订阅，不创建 ROS 或 SDK2 发布器，不创建服务客户端，也不调用
+探针是只读工具。它只创建六个订阅，不创建 ROS 或 SDK2 发布器，不创建服务客户端，也不调用
 任何运动、停车、遥控器仲裁、姿态或步态接口：
 
 | 数据 | 来源 | 用途 |
@@ -15,6 +16,8 @@
 | 世界系机体位姿 | `/lio/body_odom` | 计算实际平移和偏航变化 |
 | 宇树高层运动状态 | `rt/sportmodestate` | 读取运动状态码、估计速度和偏航速度 |
 | 原生遥控器数据 | `rt/lowstate.wireless_remote` | 定位拨杆开始、结束和峰值 |
+| 操作员目标 | `/goal_pose` | 记录目标位姿、消息头时间和目标代次 |
+| 规划路径 | `/body_path` | 记录每版路径的接收序号、完整 pose 几何、消息头时间和目标代次 |
 
 C++ SDK2 读取器使用 `std::chrono::steady_clock`，Python ROS 订阅器使用
 `time.monotonic_ns()`。在同一台 Linux Jetson 上，两者都以系统单调时钟为基准；合并后的
@@ -37,7 +40,9 @@ bash ./tools/run_sdk2_motion_stall_probe.sh --duration 45
 
 脚本会在权限为 `0700` 的随机临时目录
 `/tmp/go2-sdk2-motion-stall-build.XXXXXX` 中构建仓库的只读 C++ 读取器，并在退出时删除该
-构建目录，然后等待四个数据源完成 DDS 发现。它要求 SLAM/规划启动流程已建立有效的
+构建目录，然后等待四个必需运动数据源完成 DDS 发现。`/goal_pose` 和 `/body_path` 是独立的
+规划证据流，不参与发现完成和 `required_streams_complete` 判定，因为在 `READY` 后发布新目标前
+它们可以合法地没有数据。脚本要求 SLAM/规划启动流程已建立有效的
 `go2-log` active-session，
 且该会话的 collector PID、命令行、未上传/未结束标记和容量余量均通过检查。脚本在
 采集前直接预留权限为 `0700` 的证据子目录，Python 通过持有的 directory fd 写入，
@@ -89,7 +94,10 @@ wrapper 不允许覆盖 `--output-dir`，避免诊断证据绕过会话保留和
 ## 结果解释
 
 终端摘要分别给出 `command`、`odom`、`sport` 和 `remote` 的样本数、平均频率、最大接收间隙
-及独立状态。默认间隙界限为：指令 250 ms、里程计 500 ms、sport 250 ms。遥控器数据即使
+及独立状态，并用一行 `planning` 汇总本次目标和路径数量。每个 path 事件在 `events.jsonl`
+保留接收单调时间、消息头时间、接收序号、目标代次、pose 数量以及全部位置和四元数；
+`report.json` 的 `planning` 字段保存计数、序号列表和 pose 数量范围，但不会改变失速分类。
+默认间隙界限为：指令 250 ms、里程计 500 ms、sport 250 ms。遥控器数据即使
 内部相邻帧正常，只要没有覆盖非零指令区间也会标记为 `partial`，不能用于遥控器相关结论。
 
 - `stall=observed`：非零指令持续至少 750 ms，但 body odom 没有达到运动响应阈值。这是“有
@@ -111,6 +119,12 @@ wrapper 不允许覆盖 `--output-dir`，避免诊断证据绕过会话保留和
   优先检查机体坐标修正、偏航定义和时间对齐，不应通过反向 SDK 指令猜测修复。
 - `yaw_sign=mismatch`：至少一个反馈源积累了 0.05 rad 以上的反号证据，且反号比例达到 70%。
 - `insufficient_*`：本次没有足够的非零指令、反馈变化或完整数据，不能对相应问题下结论。
+
+若 bridge 因路径进度门停车，ROS 日志会在原有停车原因后追加一组结构化诊断字段，包括
+`failure`、接受路径序号、目标代次、路径年龄、pose 数量、tracker pose/fraction、当前进度、
+横向误差、投影距离、旋转点/终点距离，以及机器人、当前线段和路径首尾坐标。该补充只读取
+已参与原有判断的中间值；`kMaximumPathCrossTrack=0.05` 等阈值、判断顺序、停车和 disarm 流程
+均不改变。
 
 离线回放不需要 ROS 2 或 SDK2，可在仓库中运行：
 

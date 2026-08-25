@@ -417,9 +417,18 @@ TEST(PathProgress, RejectsAnAmbiguousPositionBetweenTheBranchesOfAUTurn)
     pathPose(0.4, 0.2, 3.1415926535897932),
     pathPose(0.0, 0.2, 3.1415926535897932)};
   PathProgressTracker tracker;
+  PathTrackingDiagnostics diagnostics;
 
   EXPECT_FALSE(
-    tracker.update(poses, 0.2, 0.11, 0.0, 0.3, 0.2617993877991494).has_value());
+    tracker.update(
+      poses, 0.2, 0.11, 0.0, 0.3, 0.2617993877991494,
+      &diagnostics).has_value());
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kProjectionTooFar);
+  EXPECT_STREQ(pathTrackingFailureName(diagnostics.failure), "projection_too_far");
+  EXPECT_EQ(diagnostics.pose_index, 0U);
+  EXPECT_NEAR(diagnostics.current_progress, 0.2, 1.0e-12);
+  EXPECT_NEAR(diagnostics.cross_track, 0.11, 1.0e-12);
+  EXPECT_NEAR(diagnostics.projection_distance, 0.11, 1.0e-12);
 }
 
 TEST(PathProgress, TracksABoundedDeviationWithoutJumpingPastTheCurrentSegment)
@@ -432,10 +441,14 @@ TEST(PathProgress, TracksABoundedDeviationWithoutJumpingPastTheCurrentSegment)
     pathPose(0.4, 0.2, 3.1415926535897932),
     pathPose(0.0, 0.2, 3.1415926535897932)};
   PathProgressTracker tracker;
+  PathTrackingDiagnostics diagnostics;
 
-  const auto target = tracker.update(poses, 0.2, 0.04, 0.0, 0.3, 0.2617993877991494);
+  const auto target = tracker.update(
+    poses, 0.2, 0.04, 0.0, 0.3, 0.2617993877991494, &diagnostics);
 
   ASSERT_TRUE(target.has_value());
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kNone);
+  EXPECT_STREQ(pathTrackingFailureName(diagnostics.failure), "none");
   EXPECT_EQ(target->progress_pose, 0U);
   EXPECT_NEAR(target->target_y, 0.0, 1.0e-12);
   EXPECT_GT(target->target_x, 0.2);
@@ -600,9 +613,12 @@ TEST(PathProgress, RejectsRotationWhenTheBodyIsNotAtTheWaypoint)
     pathPose(0.0, 0.0, 0.0),
     pathPose(0.0, 0.0, half_pi)};
   PathProgressTracker tracker;
+  PathTrackingDiagnostics diagnostics;
 
   EXPECT_FALSE(
-    tracker.update(poses, 0.20, 0.0, 0.0, 0.3, 0.1).has_value());
+    tracker.update(poses, 0.20, 0.0, 0.0, 0.3, 0.1, &diagnostics).has_value());
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kRotationWaypointTooFar);
+  EXPECT_NEAR(diagnostics.waypoint_distance, 0.20, 1.0e-12);
 }
 
 TEST(PathProgress, RejectsUnconfirmedProgressInsteadOfJumpingForward)
@@ -611,18 +627,28 @@ TEST(PathProgress, RejectsUnconfirmedProgressInsteadOfJumpingForward)
     pathPose(0.0, 0.0), pathPose(0.2, 0.0), pathPose(0.4, 0.0),
     pathPose(0.6, 0.0), pathPose(0.8, 0.0), pathPose(1.0, 0.0)};
   PathProgressTracker tracker;
+  PathTrackingDiagnostics diagnostics;
 
   EXPECT_FALSE(
-    tracker.update(poses, 1.0, 0.0, 0.0, 0.3, 0.2617993877991494).has_value());
+    tracker.update(
+      poses, 1.0, 0.0, 0.0, 0.3, 0.2617993877991494,
+      &diagnostics).has_value());
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kProjectionTooFar);
+  EXPECT_NEAR(diagnostics.current_progress, 1.0, 1.0e-12);
+  EXPECT_NEAR(diagnostics.maximum_progress, 0.4, 1.0e-12);
+  EXPECT_NEAR(diagnostics.projection_distance, 0.6, 1.0e-12);
 }
 
 TEST(PathProgress, RejectsASinglePosePathAwayFromTheRobot)
 {
   PathProgressTracker tracker;
   const std::vector<geometry_msgs::msg::PoseStamped> poses{pathPose(1.0, 0.0)};
+  PathTrackingDiagnostics diagnostics;
 
   EXPECT_FALSE(
-    tracker.update(poses, 0.0, 0.0, 0.0, 0.2, 0.1).has_value());
+    tracker.update(poses, 0.0, 0.0, 0.0, 0.2, 0.1, &diagnostics).has_value());
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kFinalPoseTooFar);
+  EXPECT_NEAR(diagnostics.final_distance, 1.0, 1.0e-12);
 }
 
 TEST(PathProgress, RejectsLateralJumpAfterReachingTheFinalPose)
@@ -630,9 +656,13 @@ TEST(PathProgress, RejectsLateralJumpAfterReachingTheFinalPose)
   PathProgressTracker tracker;
   const std::vector<geometry_msgs::msg::PoseStamped> poses{
     pathPose(0.0, 0.0), pathPose(0.2, 0.0)};
+  PathTrackingDiagnostics diagnostics;
 
   ASSERT_TRUE(tracker.update(poses, 0.2, 0.0, 0.0, 0.2, 0.1).has_value());
-  EXPECT_FALSE(tracker.update(poses, 0.2, 0.06, 0.0, 0.2, 0.1).has_value());
+  EXPECT_FALSE(
+    tracker.update(poses, 0.2, 0.06, 0.0, 0.2, 0.1, &diagnostics).has_value());
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kFinalPoseTooFar);
+  EXPECT_NEAR(diagnostics.final_distance, 0.06, 1.0e-12);
 }
 
 TEST(CommandValidation, RejectsUnexpectedReverseButAllowsAnExplicitReverseSegment)

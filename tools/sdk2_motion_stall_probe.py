@@ -871,6 +871,53 @@ def yaw_sign_analysis(
     return {"status": overall, "odom": odom_result, "sport": sport_result}
 
 
+def _ordered_nonnegative_integers(
+    events: Sequence[dict[str, Any]], key: str
+) -> list[int]:
+    result: list[int] = []
+    seen: set[int] = set()
+    for event in events:
+        value = event.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            candidate = int(value)
+        except (TypeError, ValueError):
+            continue
+        if candidate < 0 or candidate in seen:
+            continue
+        seen.add(candidate)
+        result.append(candidate)
+    return result
+
+
+def planning_summary(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    goals = _source_events(events, "goal")
+    paths = _source_events(events, "path")
+    pose_counts = _ordered_nonnegative_integers(paths, "pose_count")
+    path_sequences = _ordered_nonnegative_integers(paths, "sequence")
+    if paths:
+        status = "path_observed"
+    elif goals:
+        status = "goal_without_path"
+    else:
+        status = "not_observed"
+    return {
+        "status": status,
+        "goal_count": len(goals),
+        "path_count": len(paths),
+        "goal_generations_ns": _ordered_nonnegative_integers(
+            goals, "goal_generation_ns"
+        ),
+        "path_goal_generations_ns": _ordered_nonnegative_integers(
+            paths, "goal_generation_ns"
+        ),
+        "path_sequences": path_sequences,
+        "path_pose_count_min": min(pose_counts) if pose_counts else None,
+        "path_pose_count_max": max(pose_counts) if pose_counts else None,
+    }
+
+
 def analyze_events(
     events: Iterable[dict[str, Any]], config: AnalysisConfig | None = None
 ) -> dict[str, Any]:
@@ -1046,6 +1093,9 @@ def analyze_events(
         "yaw_sign": yaw_sign_analysis(
             commands, sport, odom_motion, active_config
         ),
+        # Goal/path evidence is intentionally not part of required stream
+        # completeness: neither exists until the operator publishes a goal.
+        "planning": planning_summary(event_list),
     }
 
 
@@ -1081,6 +1131,69 @@ def _quaternion_yaw(orientation: Any) -> float | None:
         2.0 * (w * z + x * y),
         1.0 - 2.0 * (y * y + z * z),
     )
+
+
+def _stamped_pose_geometry(message: Any) -> dict[str, Any]:
+    position = message.pose.position
+    orientation = message.pose.orientation
+    return {
+        "header_ns": _header_stamp_ns(message),
+        "frame_id": str(message.header.frame_id),
+        "x": _finite_or_none(position.x),
+        "y": _finite_or_none(position.y),
+        "z": _finite_or_none(position.z),
+        "qx": _finite_or_none(orientation.x),
+        "qy": _finite_or_none(orientation.y),
+        "qz": _finite_or_none(orientation.z),
+        "qw": _finite_or_none(orientation.w),
+        "yaw": _quaternion_yaw(orientation),
+    }
+
+
+def _path_goal_generation_ns(poses: Sequence[Any]) -> int | None:
+    if not poses:
+        return None
+    generation = _header_stamp_ns(poses[0])
+    if generation is None or generation <= 0:
+        return None
+    for pose in poses[1:]:
+        if _header_stamp_ns(pose) != generation:
+            return None
+    return generation
+
+
+def _goal_event(message: Any, mono_ns: int) -> dict[str, Any]:
+    geometry = _stamped_pose_geometry(message)
+    header_ns = geometry["header_ns"]
+    return {
+        "schema": 1,
+        "source": "goal",
+        "topic": "/goal_pose",
+        "mono_ns": mono_ns,
+        "goal_generation_ns": (
+            header_ns if isinstance(header_ns, int) and header_ns > 0 else None
+        ),
+        **geometry,
+    }
+
+
+def _path_event(message: Any, mono_ns: int, sequence: int) -> dict[str, Any]:
+    poses = list(message.poses)
+    return {
+        "schema": 1,
+        "source": "path",
+        "topic": "/body_path",
+        "mono_ns": mono_ns,
+        "header_ns": _header_stamp_ns(message),
+        "frame_id": str(message.header.frame_id),
+        "sequence": sequence,
+        "goal_generation_ns": _path_goal_generation_ns(poses),
+        "pose_count": len(poses),
+        "poses": [
+            {"index": index, **_stamped_pose_geometry(pose)}
+            for index, pose in enumerate(poses)
+        ],
+    }
 
 
 class EventStore:
@@ -1253,8 +1366,8 @@ def capture_live(
 ]:
     try:
         import rclpy
-        from geometry_msgs.msg import TwistStamped
-        from nav_msgs.msg import Odometry
+        from geometry_msgs.msg import PoseStamped, TwistStamped
+        from nav_msgs.msg import Odometry, Path as PathMessage
         from rclpy.node import Node
         from rclpy.qos import (
             DurabilityPolicy,
@@ -1350,6 +1463,17 @@ def capture_live(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
         )
+        goal_qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        path_qos = QoSProfile(
+            depth=50,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        path_sequence = 0
 
         def command_callback(message: Any) -> None:
             store.append(
@@ -1383,12 +1507,26 @@ def capture_live(
                 }
             )
 
+        def goal_callback(message: Any) -> None:
+            store.append(_goal_event(message, time.monotonic_ns()))
+
+        def path_callback(message: Any) -> None:
+            nonlocal path_sequence
+            path_sequence += 1
+            store.append(_path_event(message, time.monotonic_ns(), path_sequence))
+
         subscriptions = [
             node.create_subscription(
                 TwistStamped, "/sdk2_command", command_callback, command_qos
             ),
             node.create_subscription(
                 Odometry, "/lio/body_odom", odom_callback, odom_qos
+            ),
+            node.create_subscription(
+                PoseStamped, "/goal_pose", goal_callback, goal_qos
+            ),
+            node.create_subscription(
+                PathMessage, "/body_path", path_callback, path_qos
             ),
         ]
         del subscriptions
@@ -1443,6 +1581,7 @@ def capture_live(
 
         if capture_invalidation_reason is None:
             store.clear()
+            path_sequence = 0
             capture_start_ns = time.monotonic_ns()
             print("READY: publish one fresh goal now. Keep the native remote centered.")
             print("Do not command the native remote while the SDK2 bridge is armed.")
@@ -1609,6 +1748,11 @@ def print_report(report: dict[str, Any], output_dir: Path | None) -> None:
         f"remote_wake={report['remote']['wake_status']}"
     )
     print(f"yaw_sign={report['yaw_sign']['status']}")
+    planning = report["planning"]
+    print(
+        f"planning={planning['status']} goals={planning['goal_count']} "
+        f"paths={planning['path_count']}"
+    )
     if report.get("capture_invalidated") is not None:
         print(f"capture_invalidated={report['capture_invalidated']}")
     if output_dir is not None:
