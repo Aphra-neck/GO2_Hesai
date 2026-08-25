@@ -65,6 +65,13 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   sport_state_timeout_ = declare_parameter("sport_state_timeout", 1.0);
   timestamp_future_tolerance_ = declare_parameter("timestamp_future_tolerance", 0.2);
   lookahead_distance_ = declare_parameter("lookahead_distance", 0.6);
+  rcl_interfaces::msg::ParameterDescriptor path_cross_track_descriptor;
+  path_cross_track_descriptor.description =
+    "Enforce the 0.05 m path cross-track/final-distance stop gate; finite-value checks remain "
+    "active when disabled";
+  path_cross_track_descriptor.read_only = true;
+  path_cross_track_safety_gate_enabled_ = declare_parameter<bool>(
+    "path_cross_track_safety_gate_enabled", true, path_cross_track_descriptor);
   goal_position_tolerance_ = declare_parameter("goal_position_tolerance", 0.15);
   goal_yaw_tolerance_ = declare_parameter("goal_yaw_tolerance", 0.20);
   heading_alignment_enter_angle_ =
@@ -165,6 +172,12 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     "Go2 SDK2 bridge on interface '%s'; motion is disabled and can only be enabled via "
     "~/enable_motion",
     network_interface_.c_str());
+  if (!path_cross_track_safety_gate_enabled_) {
+    RCLCPP_WARN(
+      get_logger(),
+      "The 0.05 m path cross-track safety gate is DISABLED by configuration; "
+      "finite-value and command-direction safety checks remain active");
+  }
 }
 
 Go2Sdk2BridgeNode::~Go2Sdk2BridgeNode() noexcept
@@ -598,7 +611,8 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   PathTrackingDiagnostics tracking_diagnostics;
   const auto tracking_target = path_progress_tracker_.update(
     path_->poses, current.position.x, current.position.y, *current_yaw,
-    lookahead_distance_, explicit_rotation_tolerance_, &tracking_diagnostics);
+    lookahead_distance_, explicit_rotation_tolerance_, &tracking_diagnostics,
+    path_cross_track_safety_gate_enabled_);
   const auto completion_ready = goalCompletionReady(
     goal_distance, goal_yaw_error, goal_position_tolerance_, goal_yaw_tolerance_,
     tracking_target);

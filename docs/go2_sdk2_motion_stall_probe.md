@@ -123,8 +123,9 @@ wrapper 不允许覆盖 `--output-dir`，避免诊断证据绕过会话保留和
 若 bridge 因路径进度门停车，ROS 日志会在原有停车原因后追加一组结构化诊断字段，包括
 `failure`、接受路径序号、目标代次、路径年龄、pose 数量、tracker pose/fraction、当前进度、
 横向误差、投影距离、旋转点/终点距离，以及机器人、当前线段和路径首尾坐标。该补充只读取
-已参与原有判断的中间值；`kMaximumPathCrossTrack=0.05` 等阈值、判断顺序、停车和 disarm 流程
-均不改变。
+已参与原有判断的中间值。标准配置将 `path_cross_track_safety_gate_enabled` 设为 `false`，
+所以 `kMaximumPathCrossTrack=0.05` m 只作为诊断参考，不会单独触发停车；将该参数设为 `true`
+时恢复原来的投影/终点偏离门。非法值、输入过期、原地转向点、反向命令和运动响应保护不受影响。
 
 离线回放不需要 ROS 2 或 SDK2，可在仓库中运行：
 

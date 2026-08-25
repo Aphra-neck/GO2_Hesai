@@ -431,6 +431,27 @@ TEST(PathProgress, RejectsAnAmbiguousPositionBetweenTheBranchesOfAUTurn)
   EXPECT_NEAR(diagnostics.projection_distance, 0.11, 1.0e-12);
 }
 
+TEST(PathProgress, AllowsProjectionBeyondFiveCentimetresWhenGateIsDisabled)
+{
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(0.0, 0.0),
+    pathPose(0.4, 0.0),
+    pathPose(0.8, 0.0),
+    pathPose(0.8, 0.2, 1.5707963267948966),
+    pathPose(0.4, 0.2, 3.1415926535897932),
+    pathPose(0.0, 0.2, 3.1415926535897932)};
+  PathProgressTracker tracker;
+  PathTrackingDiagnostics diagnostics;
+
+  const auto target = tracker.update(
+    poses, 0.2, 0.11, 0.0, 0.3, 0.2617993877991494,
+    &diagnostics, false);
+
+  ASSERT_TRUE(target.has_value());
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kNone);
+  EXPECT_NEAR(diagnostics.projection_distance, 0.11, 1.0e-12);
+}
+
 TEST(PathProgress, TracksABoundedDeviationWithoutJumpingPastTheCurrentSegment)
 {
   const std::vector<geometry_msgs::msg::PoseStamped> poses{
@@ -648,6 +669,21 @@ TEST(PathProgress, RejectsASinglePosePathAwayFromTheRobot)
   EXPECT_FALSE(
     tracker.update(poses, 0.0, 0.0, 0.0, 0.2, 0.1, &diagnostics).has_value());
   EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kFinalPoseTooFar);
+  EXPECT_NEAR(diagnostics.final_distance, 1.0, 1.0e-12);
+}
+
+TEST(PathProgress, AllowsAFarFinalPoseWhenGateIsDisabled)
+{
+  PathProgressTracker tracker;
+  PathTrackingDiagnostics diagnostics;
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{pathPose(1.0, 0.0)};
+
+  const auto target = tracker.update(
+    poses, 0.0, 0.0, 0.0, 0.2, 0.1, &diagnostics, false);
+
+  ASSERT_TRUE(target.has_value());
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kNone);
+  EXPECT_NEAR(target->target_x, 1.0, 1.0e-12);
   EXPECT_NEAR(diagnostics.final_distance, 1.0, 1.0e-12);
 }
 

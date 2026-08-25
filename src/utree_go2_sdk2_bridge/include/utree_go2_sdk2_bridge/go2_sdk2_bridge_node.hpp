@@ -73,6 +73,7 @@ private:
   double sport_state_timeout_{1.0};
   double timestamp_future_tolerance_{0.2};
   double lookahead_distance_{0.6};
+  bool path_cross_track_safety_gate_enabled_{true};
   double goal_position_tolerance_{0.15};
   double goal_yaw_tolerance_{0.20};
   double heading_alignment_enter_angle_{0.7853981633974483};

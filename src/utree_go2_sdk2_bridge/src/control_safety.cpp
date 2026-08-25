@@ -521,7 +521,8 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
   double current_yaw,
   double lookahead_distance,
   double explicit_rotation_tolerance,
-  PathTrackingDiagnostics * diagnostics)
+  PathTrackingDiagnostics * diagnostics,
+  bool enforce_path_cross_track_safety_gate)
 {
   constexpr double same_position_tolerance = 1.0e-6;
   constexpr double same_direction_tolerance = 1.0e-6;
@@ -620,7 +621,10 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       if (diagnostics != nullptr) {
         diagnostics->final_distance = final_distance;
       }
-      if (!std::isfinite(final_distance) || final_distance > kMaximumPathCrossTrack) {
+      if (!std::isfinite(final_distance) ||
+        (enforce_path_cross_track_safety_gate &&
+        final_distance > kMaximumPathCrossTrack))
+      {
         return fail(
           !std::isfinite(final_distance) ?
           PathTrackingFailure::kNonFiniteFinalDistance :
@@ -746,7 +750,8 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       diagnostics->projection_distance = projection_distance;
     }
     if (!std::isfinite(projection_distance) ||
-      projection_distance > kMaximumPathCrossTrack)
+      (enforce_path_cross_track_safety_gate &&
+      projection_distance > kMaximumPathCrossTrack))
     {
       return fail(
         !std::isfinite(projection_distance) ?

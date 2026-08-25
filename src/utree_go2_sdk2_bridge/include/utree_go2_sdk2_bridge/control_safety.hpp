@@ -20,6 +20,8 @@ inline constexpr double kSdkMaxAbsVy = 1.0;
 inline constexpr double kSdkMaxAbsYawRate = 4.0;
 inline constexpr double kRotationWaypointTolerance = 0.05;
 inline constexpr double kMaximumPathProgressAdvance = 0.4;
+// The bridge may disable this commissioning-time geometric rejection gate
+// while retaining all finite-value and command-direction checks.
 inline constexpr double kMaximumPathCrossTrack = 0.05;
 inline constexpr double kSignedCornerReachTolerance = 1.0e-3;
 inline constexpr double kUnexpectedReverseTolerance = 1.0e-4;
@@ -191,7 +193,8 @@ public:
     double current_yaw,
     double lookahead_distance,
     double explicit_rotation_tolerance,
-    PathTrackingDiagnostics * diagnostics = nullptr);
+    PathTrackingDiagnostics * diagnostics = nullptr,
+    bool enforce_path_cross_track_safety_gate = true);
 
 private:
   bool initialized_{false};
