@@ -44,8 +44,8 @@ cd ~
 mkdir catkin_ws
 cd ~/catkin_ws
 
-git -c http.proxy=http://192.168.151.145:7890 \
-  -c https.proxy=http://192.168.151.145:7890 \
+git -c http.proxy=http://192.168.151.132:7890 \
+  -c https.proxy=http://192.168.151.132:7890 \
   clone --branch ROS2-2D-navigation --single-branch \
   https://github.com/Aphra-neck/GO2_Hesai.git .
 ```
@@ -72,8 +72,8 @@ git -c http.proxy=http://192.168.151.145:7890 \
 ```bash
 cd ~/catkin_ws
 test "$(git branch --show-current)" = ROS2-2D-navigation || exit 1
-git -c http.proxy=http://192.168.151.145:7890 \
-  -c https.proxy=http://192.168.151.145:7890 \
+git -c http.proxy=http://192.168.151.132:7890 \
+  -c https.proxy=http://192.168.151.132:7890 \
   pull --ff-only origin ROS2-2D-navigation
 
 source /opt/ros/humble/setup.bash
@@ -102,8 +102,8 @@ Jetson 的 `~/catkin_ws` 只使用上面的 `pull --ff-only` 更新。确认机�
 ```powershell
 Set-Location C:\path\to\GO2_Hesai
 git status --short --branch
-git -c http.proxy=http://192.168.151.145:7890 `
-  -c https.proxy=http://192.168.151.145:7890 `
+git -c http.proxy=http://192.168.151.132:7890 `
+  -c https.proxy=http://192.168.151.132:7890 `
   push origin ROS2-2D-navigation
 ```
 
@@ -291,10 +291,10 @@ Go2 LowState
 | 端点 | 地址 | 用途 |
 | --- | --- | --- |
 | Jetson Wi-Fi | `192.168.151.213/24` | ROS 2 数据与 WSL2 通信 |
-| WSL2 mirrored | `192.168.151.145/24` | 运行 RViz2 |
+| WSL2 mirrored | `192.168.151.132/24` | 运行 RViz2 |
 | Jetson `enP8p1s0` | `192.168.123.18/24` | Go2 与 Hesai 设备网络 |
 | Hesai XT-16 | `192.168.123.20` | UDP 点云发送端 |
-| Git 代理 | `192.168.151.145:7890` | Jetson 访问 GitHub |
+| Git 代理 | `192.168.151.132:7890` | Jetson 访问 GitHub |
 
 ROS 2 使用 domain `30` 和 Fast DDS。Unitree SDK2 在 `enP8p1s0` 上独立使用
 DDS domain `0`。不要把 ROS 2 切换为 `rmw_cyclonedds_cpp`。
@@ -358,7 +358,7 @@ wsl -l -v
 ip -4 -brief address
 ```
 
-当前 profile 要求地址中出现 `192.168.151.145/24`。如果 Windows Wi-Fi 地址改变，
+当前 profile 要求地址中出现 `192.168.151.132/24`。如果 Windows Wi-Fi 地址改变，
 必须同步更新两份 XML 和下面的防火墙规则。
 
 ### 配置 Windows 入站防火墙
@@ -437,7 +437,7 @@ curl --fail --location \
 grep -n '<address>' ~/go2_rviz/config/fastdds/wsl2_mirrored.xml
 ```
 
-输出必须同时包含 `192.168.151.213` 和 `192.168.151.145`。
+输出必须同时包含 `192.168.151.213` 和 `192.168.151.132`。
 
 ## 日常完整启动
 
@@ -1096,10 +1096,10 @@ ros2 service call /go2_sdk2_bridge/enable_motion \
 
 二维规划优先让机头朝向局部路径段：长距离反向/横向运动会承担持续航向代价，直角转折在
 真正到达拐点后使用下一段航向；运动桥在航向误差较大时只转向，进入对齐范围后才恢复平移。
-bridge 对每条新路径维护有界、单调的进度，不会因 U 形回折段离机器人更近就跳到未来段；
+bridge 对同一目标的路径刷新维护有界、单调的进度，并在刷新时重新锚定 tracker，不会因 U 形回折段离机器人更近就跳到未来段；规划器首段已经被机器人越过时，只消费受控的短首段连接；
 当前部署配置关闭了 `0.05 m` 路径横向/终点偏离停车门（`path_cross_track_safety_gate_enabled: false`），
-因此定位短时偏离不会单独触发 disarm；非法几何、原地转向点、过期输入、运动无响应和非规划的负
-`vx` 保护仍会停车并解除授权。多级
+因此定位短时偏离不会单独触发 disarm；非法几何、原地转向点、过期输入和运动无响应仍会停车并解除授权。
+瞬时的“正向路径却算出负 `vx`”会保持零速并等待最多 `0.75 s` 的新路径；持续冲突超时后仍会停车并解除授权。多级
 原地转向按规划姿态逐级执行。这里跟随局部路径切线而不是始终朝最终目标，因此不会破坏
 必须先前进再转弯的绕障路径；单个栅格的小幅全向修正仍保留。不要通过修改
 `world -> imu -> base_link` 的 `-90 deg` 关系调这个行为。
@@ -1300,7 +1300,7 @@ source ./shell/ros2_environment.sh
 
 ./tools/go2-log stop
 ./tools/go2-log repair
-GO2_LOG_PROXY=http://192.168.151.145:7890 ./tools/go2-log upload
+GO2_LOG_PROXY=http://192.168.151.132:7890 ./tools/go2-log upload
 ```
 
 自动收尾用于防止新的会话继续积压，但不会在下一次启动时擅自上传历史会话。旧的 stale
@@ -1326,7 +1326,7 @@ push。每个会话最多 100 MiB，本地最多保留 20 个；只有远端提�
 才允许被清理。默认上传到公开仓库 `Aphra-neck/G02_log` 的 `main` 分支，并使用：
 
 ```bash
-export GO2_LOG_PROXY=http://192.168.151.145:7890
+export GO2_LOG_PROXY=http://192.168.151.132:7890
 ```
 
 实机上传当前使用对 `Aphra-neck/G02_log` 具有写权限的 GitHub Deploy Key，并通过
@@ -1349,8 +1349,8 @@ Windows 本地拉取并分析：
 
 ```powershell
 git -C D:\G02_log `
-  -c http.proxy=http://192.168.151.145:7890 `
-  -c https.proxy=http://192.168.151.145:7890 `
+  -c http.proxy=http://192.168.151.132:7890 `
+  -c https.proxy=http://192.168.151.132:7890 `
   pull --ff-only origin main
 
 # 先替换为本机 GO2_Hesai checkout 的实际路径
@@ -1629,7 +1629,7 @@ ros2 daemon stop
 ros2 topic list --no-daemon
 ```
 
-两端 profile 都必须同时包含 `192.168.151.213` 与 `192.168.151.145`，且 whitelist
+两端 profile 都必须同时包含 `192.168.151.213` 与 `192.168.151.132`，且 whitelist
 地址必须属于本机。不要启动 `fastdds discovery`，不要设置 `ROS_DISCOVERY_SERVER`，
 也不要把 multicast 测试当作静态单播配置的通过条件。
 

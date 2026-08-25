@@ -215,6 +215,42 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
         self.assertNotIn("path_.reset", branch)
         self.assertNotIn("path_progress_tracker_.reset", branch)
 
+    def test_same_goal_refresh_reanchors_without_resetting_tracker(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        callback = source[
+            source.index("void Go2Sdk2BridgeNode::pathCallback") : source.index(
+                "void Go2Sdk2BridgeNode::odomCallback"
+            )
+        ]
+
+        self.assertIn("same_goal_refresh", callback)
+        self.assertIn("path_refresh_pending_reanchor_ = true", callback)
+        self.assertIn("path_progress_tracker_.reset();", callback)
+        self.assertIn("direction_conflict_started_at_.reset();", callback)
+
+    def test_direction_conflict_waits_for_a_fresh_path_before_fail_safe(self):
+        with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        control = source[
+            source.index("const double requested_vx") : source.index(
+                "const double raw_vy", source.index("const double requested_vx")
+            )
+        ]
+
+        self.assertIn("transient_direction_conflict", control)
+        self.assertIn("kDirectionConflictWaitTimeout", control)
+        self.assertIn("direction_conflict_path_sequence_", control)
+        self.assertIn(
+            "accepted_path_sequence_ != *direction_conflict_path_sequence_", control
+        )
+        self.assertIn(
+            'holdZeroMoveWhileWaiting("waiting for refreshed path after direction conflict")',
+            control,
+        )
+        self.assertIn('failSafe("direction conflict wait timeout")', control)
+        self.assertNotIn('failSafe("unplanned reverse command")', control)
+
     def test_path_progress_stop_records_the_exact_diagnostic_branch(self):
         with open(NODE_SOURCE, "r", encoding="utf-8") as stream:
             source = stream.read()

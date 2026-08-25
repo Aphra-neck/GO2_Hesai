@@ -579,6 +579,70 @@ TEST(PathProgress, ReportsPendingRotationAcrossAShortStartConnector)
   EXPECT_FALSE(suffix->pending_explicit_rotation);
 }
 
+TEST(PathProgress, ReanchorPreservesProgressAcrossASameGoalRefresh)
+{
+  const std::vector<geometry_msgs::msg::PoseStamped> initial_path{
+    pathPose(0.0, 0.0), pathPose(0.2, 0.0), pathPose(0.4, 0.0)};
+  PathProgressTracker tracker;
+
+  const auto initial = tracker.update(
+    initial_path, 0.12, 0.0, 0.0, 0.3, 0.1);
+  ASSERT_TRUE(initial.has_value());
+  EXPECT_EQ(initial->progress_pose, 0U);
+
+  const std::vector<geometry_msgs::msg::PoseStamped> refreshed_path{
+    pathPose(0.14, 0.0), pathPose(0.20, 0.0), pathPose(0.40, 0.0)};
+  ASSERT_TRUE(tracker.reanchor(refreshed_path, 0.21, 0.0));
+
+  PathTrackingDiagnostics diagnostics;
+  const auto refreshed = tracker.update(
+    refreshed_path, 0.21, 0.0, 0.0, 0.3, 0.1, &diagnostics, false);
+  ASSERT_TRUE(refreshed.has_value());
+  EXPECT_GE(refreshed->progress_pose, 1U);
+  EXPECT_EQ(refreshed->translation_direction, PlannedTranslationDirection::kForward);
+}
+
+TEST(PathProgress, ReanchorSkipsAProgressedShortStartConnector)
+{
+  const std::vector<geometry_msgs::msg::PoseStamped> initial_path{
+    pathPose(0.0, 0.0), pathPose(0.2, 0.0), pathPose(0.2, 0.2)};
+  PathProgressTracker tracker;
+  ASSERT_TRUE(tracker.update(
+    initial_path, 0.12, 0.0, 0.0, 0.3, 0.1).has_value());
+
+  const std::vector<geometry_msgs::msg::PoseStamped> refreshed_path{
+    pathPose(0.14, 0.0), pathPose(0.18, 0.0), pathPose(0.18, 0.2)};
+  ASSERT_TRUE(tracker.reanchor(refreshed_path, 0.20, 0.0));
+
+  PathTrackingDiagnostics diagnostics;
+  const auto target = tracker.update(
+    refreshed_path, 0.20, 0.0, 0.0, 0.3, 0.1, &diagnostics, false);
+  ASSERT_TRUE(target.has_value());
+  EXPECT_EQ(target->progress_pose, 1U);
+  EXPECT_EQ(target->translation_direction, PlannedTranslationDirection::kLateral);
+}
+
+TEST(PathProgress, ReanchorDoesNotSkipAnExplicitRotationWaypoint)
+{
+  constexpr double half_pi = 1.5707963267948966;
+  const std::vector<geometry_msgs::msg::PoseStamped> initial_path{
+    pathPose(0.0, 0.0), pathPose(0.2, 0.0), pathPose(0.2, 0.2, half_pi)};
+  PathProgressTracker tracker;
+  ASSERT_TRUE(tracker.update(
+    initial_path, 0.10, 0.0, 0.0, 0.3, 0.1).has_value());
+
+  const std::vector<geometry_msgs::msg::PoseStamped> refreshed_path{
+    pathPose(0.15, 0.0), pathPose(0.20, 0.0),
+    pathPose(0.20, 0.0, half_pi), pathPose(0.20, 0.2, half_pi)};
+  ASSERT_TRUE(tracker.reanchor(refreshed_path, 0.20, 0.04));
+
+  const auto target = tracker.update(
+    refreshed_path, 0.20, 0.04, 0.0, 0.3, 0.1);
+  ASSERT_TRUE(target.has_value());
+  EXPECT_TRUE(target->explicit_rotation_waypoint);
+  EXPECT_EQ(target->heading_pose, 2U);
+}
+
 TEST(PathProgress, OvershotCornerRotatesThenTargetsForwardWithoutBackingUp)
 {
   constexpr double half_pi = 1.5707963267948966;

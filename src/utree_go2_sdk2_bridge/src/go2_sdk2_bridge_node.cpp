@@ -300,10 +300,21 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
           static_cast<long long>(*goal_generation));
         return;
     }
+    const bool same_goal_refresh =
+      path_ && path_goal_generation_ && *path_goal_generation_ == *goal_generation;
     path_ = msg;
     path_goal_generation_ = *goal_generation;
     ++accepted_path_sequence_;
-    path_progress_tracker_.reset();
+    if (same_goal_refresh) {
+      // Keep the monotonic cursor. The next control tick reanchors it against
+      // the new geometry using the latest validated odometry.
+      path_refresh_pending_reanchor_ = true;
+    } else {
+      path_progress_tracker_.reset();
+      path_refresh_pending_reanchor_ = false;
+      direction_conflict_started_at_.reset();
+      direction_conflict_path_sequence_.reset();
+    }
     motion_authorization_.pathAvailable();
   } catch (const std::exception & exception) {
     failSafe("exception while validating path");
@@ -406,6 +417,9 @@ void Go2Sdk2BridgeNode::enableCallback(
       motion_authorization_.disarm();
       path_.reset();
       path_goal_generation_.reset();
+      path_refresh_pending_reanchor_ = false;
+      direction_conflict_started_at_.reset();
+      direction_conflict_path_sequence_.reset();
       path_progress_tracker_.reset();
       motion_response_watchdog_.reset();
       completed_goal_latch_.clear();
@@ -591,6 +605,24 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   }
 
   const auto & current = odom_->pose.pose;
+  if (path_refresh_pending_reanchor_) {
+    const auto refresh_path_sequence = accepted_path_sequence_;
+    const auto refresh_goal_generation = path_goal_generation_.value_or(-1);
+    if (!path_progress_tracker_.reanchor(
+        path_->poses, current.position.x, current.position.y))
+    {
+      failSafe("same-goal path reanchor failed");
+      RCLCPP_ERROR(
+        get_logger(),
+        "Rejected refreshed path because its tracker reanchor was invalid: "
+        "path_sequence=%llu goal_generation=%lld current=(%.9f,%.9f)",
+        static_cast<unsigned long long>(refresh_path_sequence),
+        static_cast<long long>(refresh_goal_generation),
+        current.position.x, current.position.y);
+      return;
+    }
+    path_refresh_pending_reanchor_ = false;
+  }
   const auto & goal = path_->poses.back().pose;
   const auto current_yaw = quaternionYaw(current.orientation);
   const auto goal_yaw = quaternionYaw(goal.orientation);
@@ -699,14 +731,68 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   }
   heading_alignment_active_ = *rotate_in_place;
 
+  const double requested_vx = *rotate_in_place ? 0.0 : linear_gain_ * body_dx;
   const auto raw_vx = filterLongitudinalCommand(
-    *rotate_in_place ? 0.0 : linear_gain_ * body_dx,
-    tracking_target->translation_direction);
+    requested_vx, tracking_target->translation_direction);
+  const auto holdDirectionConflict = [this]() {
+      const auto steady_now = std::chrono::steady_clock::now();
+      if (!direction_conflict_started_at_) {
+        return false;
+      }
+      const double conflict_age = std::chrono::duration<double>(
+        steady_now - *direction_conflict_started_at_).count();
+      if (!std::isfinite(conflict_age) || conflict_age >= kDirectionConflictWaitTimeout) {
+        RCLCPP_ERROR(
+          get_logger(),
+          "Direction conflict persisted for %.3f s without a refreshed path; stopping",
+          conflict_age);
+        failSafe("direction conflict wait timeout");
+        return false;
+      }
+      if (!holdZeroMoveWhileWaiting("waiting for refreshed path after direction conflict")) {
+        failSafe("direction conflict zero hold failed");
+        return false;
+      }
+      return true;
+    };
   if (!raw_vx) {
-    failSafe("unplanned reverse command");
-    RCLCPP_ERROR(
-      get_logger(), "Rejected negative vx because the active path segment is not reverse");
+    const bool transient_direction_conflict =
+      !*rotate_in_place &&
+      tracking_target->translation_direction == PlannedTranslationDirection::kForward &&
+      std::isfinite(requested_vx) && requested_vx < -kUnexpectedReverseTolerance;
+    if (!transient_direction_conflict) {
+      failSafe("invalid longitudinal command");
+      RCLCPP_ERROR(
+        get_logger(),
+        "Rejected invalid longitudinal command: requested_vx=%.9f direction=%d",
+        requested_vx, static_cast<int>(tracking_target->translation_direction));
+      return;
+    }
+
+    const auto steady_now = std::chrono::steady_clock::now();
+    if (!direction_conflict_started_at_) {
+      direction_conflict_started_at_ = steady_now;
+      direction_conflict_path_sequence_ = accepted_path_sequence_;
+      RCLCPP_WARN(
+        get_logger(),
+        "Transient forward/reverse conflict; holding zero for a refreshed path: "
+        "path_sequence=%llu goal_generation=%lld tracker_pose=%zu "
+        "forward_alignment=%.6f body_target=(%.6f,%.6f) requested_vx=%.6f",
+        static_cast<unsigned long long>(accepted_path_sequence_),
+        static_cast<long long>(path_goal_generation_.value_or(-1)),
+        tracking_diagnostics.pose_index, tracking_diagnostics.forward_alignment,
+        body_dx, body_dy, requested_vx);
+    }
+    (void)holdDirectionConflict();
     return;
+  }
+  if (direction_conflict_started_at_) {
+    const bool refreshed_path = direction_conflict_path_sequence_ &&
+      accepted_path_sequence_ != *direction_conflict_path_sequence_;
+    if (!refreshed_path) {
+      (void)holdDirectionConflict();
+      return;
+    }
   }
   const double raw_vy = linear_gain_ * body_dy;
   const double raw_yaw_rate = yaw_gain_ * (*target_yaw_error);
@@ -748,6 +834,12 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   if (!sendMove(command->vx, command->vy, command->yaw_rate)) {
     failSafe("SDK2 Move could not be queued");
     return;
+  }
+  if (direction_conflict_started_at_) {
+    RCLCPP_INFO(
+      get_logger(), "Direction conflict cleared by a valid refreshed-path command");
+    direction_conflict_started_at_.reset();
+    direction_conflict_path_sequence_.reset();
   }
 }
 
@@ -813,6 +905,9 @@ void Go2Sdk2BridgeNode::failSafe(const char * reason)
   motion_authorization_.disarm();
   path_.reset();
   path_goal_generation_.reset();
+  path_refresh_pending_reanchor_ = false;
+  direction_conflict_started_at_.reset();
+  direction_conflict_path_sequence_.reset();
   odom_.reset();
   path_progress_tracker_.reset();
   motion_response_watchdog_.reset();
@@ -830,6 +925,9 @@ bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
   }
   path_.reset();
   path_goal_generation_.reset();
+  path_refresh_pending_reanchor_ = false;
+  direction_conflict_started_at_.reset();
+  direction_conflict_path_sequence_.reset();
   path_progress_tracker_.reset();
   motion_response_watchdog_.reset();
   motion_authorization_.waitForPath();

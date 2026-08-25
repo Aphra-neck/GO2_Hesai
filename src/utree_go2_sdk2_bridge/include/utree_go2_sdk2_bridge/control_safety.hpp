@@ -26,6 +26,15 @@ inline constexpr double kMaximumPathCrossTrack = 0.05;
 inline constexpr double kSignedCornerReachTolerance = 1.0e-3;
 inline constexpr double kUnexpectedReverseTolerance = 1.0e-4;
 inline constexpr double kMotionResponseCommandEpsilon = 1.0e-4;
+// A planner refresh normally arrives within one 0.5 s planning cycle. Keep a
+// transient direction mismatch at zero for one bounded recovery window, then
+// fail closed if no refreshed path produces a valid command.
+inline constexpr double kDirectionConflictWaitTimeout = 0.75;
+// The planner's first pose is the delayed body pose and its first grid
+// connector can be a short fractional cell. Only a progressed, same-goal
+// refresh may consume such a connector without requiring the robot to back up.
+inline constexpr double kShortStartConnectorMaxLength = 0.10;
+inline constexpr double kShortStartConnectorReachTolerance = 0.08;
 // The 16-bin planner's closest rounded diagonal is 22.5 degrees from lateral.
 // Split that interval at 11.25 degrees so grid jitter stays lateral while the
 // diagonal primitive keeps its longitudinal component: sin(pi / 16).
@@ -177,14 +186,24 @@ struct PathTrackingDiagnostics
   double projection_distance{std::numeric_limits<double>::quiet_NaN()};
   double waypoint_distance{std::numeric_limits<double>::quiet_NaN()};
   double final_distance{std::numeric_limits<double>::quiet_NaN()};
+  double forward_alignment{std::numeric_limits<double>::quiet_NaN()};
 };
 
-// Maintains bounded, monotonic progress on one Path message. Reset it whenever
-// a new Path is accepted; the first update searches only the path prefix.
+// Maintains bounded, monotonic progress across refreshed Path messages. A new
+// operator goal resets it; a same-goal planner refresh reanchors it without
+// discarding already consumed route progress.
 class PathProgressTracker
 {
 public:
   void reset();
+
+  // Reconcile the existing cursor with a same-goal refreshed path. Returns
+  // false for invalid geometry or a non-finite current pose. The search is
+  // monotonic and bounded by kMaximumPathProgressAdvance.
+  bool reanchor(
+    const std::vector<geometry_msgs::msg::PoseStamped> & poses,
+    double current_x,
+    double current_y);
 
   std::optional<PathTrackingTarget> update(
     const std::vector<geometry_msgs::msg::PoseStamped> & poses,

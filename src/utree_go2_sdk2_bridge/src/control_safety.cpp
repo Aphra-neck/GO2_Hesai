@@ -514,6 +514,100 @@ void PathProgressTracker::reset()
   segment_fraction_ = 0.0;
 }
 
+bool PathProgressTracker::reanchor(
+  const std::vector<geometry_msgs::msg::PoseStamped> & poses,
+  double current_x,
+  double current_y)
+{
+  constexpr double same_position_tolerance = 1.0e-6;
+  if (poses.empty() || !std::isfinite(current_x) || !std::isfinite(current_y) ||
+    !std::all_of(
+      poses.begin(), poses.end(),
+      [](const geometry_msgs::msg::PoseStamped & pose) {return isFinitePose(pose.pose);}))
+  {
+    return false;
+  }
+
+  // There is no prior cursor to preserve on the first path of a goal. Let the
+  // normal update perform its original bounded prefix search.
+  if (!initialized_) {
+    initialized_ = true;
+    pose_index_ = 0U;
+    segment_fraction_ = 0.0;
+    return true;
+  }
+
+  const std::size_t previous_pose_index = pose_index_;
+  const double previous_segment_fraction = segment_fraction_;
+  if (poses.size() == 1U) {
+    pose_index_ = 0U;
+    segment_fraction_ = 0.0;
+    return true;
+  }
+
+  // Keep the old cursor as the lower bound. Reanchoring is intentionally not
+  // a nearest-segment search: a future U-turn segment can be geometrically
+  // closer than the active segment and must never be selected merely for that
+  // reason.
+  pose_index_ = std::min(previous_pose_index, poses.size() - 1U);
+  segment_fraction_ = std::clamp(previous_segment_fraction, 0.0, 1.0);
+  double advanced_length = 0.0;
+
+  // Consume only a connector that the prior cursor had already begun or that
+  // the current pose has geometrically crossed. This is deliberately narrower
+  // than the commissioning cross-track policy and cannot skip a fresh route's
+  // first step merely because it is short.
+  for (std::size_t pass = 0U; pass < poses.size(); ++pass) {
+    if (pose_index_ + 1U >= poses.size()) {
+      break;
+    }
+    const auto & start = poses[pose_index_].pose.position;
+    const auto & end = poses[pose_index_ + 1U].pose.position;
+    const double dx = end.x - start.x;
+    const double dy = end.y - start.y;
+    const double length = std::hypot(dx, dy);
+    if (!std::isfinite(length)) {
+      return false;
+    }
+    if (length <= same_position_tolerance) {
+      // A zero-length edge is an explicit rotation waypoint and must remain
+      // visible to update().
+      break;
+    }
+    const double direction_x = dx / length;
+    const double direction_y = dy / length;
+    const double offset_x = current_x - start.x;
+    const double offset_y = current_y - start.y;
+    const double progress = offset_x * direction_x + offset_y * direction_y;
+    const double cross_track = std::abs(-offset_x * direction_y + offset_y * direction_x);
+    if (!std::isfinite(progress) || !std::isfinite(cross_track)) {
+      return false;
+    }
+    const double projected_fraction = std::clamp(progress / length, 0.0, 1.0);
+    segment_fraction_ = pose_index_ == previous_pose_index ?
+      std::max(segment_fraction_, projected_fraction) : projected_fraction;
+    const bool crossed_segment =
+      progress >= length - kSignedCornerReachTolerance &&
+      cross_track <= kRotationWaypointTolerance;
+    const bool progressed_short_connector =
+      pose_index_ == 0U && previous_pose_index == 0U &&
+      previous_segment_fraction > 0.5 &&
+      length <= kShortStartConnectorMaxLength &&
+      std::hypot(current_x - end.x, current_y - end.y) <=
+      kShortStartConnectorReachTolerance;
+    if (!crossed_segment && !progressed_short_connector) {
+      break;
+    }
+    if (advanced_length + length > kMaximumPathProgressAdvance) {
+      break;
+    }
+    ++pose_index_;
+    segment_fraction_ = 0.0;
+    advanced_length += length;
+  }
+  return true;
+}
+
 std::optional<PathTrackingTarget> PathProgressTracker::update(
   const std::vector<geometry_msgs::msg::PoseStamped> & poses,
   double current_x,
@@ -613,6 +707,7 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       diagnostics->projection_distance = diagnostic_nan;
       diagnostics->waypoint_distance = diagnostic_nan;
       diagnostics->final_distance = diagnostic_nan;
+      diagnostics->forward_alignment = diagnostic_nan;
     }
     sync_cursor_diagnostics();
     if (pose_index_ + 1U >= poses.size()) {
@@ -803,6 +898,9 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
       std::cos(*planned_yaw) * direction_x + std::sin(*planned_yaw) * direction_y;
     if (!std::isfinite(forward_alignment)) {
       return fail(PathTrackingFailure::kNonFiniteForwardAlignment);
+    }
+    if (diagnostics != nullptr) {
+      diagnostics->forward_alignment = forward_alignment;
     }
     const PlannedTranslationDirection translation_direction =
       std::abs(forward_alignment) <= kLateralForwardAlignmentTolerance ?

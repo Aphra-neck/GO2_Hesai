@@ -18,6 +18,9 @@ go2_sdk2_bridge:
     # more than 0.05 m from the active path projection/final pose. Non-finite
     # geometry, stale inputs, reverse-command, and motion-response gates remain.
     path_cross_track_safety_gate_enabled: false
+    # Same-goal path refreshes preserve tracker progress. A transient forward /
+    # reverse mismatch holds a zero Move for at most 0.75 s while waiting for
+    # the next planner path; the negative-vx safety gate is not disabled.
     goal_position_tolerance: 0.15
     goal_yaw_tolerance: 0.20
     # Rotate in place above 45 deg; resume translation only after reaching 15 deg.

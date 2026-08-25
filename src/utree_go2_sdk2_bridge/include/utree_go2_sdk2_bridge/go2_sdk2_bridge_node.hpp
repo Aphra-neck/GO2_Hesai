@@ -94,6 +94,14 @@ private:
   CompletedGoalLatch completed_goal_latch_;
   std::uint64_t accepted_path_sequence_{0U};
   std::optional<std::int64_t> path_goal_generation_;
+  // A same-goal refresh is reconciled against the current odometry on the
+  // next gated control tick, so the subscription callback never commands.
+  bool path_refresh_pending_reanchor_{false};
+  // A transient forward/reverse mismatch holds a zero Move while the planner
+  // gets one chance to publish a corrected same-goal path. The sequence is
+  // recorded so an old path cannot resume merely because odometry moved.
+  std::optional<std::chrono::steady_clock::time_point> direction_conflict_started_at_;
+  std::optional<std::uint64_t> direction_conflict_path_sequence_;
   nav_msgs::msg::Path::SharedPtr path_;
   nav_msgs::msg::Odometry::SharedPtr odom_;
   mutable std::mutex sport_state_mutex_;

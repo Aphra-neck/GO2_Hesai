@@ -31,7 +31,7 @@ LOCK_OWNER_FILE="${LOCK_DIR}/owner"
 LOG_REPO="${GO2_LOG_REPO:-${HOME}/G02_log}"
 LOG_REMOTE="${GO2_LOG_REMOTE:-https://github.com/Aphra-neck/G02_log.git}"
 LOG_BRANCH="${GO2_LOG_BRANCH:-main}"
-LOG_PROXY="${GO2_LOG_PROXY:-http://192.168.151.145:7890}"
+LOG_PROXY="${GO2_LOG_PROXY:-http://192.168.151.132:7890}"
 
 # Leave room for the independently bounded rosout and parameter-capture writers.
 readonly SESSION_STOP_BYTES=$((36 * 1024 * 1024))
@@ -3524,7 +3524,7 @@ Environment:
   GO2_LOG_ROOT          Runtime root (default: ~/go2_logs)
   GO2_WORKSPACE         GO2_Hesai workspace (default: current Git checkout)
   GO2_LOG_REPO          Local G02_log checkout (default: ~/G02_log)
-  GO2_LOG_PROXY         Git HTTP(S) proxy (default: http://192.168.151.145:7890)
+  GO2_LOG_PROXY         Git HTTP(S) proxy (default: http://192.168.151.132:7890)
   GO2_LOG_REMOTE        Git remote URL
   GO2_LOG_BRANCH        Git branch (default: main)
 EOF
