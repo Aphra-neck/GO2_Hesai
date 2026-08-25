@@ -1082,6 +1082,11 @@ class ReadOnlySurfaceTests(unittest.TestCase):
         self.assertIn("lowstate_frames.fetch_add", reader)
         self.assertIn("invalid_remote_frames.fetch_add", reader)
         self.assertIn('"{\\"schema\\":1,\\"source\\":\\"lowstate\\""', reader)
+        self.assertIn(
+            "(static_cast<std::uint16_t>(bytes[0]) << 8U) |\n"
+            "    static_cast<std::uint16_t>(bytes[1])",
+            reader,
+        )
         gate_index = reader.index("if (packet_head != 0x5551U)")
         gate_return_index = reader.index("return;", gate_index)
         sequence_index = reader.index(

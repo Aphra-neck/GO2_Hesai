@@ -53,7 +53,7 @@ wrapper 只允许覆盖 `--duration` 和 `--discovery-timeout`；reader、网卡
 
 若发现阶段超时，`missing rt/lowstate` 表示 SDK2 reader 没有收到任何 LowState；
 `rt/lowstate present but wireless_remote packets are invalid` 表示 LowState 正在到达，但 40 字节
-`wireless_remote` 字段没有出现要求的 `0x5551` 包头。后一种错误同时报告至少观察到的
+`wireless_remote` 字段没有出现要求的原始包头字节 `55 51`（按线序报告为 `0x5551`）。后一种错误同时报告至少观察到的
 LowState/无效遥控帧数、最近包头和非零字节数，用于区分全零字段与格式不匹配；这种情况下
 继续增大发现超时不会让采集进入 `READY`。
 

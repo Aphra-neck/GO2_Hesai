@@ -127,8 +127,8 @@ void lowStateCallback(const void * data)
   const auto callback_time_ns = monotonicNanoseconds();
   const std::array<std::uint8_t, 40> bytes = message.wireless_remote();
   const std::uint16_t packet_head =
-    static_cast<std::uint16_t>(bytes[0]) |
-    (static_cast<std::uint16_t>(bytes[1]) << 8U);
+    (static_cast<std::uint16_t>(bytes[0]) << 8U) |
+    static_cast<std::uint16_t>(bytes[1]);
   if (packet_head != 0x5551U) {
     const auto invalid_sequence =
       invalid_remote_frames.fetch_add(1, std::memory_order_relaxed) + 1;
