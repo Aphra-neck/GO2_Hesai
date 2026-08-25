@@ -13,7 +13,7 @@ ControlParameters validParameters()
   return ControlParameters{
     20.0, 1.0, 0.5, 1.0, 0.2, 0.6, 0.15, 0.2,
     0.7853981633974483, 0.2617993877991494,
-    0.05, 1.0, 1.5, 0.6, 0.35, 0.8};
+    0.05, 1.0, 1.5, 0.20, 2.0, 0.04, 0.05, 0.6, 0.35, 0.8};
 }
 
 geometry_msgs::msg::Pose validPose()
@@ -83,6 +83,23 @@ TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
   parameters = validParameters();
   parameters.max_vy = -0.1;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
+
+  parameters = validParameters();
+  parameters.minimum_translation_speed = 0.36;
+  EXPECT_FALSE(validateControlParameters(parameters).empty());
+
+  parameters = validParameters();
+  parameters.motion_response_timeout = 0.0;
+  EXPECT_FALSE(validateControlParameters(parameters).empty());
+
+  parameters = validParameters();
+  parameters.motion_response_min_translation = 0.5;
+  EXPECT_FALSE(validateControlParameters(parameters).empty());
+
+  parameters = validParameters();
+  parameters.max_yaw_rate = 4.0;
+  parameters.motion_response_min_yaw = 3.2;
+  EXPECT_FALSE(validateControlParameters(parameters).empty());
 }
 
 TEST(ControlParameters, AcceptsValuesWithinTheSdkCapabilityEnvelope)
@@ -107,6 +124,117 @@ TEST(ControlParameters, RejectsValuesAboveTheSdkCapabilityEnvelope)
   parameters = validParameters();
   parameters.max_yaw_rate = 4.000001;
   EXPECT_FALSE(validateControlParameters(parameters).empty());
+}
+
+TEST(MinimumPlanarSpeed, PreservesZeroAndCommandsAboveTheFloor)
+{
+  const VelocityCommand zero{0.0F, 0.0F, 0.2F};
+  const auto preserved_zero = applyMinimumPlanarSpeed(zero, 0.20, 0.6, 0.35);
+  ASSERT_TRUE(preserved_zero.has_value());
+  EXPECT_FLOAT_EQ(preserved_zero->vx, 0.0F);
+  EXPECT_FLOAT_EQ(preserved_zero->vy, 0.0F);
+  EXPECT_FLOAT_EQ(preserved_zero->yaw_rate, 0.2F);
+
+  const VelocityCommand already_fast{0.18F, -0.12F, -0.1F};
+  const auto preserved_fast = applyMinimumPlanarSpeed(already_fast, 0.20, 0.6, 0.35);
+  ASSERT_TRUE(preserved_fast.has_value());
+  EXPECT_FLOAT_EQ(preserved_fast->vx, already_fast.vx);
+  EXPECT_FLOAT_EQ(preserved_fast->vy, already_fast.vy);
+  EXPECT_FLOAT_EQ(preserved_fast->yaw_rate, already_fast.yaw_rate);
+}
+
+TEST(MinimumPlanarSpeed, RaisesLowSpeedWithoutChangingDirection)
+{
+  const VelocityCommand low_speed{0.06F, -0.08F, 0.03F};
+  const auto command = applyMinimumPlanarSpeed(low_speed, 0.20, 0.6, 0.35);
+  ASSERT_TRUE(command.has_value());
+
+  EXPECT_NEAR(command->vx, 0.12, 1.0e-6);
+  EXPECT_NEAR(command->vy, -0.16, 1.0e-6);
+  EXPECT_NEAR(std::hypot(command->vx, command->vy), 0.20, 1.0e-6);
+  EXPECT_FLOAT_EQ(command->yaw_rate, low_speed.yaw_rate);
+}
+
+TEST(MinimumPlanarSpeed, RejectsInvalidOrUnreachableConfiguration)
+{
+  const VelocityCommand command{0.06F, -0.08F, 0.0F};
+  EXPECT_FALSE(applyMinimumPlanarSpeed(command, 0.36, 0.6, 0.35).has_value());
+  EXPECT_FALSE(applyMinimumPlanarSpeed(command, -0.1, 0.6, 0.35).has_value());
+
+  auto invalid = command;
+  invalid.vx = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_FALSE(applyMinimumPlanarSpeed(invalid, 0.20, 0.6, 0.35).has_value());
+}
+
+TEST(MotionResponseWatchdog, TimesOutWithoutTranslationProgress)
+{
+  MotionResponseWatchdog watchdog;
+  const VelocityCommand command{0.20F, 0.0F, 0.0F};
+
+  const auto started = watchdog.observe(command, 0.0, 0.0, 0.0, 10.0, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(started.has_value());
+  EXPECT_TRUE(*started);
+  const auto waiting = watchdog.observe(command, 0.01, 0.0, 0.0, 11.9, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(waiting.has_value());
+  EXPECT_TRUE(*waiting);
+  const auto timed_out = watchdog.observe(command, 0.01, 0.0, 0.0, 12.01, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(timed_out.has_value());
+  EXPECT_FALSE(*timed_out);
+}
+
+TEST(MotionResponseWatchdog, TranslationProgressRenewsTheDeadline)
+{
+  MotionResponseWatchdog watchdog;
+  const VelocityCommand command{0.20F, 0.0F, 0.0F};
+
+  const auto started = watchdog.observe(command, 0.0, 0.0, 0.0, 20.0, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(started.has_value());
+  EXPECT_TRUE(*started);
+  const auto progressed = watchdog.observe(command, 0.04, 0.0, 0.0, 21.9, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(progressed.has_value());
+  EXPECT_TRUE(*progressed);
+  const auto renewed = watchdog.observe(command, 0.04, 0.0, 0.0, 23.8, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(renewed.has_value());
+  EXPECT_TRUE(*renewed);
+  const auto timed_out = watchdog.observe(
+    command, 0.04, 0.0, 0.0, 23.91, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(timed_out.has_value());
+  EXPECT_FALSE(*timed_out);
+}
+
+TEST(MotionResponseWatchdog, HandlesWrappedYawAndZeroCommandReset)
+{
+  MotionResponseWatchdog watchdog;
+  const VelocityCommand rotate{0.0F, 0.0F, 0.20F};
+  const VelocityCommand zero{0.0F, 0.0F, 0.0F};
+
+  const auto started = watchdog.observe(rotate, 0.0, 0.0, 3.13, 30.0, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(started.has_value());
+  EXPECT_TRUE(*started);
+  const auto wrapped_progress =
+    watchdog.observe(rotate, 0.0, 0.0, -3.10, 31.0, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(wrapped_progress.has_value());
+  EXPECT_TRUE(*wrapped_progress);
+  const auto inactive = watchdog.observe(zero, 0.0, 0.0, -3.10, 34.0, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(inactive.has_value());
+  EXPECT_TRUE(*inactive);
+  const auto restarted = watchdog.observe(rotate, 0.0, 0.0, -3.10, 35.0, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(restarted.has_value());
+  EXPECT_TRUE(*restarted);
+}
+
+TEST(MotionResponseWatchdog, RejectsNonFiniteOrBackwardSteadyTime)
+{
+  MotionResponseWatchdog watchdog;
+  const VelocityCommand command{0.20F, 0.0F, 0.0F};
+  const auto started = watchdog.observe(command, 0.0, 0.0, 0.0, 40.0, 2.0, 0.04, 0.05);
+  ASSERT_TRUE(started.has_value());
+  EXPECT_TRUE(*started);
+  EXPECT_FALSE(watchdog.observe(command, 0.0, 0.0, 0.0, 39.9, 2.0, 0.04, 0.05).has_value());
+  EXPECT_FALSE(
+    watchdog.observe(
+      command, std::numeric_limits<double>::quiet_NaN(), 0.0, 0.0,
+      40.1, 2.0, 0.04, 0.05).has_value());
 }
 
 TEST(PoseValidation, RejectsNonFinitePosition)

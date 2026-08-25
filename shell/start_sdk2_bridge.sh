@@ -111,6 +111,17 @@ IFS='|' read -r MAX_VY MAX_VY_SOURCE < <(velocity_limit GO2_MAX_VY max_vy)
 IFS='|' read -r MAX_YAW_RATE MAX_YAW_RATE_SOURCE < <(
   velocity_limit GO2_MAX_YAW_RATE max_yaw_rate
 )
+MIN_TRANSLATION_SPEED="$(yaml_number minimum_translation_speed)"
+MOTION_RESPONSE_TIMEOUT="$(yaml_number motion_response_timeout)"
+MOTION_RESPONSE_MIN_TRANSLATION="$(yaml_number motion_response_min_translation)"
+MOTION_RESPONSE_MIN_YAW="$(yaml_number motion_response_min_yaw)"
+for required_value in MIN_TRANSLATION_SPEED MOTION_RESPONSE_TIMEOUT \
+  MOTION_RESPONSE_MIN_TRANSLATION MOTION_RESPONSE_MIN_YAW; do
+  if [[ -z "${!required_value}" ]]; then
+    echo "Missing ${required_value} in bridge config: ${BRIDGE_CONFIG}" >&2
+    exit 1
+  fi
+done
 
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
   LD_LIBRARY_PATH="${UNITREE_SDK_LIBRARY_DIR}:${LD_LIBRARY_PATH}"
@@ -191,6 +202,9 @@ echo " Velocity limits:"
 echo "   vx=${MAX_VX} m/s [${MAX_VX_SOURCE}]"
 echo "   vy=${MAX_VY} m/s [${MAX_VY_SOURCE}]"
 echo "   yaw=${MAX_YAW_RATE} rad/s [${MAX_YAW_RATE_SOURCE}]"
+echo " Minimum translation: ${MIN_TRANSLATION_SPEED} m/s [YAML: ${BRIDGE_CONFIG}]"
+echo " Motion-response watchdog: ${MOTION_RESPONSE_TIMEOUT} s"
+echo "   progress=${MOTION_RESPONSE_MIN_TRANSLATION} m / ${MOTION_RESPONSE_MIN_YAW} rad"
 echo "======================================"
 echo "In another Jetson terminal, verify the scene and arm once with:"
 echo "cd ${WORKSPACE_DIR}"

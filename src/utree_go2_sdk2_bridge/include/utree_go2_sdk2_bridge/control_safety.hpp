@@ -22,6 +22,7 @@ inline constexpr double kMaximumPathProgressAdvance = 0.4;
 inline constexpr double kMaximumPathCrossTrack = 0.05;
 inline constexpr double kSignedCornerReachTolerance = 1.0e-3;
 inline constexpr double kUnexpectedReverseTolerance = 1.0e-4;
+inline constexpr double kMotionResponseCommandEpsilon = 1.0e-4;
 // The 16-bin planner's closest rounded diagonal is 22.5 degrees from lateral.
 // Split that interval at 11.25 degrees so grid jitter stays lateral while the
 // diagonal primitive keeps its longitudinal component: sin(pi / 16).
@@ -42,6 +43,10 @@ struct ControlParameters
   double explicit_rotation_tolerance;
   double linear_gain;
   double yaw_gain;
+  double minimum_translation_speed;
+  double motion_response_timeout;
+  double motion_response_min_translation;
+  double motion_response_min_yaw;
   double max_vx;
   double max_vy;
   double max_yaw_rate;
@@ -52,6 +57,46 @@ struct VelocityCommand
   float vx;
   float vy;
   float yaw_rate;
+};
+
+// Raises a non-zero planar command above the empirically observed no-response
+// band while preserving its direction and the already bounded yaw command.
+std::optional<VelocityCommand> applyMinimumPlanarSpeed(
+  const VelocityCommand & command,
+  double minimum_speed,
+  double max_vx,
+  double max_vy);
+
+// Fails closed when a continuing non-zero command produces no bounded odometry
+// progress. The steady_time argument keeps this helper independent of ROS time.
+class MotionResponseWatchdog
+{
+public:
+  void reset();
+
+  std::optional<bool> observe(
+    const VelocityCommand & command,
+    double current_x,
+    double current_y,
+    double current_yaw,
+    double steady_time,
+    double timeout,
+    double minimum_translation,
+    double minimum_yaw);
+
+private:
+  enum class Mode
+  {
+    kInactive,
+    kTranslation,
+    kRotation,
+  };
+
+  Mode mode_{Mode::kInactive};
+  double checkpoint_x_{0.0};
+  double checkpoint_y_{0.0};
+  double checkpoint_yaw_{0.0};
+  double checkpoint_time_{0.0};
 };
 
 enum class PlannedTranslationDirection

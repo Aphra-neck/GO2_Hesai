@@ -174,6 +174,28 @@ std::string validateControlParameters(const ControlParameters & parameters)
   if (!inPositiveRange(parameters.max_yaw_rate, kSdkMaxAbsYawRate)) {
     return "max_yaw_rate must be finite and in (0, 4] rad/s";
   }
+  const double minimum_axis_limit = std::min(parameters.max_vx, parameters.max_vy);
+  if (!inPositiveRange(parameters.minimum_translation_speed, minimum_axis_limit)) {
+    return "minimum_translation_speed must be finite, positive, and no greater than both "
+           "max_vx and max_vy";
+  }
+  if (!inPositiveRange(parameters.motion_response_timeout, 10.0)) {
+    return "motion_response_timeout must be finite and in (0, 10] seconds";
+  }
+  if (!inPositiveRange(
+      parameters.motion_response_min_translation,
+      parameters.minimum_translation_speed * parameters.motion_response_timeout))
+  {
+    return "motion_response_min_translation must be finite, positive, and reachable at the "
+           "minimum translation speed within the response timeout";
+  }
+  const double maximum_response_yaw = std::min(
+    kPi, parameters.max_yaw_rate * parameters.motion_response_timeout);
+  if (!inPositiveRange(parameters.motion_response_min_yaw, maximum_response_yaw))
+  {
+    return "motion_response_min_yaw must be finite, positive, no greater than pi, and "
+           "reachable at max_yaw_rate within the response timeout";
+  }
   return {};
 }
 
@@ -242,6 +264,107 @@ std::optional<VelocityCommand> makeBoundedCommand(
     return std::nullopt;
   }
   return command;
+}
+
+std::optional<VelocityCommand> applyMinimumPlanarSpeed(
+  const VelocityCommand & command,
+  double minimum_speed,
+  double max_vx,
+  double max_vy)
+{
+  if (!std::isfinite(command.vx) || !std::isfinite(command.vy) ||
+    !std::isfinite(command.yaw_rate) ||
+    !inClosedRange(minimum_speed, 0.0, std::min(max_vx, max_vy)) ||
+    !inPositiveRange(max_vx, std::numeric_limits<float>::max()) ||
+    !inPositiveRange(max_vy, std::numeric_limits<float>::max()) ||
+    std::abs(command.vx) > max_vx || std::abs(command.vy) > max_vy)
+  {
+    return std::nullopt;
+  }
+
+  const double planar_speed = std::hypot(command.vx, command.vy);
+  if (!std::isfinite(planar_speed)) {
+    return std::nullopt;
+  }
+  if (planar_speed <= kMotionResponseCommandEpsilon || planar_speed >= minimum_speed) {
+    return command;
+  }
+
+  const double scale = minimum_speed / planar_speed;
+  const VelocityCommand scaled{
+    static_cast<float>(static_cast<double>(command.vx) * scale),
+    static_cast<float>(static_cast<double>(command.vy) * scale),
+    command.yaw_rate};
+  if (!std::isfinite(scaled.vx) || !std::isfinite(scaled.vy) ||
+    std::abs(scaled.vx) > max_vx || std::abs(scaled.vy) > max_vy)
+  {
+    return std::nullopt;
+  }
+  return scaled;
+}
+
+void MotionResponseWatchdog::reset()
+{
+  mode_ = Mode::kInactive;
+  checkpoint_x_ = 0.0;
+  checkpoint_y_ = 0.0;
+  checkpoint_yaw_ = 0.0;
+  checkpoint_time_ = 0.0;
+}
+
+std::optional<bool> MotionResponseWatchdog::observe(
+  const VelocityCommand & command,
+  double current_x,
+  double current_y,
+  double current_yaw,
+  double steady_time,
+  double timeout,
+  double minimum_translation,
+  double minimum_yaw)
+{
+  if (!std::isfinite(command.vx) || !std::isfinite(command.vy) ||
+    !std::isfinite(command.yaw_rate) || !std::isfinite(current_x) ||
+    !std::isfinite(current_y) || !std::isfinite(current_yaw) ||
+    !std::isfinite(steady_time) || !inPositiveRange(timeout, 10.0) ||
+    !inPositiveRange(minimum_translation, std::numeric_limits<double>::max()) ||
+    !inPositiveRange(minimum_yaw, kPi))
+  {
+    return std::nullopt;
+  }
+
+  const double translation_command = std::hypot(command.vx, command.vy);
+  const Mode next_mode = translation_command > kMotionResponseCommandEpsilon ?
+    Mode::kTranslation :
+    (std::abs(command.yaw_rate) > kMotionResponseCommandEpsilon ?
+    Mode::kRotation : Mode::kInactive);
+  if (next_mode == Mode::kInactive) {
+    reset();
+    return true;
+  }
+
+  if (mode_ != next_mode) {
+    mode_ = next_mode;
+    checkpoint_x_ = current_x;
+    checkpoint_y_ = current_y;
+    checkpoint_yaw_ = current_yaw;
+    checkpoint_time_ = steady_time;
+    return true;
+  }
+  if (steady_time < checkpoint_time_) {
+    return std::nullopt;
+  }
+
+  const bool response_observed = mode_ == Mode::kTranslation ?
+    std::hypot(current_x - checkpoint_x_, current_y - checkpoint_y_) >= minimum_translation :
+    std::abs(std::remainder(current_yaw - checkpoint_yaw_, 2.0 * kPi)) >= minimum_yaw;
+  if (response_observed) {
+    checkpoint_x_ = current_x;
+    checkpoint_y_ = current_y;
+    checkpoint_yaw_ = current_yaw;
+    checkpoint_time_ = steady_time;
+    return true;
+  }
+  return steady_time - checkpoint_time_ <= timeout;
 }
 
 std::optional<bool> updateHeadingAlignmentGate(

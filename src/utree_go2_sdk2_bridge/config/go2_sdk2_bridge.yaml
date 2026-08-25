@@ -23,6 +23,14 @@ go2_sdk2_bridge:
     explicit_rotation_tolerance: 0.05
     linear_gain: 1.0
     yaw_gain: 1.5
+    # The synchronized hardware capture showed repeated no-response episodes
+    # while commands stayed at 0.069-0.137 m/s. Preserve direction but lift
+    # non-zero translation above that observed band.
+    minimum_translation_speed: 0.20
+    # Disarm instead of leaving an unexecuted command stream armed indefinitely.
+    motion_response_timeout: 2.0
+    motion_response_min_translation: 0.04
+    motion_response_min_yaw: 0.05
     max_vx: 0.6
     max_vy: 0.35
     max_yaw_rate: 0.8

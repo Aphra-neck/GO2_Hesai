@@ -81,10 +81,15 @@ private:
   bool heading_alignment_active_{false};
   double linear_gain_{1.0};
   double yaw_gain_{1.5};
+  double minimum_translation_speed_{0.20};
+  double motion_response_timeout_{2.0};
+  double motion_response_min_translation_{0.04};
+  double motion_response_min_yaw_{0.05};
   double max_vx_{};
   double max_vy_{};
   double max_yaw_rate_{};
   PathProgressTracker path_progress_tracker_;
+  MotionResponseWatchdog motion_response_watchdog_;
   CompletedGoalLatch completed_goal_latch_;
   std::optional<std::int64_t> path_goal_generation_;
   nav_msgs::msg::Path::SharedPtr path_;

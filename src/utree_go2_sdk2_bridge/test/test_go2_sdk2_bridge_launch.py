@@ -235,12 +235,16 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
         state_gate = control.index("if (!isExecutableSportState")
         odom_gate = control.index("if (!odomFresh(current_time))")
         waiting_move = control.index('holdZeroMoveWhileWaiting("waiting for a path")')
+        minimum_speed = control.index("applyMinimumPlanarSpeed")
+        response_watchdog = control.index("motion_response_watchdog_.observe")
         path_move = control.index("sendMove(command->vx")
         self.assertLess(lowcmd_gate, waiting_move)
         self.assertLess(state_read, state_gate)
         self.assertLess(state_gate, waiting_move)
         self.assertLess(odom_gate, waiting_move)
         self.assertLess(state_gate, path_move)
+        self.assertLess(minimum_speed, response_watchdog)
+        self.assertLess(response_watchdog, path_move)
 
     def test_velocity_arguments_do_not_override_yaml_by_default(self):
         description = _load_launch_description()

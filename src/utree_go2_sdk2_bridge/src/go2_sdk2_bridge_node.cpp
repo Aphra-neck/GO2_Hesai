@@ -82,6 +82,18 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   max_vx_ = declare_parameter<double>("max_vx", velocity_limit_descriptor);
   max_vy_ = declare_parameter<double>("max_vy", velocity_limit_descriptor);
   max_yaw_rate_ = declare_parameter<double>("max_yaw_rate", velocity_limit_descriptor);
+  rcl_interfaces::msg::ParameterDescriptor response_descriptor;
+  response_descriptor.description =
+    "Read-only low-speed execution and physical-response safety setting";
+  response_descriptor.read_only = true;
+  minimum_translation_speed_ =
+    declare_parameter<double>("minimum_translation_speed", 0.20, response_descriptor);
+  motion_response_timeout_ =
+    declare_parameter<double>("motion_response_timeout", 2.0, response_descriptor);
+  motion_response_min_translation_ = declare_parameter<double>(
+    "motion_response_min_translation", 0.04, response_descriptor);
+  motion_response_min_yaw_ =
+    declare_parameter<double>("motion_response_min_yaw", 0.05, response_descriptor);
   world_frame_ = declare_parameter("world_frame", "world");
   body_frame_ = declare_parameter("body_frame", "base_link");
   const std::string path_topic = declare_parameter("path_topic", "/body_path");
@@ -107,7 +119,9 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     lookahead_distance_, goal_position_tolerance_, goal_yaw_tolerance_,
     heading_alignment_enter_angle_, heading_alignment_exit_angle_,
     explicit_rotation_tolerance_,
-    linear_gain_, yaw_gain_, max_vx_, max_vy_, max_yaw_rate_};
+    linear_gain_, yaw_gain_, minimum_translation_speed_, motion_response_timeout_,
+    motion_response_min_translation_, motion_response_min_yaw_,
+    max_vx_, max_vy_, max_yaw_rate_};
   const std::string parameter_error = validateControlParameters(parameters);
   if (!parameter_error.empty()) {
     throw std::invalid_argument(parameter_error);
@@ -379,6 +393,7 @@ void Go2Sdk2BridgeNode::enableCallback(
       path_.reset();
       path_goal_generation_.reset();
       path_progress_tracker_.reset();
+      motion_response_watchdog_.reset();
       completed_goal_latch_.clear();
       heading_alignment_active_ = false;
       const bool stopped = stopRobot("motion disabled by service");
@@ -462,6 +477,7 @@ void Go2Sdk2BridgeNode::enableCallback(
       return;
     }
     motion_authorization_.arm(path_ != nullptr);
+    motion_response_watchdog_.reset();
     response->success = true;
     response->message = path_ ?
       "Go2 motion armed" : "Go2 motion armed; waiting for a fresh body path";
@@ -649,12 +665,38 @@ void Go2Sdk2BridgeNode::controlTickImpl()
   }
   const double raw_vy = linear_gain_ * body_dy;
   const double raw_yaw_rate = yaw_gain_ * (*target_yaw_error);
-  const auto command = makeHeadingAwareCommand(
+  const auto bounded_command = makeHeadingAwareCommand(
     *raw_vx, raw_vy, raw_yaw_rate, heading_alignment_active_,
     max_vx_, max_vy_, max_yaw_rate_);
-  if (!command) {
+  if (!bounded_command) {
     failSafe("non-finite or invalid velocity command");
     RCLCPP_ERROR(get_logger(), "Rejected unsafe velocity command before SportClient::Move");
+    return;
+  }
+  const auto command = applyMinimumPlanarSpeed(
+    *bounded_command, minimum_translation_speed_, max_vx_, max_vy_);
+  if (!command) {
+    failSafe("invalid minimum-speed command");
+    RCLCPP_ERROR(get_logger(), "Rejected invalid minimum-speed command before SportClient::Move");
+    return;
+  }
+
+  const double steady_time = std::chrono::duration<double>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+  const auto response_healthy = motion_response_watchdog_.observe(
+    *command, current.position.x, current.position.y, *current_yaw, steady_time,
+    motion_response_timeout_, motion_response_min_translation_, motion_response_min_yaw_);
+  if (!response_healthy) {
+    failSafe("invalid motion response watchdog state");
+    RCLCPP_ERROR(get_logger(), "Motion response watchdog rejected invalid state");
+    return;
+  }
+  if (!*response_healthy) {
+    failSafe("motion response timeout");
+    RCLCPP_ERROR(
+      get_logger(),
+      "Stopped after %.2f s without %.3f m/%.3f rad of odometry response",
+      motion_response_timeout_, motion_response_min_translation_, motion_response_min_yaw_);
     return;
   }
 
@@ -728,6 +770,7 @@ void Go2Sdk2BridgeNode::failSafe(const char * reason)
   path_goal_generation_.reset();
   odom_.reset();
   path_progress_tracker_.reset();
+  motion_response_watchdog_.reset();
   completed_goal_latch_.clear();
   heading_alignment_active_ = false;
   stopRobot(reason);
@@ -743,6 +786,7 @@ bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
   path_.reset();
   path_goal_generation_.reset();
   path_progress_tracker_.reset();
+  motion_response_watchdog_.reset();
   motion_authorization_.waitForPath();
   heading_alignment_active_ = false;
 
@@ -756,6 +800,7 @@ bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
 
 bool Go2Sdk2BridgeNode::holdZeroMoveWhileWaiting(const char * reason)
 {
+  motion_response_watchdog_.reset();
   if (!motion_authorization_.armed()) {
     return stopRobot(reason);
   }
