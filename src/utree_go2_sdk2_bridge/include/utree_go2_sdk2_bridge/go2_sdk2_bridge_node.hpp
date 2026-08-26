@@ -1,9 +1,9 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 
@@ -12,17 +12,20 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_srvs/srv/set_bool.hpp"
-#include "unitree/idl/go2/SportModeState_.hpp"
-#include "unitree/robot/channel/channel_subscriber.hpp"
-#include "utree_go2_sdk2_bridge/control_safety.hpp"
-#include "utree_go2_sdk2_bridge/sdk_command_worker.hpp"
+#include "unitree/robot/go2/sport/sport_client.hpp"
 
 namespace utree_go2_sdk2_bridge
 {
 
-// Converts the geometric body path into bounded Go2 SportClient velocity commands.
-// Motion is disarmed by default. One explicit arm authorizes subsequent valid paths,
-// while every active command is stopped whenever its required input becomes stale.
+// Official-style SDK2 path executor.
+//
+// The planner owns route generation and publishes /body_path. Once the
+// operator arms this node, the control timer calls SportClient::Move directly
+// on every tick. A completed route stays armed and emits Move(0, 0, 0) until
+// a path for a new goal arrives. The bridge deliberately has no cross-track,
+// progress, or "no motion" disarm gate: the only runtime stop paths are an
+// SDK failure, an input timeout, a /lowcmd conflict, an explicit disable, or
+// node shutdown.
 class Go2Sdk2BridgeNode : public rclcpp::Node
 {
 public:
@@ -30,87 +33,70 @@ public:
   ~Go2Sdk2BridgeNode() noexcept override;
 
 private:
+  struct PathCommand
+  {
+    double vx{0.0};
+    double vy{0.0};
+    double yaw_rate{0.0};
+    bool completed{false};
+  };
+
   void pathCallback(const nav_msgs::msg::Path::SharedPtr msg);
   void odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
-  void sportStateCallback(const void * message);
   void enableCallback(
     const std_srvs::srv::SetBool::Request::SharedPtr request,
     std_srvs::srv::SetBool::Response::SharedPtr response);
   void controlTick();
   void controlTickImpl();
-  bool processSdkCompletions();
-  void failSafe(const char * reason);
-  bool waitForNewPath(const char * reason);
-  bool holdZeroMoveWhileWaiting(const char * reason);
+
+  std::optional<PathCommand> makePathCommand();
+  void reanchorPathCursor();
+  void clearExecutionState();
+  void disableAfterFault(const char * reason);
   bool sendMove(double vx, double vy, double yaw_rate);
-  bool stopRobot(const char * reason) noexcept;
+  bool stopRobot(const char * reason, bool force = false) noexcept;
   bool cachedPathValid() const;
   bool cachedOdomValid() const;
-  bool pathFresh(const rclcpp::Time & current_time) const;
-  bool odomFresh(const rclcpp::Time & current_time) const;
-  double messageAgeSeconds(
-    const rclcpp::Time & message_time,
-    const rclcpp::Time & current_time) const;
-  bool messageStampFresh(
-    const rclcpp::Time & message_time,
-    const rclcpp::Time & current_time,
-    double timeout) const;
-  std::optional<SportStateSample> freshSportState();
+  bool pathFresh() const;
+  bool odomFresh() const;
   bool lowcmdPublisherPresent();
 
   std::string network_interface_;
   std::string world_frame_;
   std::string body_frame_;
   int domain_id_{0};
-  MotionAuthorization motion_authorization_;
-  // Cleared only after the SDK worker confirms StopMove.
-  bool command_active_{false};
-  std::optional<SdkCommandSequence> pending_stop_sequence_;
-  std::string pending_stop_reason_;
+
   double command_rate_{20.0};
   double path_timeout_{1.0};
   double odom_timeout_{0.5};
-  double sport_state_timeout_{1.0};
-  double timestamp_future_tolerance_{0.2};
-  double lookahead_distance_{0.6};
-  bool path_cross_track_safety_gate_enabled_{true};
+  double lookahead_distance_{0.35};
+  double waypoint_tolerance_{0.12};
   double goal_position_tolerance_{0.15};
   double goal_yaw_tolerance_{0.20};
-  double heading_alignment_enter_angle_{0.7853981633974483};
-  double heading_alignment_exit_angle_{0.2617993877991494};
-  double explicit_rotation_tolerance_{0.05};
-  bool heading_alignment_active_{false};
-  double linear_gain_{1.0};
+  double heading_alignment_enter_angle_{0.35};
+  double heading_alignment_exit_angle_{0.12};
+  double explicit_rotation_tolerance_{0.08};
+  double translation_speed_{0.20};
   double yaw_gain_{1.5};
-  double minimum_translation_speed_{0.20};
-  double motion_response_timeout_{2.0};
-  double motion_response_min_translation_{0.04};
-  double motion_response_min_yaw_{0.05};
-  double max_vx_{};
-  double max_vy_{};
-  double max_yaw_rate_{};
-  PathProgressTracker path_progress_tracker_;
-  MotionResponseWatchdog motion_response_watchdog_;
-  CompletedGoalLatch completed_goal_latch_;
-  std::uint64_t accepted_path_sequence_{0U};
-  std::optional<std::int64_t> path_goal_generation_;
-  // A same-goal refresh is reconciled against the current odometry on the
-  // next gated control tick, so the subscription callback never commands.
+  double max_vx_{0.6};
+  double max_vy_{0.35};
+  double max_yaw_rate_{0.8};
+
+  bool motion_enabled_{false};
+  bool command_active_{false};
+  bool heading_alignment_active_{false};
+  bool path_waiting_for_new_goal_{false};
   bool path_refresh_pending_reanchor_{false};
-  // A transient forward/reverse mismatch holds a zero Move while the planner
-  // gets one chance to publish a corrected same-goal path. The sequence is
-  // recorded so an old path cannot resume merely because odometry moved.
-  std::optional<std::chrono::steady_clock::time_point> direction_conflict_started_at_;
-  std::optional<std::uint64_t> direction_conflict_path_sequence_;
+
+  std::size_t path_cursor_index_{0U};
+  std::optional<std::int64_t> path_goal_generation_;
+  std::optional<std::int64_t> completed_goal_generation_;
   nav_msgs::msg::Path::SharedPtr path_;
   nav_msgs::msg::Odometry::SharedPtr odom_;
-  mutable std::mutex sport_state_mutex_;
-  UnsafeSportStateLatch unsafe_sport_state_latch_;
-  std::optional<SportStateSample> sport_state_;
-  std::chrono::steady_clock::time_point sport_state_received_at_{};
-  std::unique_ptr<SdkCommandWorker> command_worker_;
-  unitree::robot::ChannelSubscriberPtr<unitree_go::msg::dds_::SportModeState_>
-  sport_state_sub_;
+  std::chrono::steady_clock::time_point last_path_received_{};
+  std::chrono::steady_clock::time_point last_odom_received_{};
+
+  std::unique_ptr<unitree::robot::go2::SportClient> sport_client_;
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr command_pub_;

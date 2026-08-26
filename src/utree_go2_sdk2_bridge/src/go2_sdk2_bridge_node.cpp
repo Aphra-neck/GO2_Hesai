@@ -3,104 +3,57 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <limits>
-#include <memory>
 #include <stdexcept>
-#include <utility>
 
-#include "rcl_interfaces/msg/parameter_descriptor.hpp"
 #include "unitree/robot/channel/channel_factory.hpp"
-#include "unitree/robot/go2/sport/sport_client.hpp"
+#include "utree_go2_sdk2_bridge/control_safety.hpp"
 
 namespace utree_go2_sdk2_bridge
 {
 namespace
 {
 constexpr double kPi = 3.14159265358979323846;
+constexpr double kGeometryEpsilon = 1.0e-6;
 
 double normalizeAngle(double angle)
 {
   return std::remainder(angle, 2.0 * kPi);
 }
 
-class SportClientCommandBackend final : public SdkCommandBackend
+bool finite(double value)
 {
-public:
-  explicit SportClientCommandBackend(
-    std::unique_ptr<unitree::robot::go2::SportClient> sport_client)
-  : sport_client_(std::move(sport_client))
-  {
-  }
+  return std::isfinite(value);
+}
 
-  std::int32_t move(const SdkVelocityCommand & command) override
-  {
-    return sport_client_->Move(command.vx, command.vy, command.yaw_rate);
-  }
-
-  std::int32_t stop() override
-  {
-    return sport_client_->StopMove();
-  }
-
-private:
-  std::unique_ptr<unitree::robot::go2::SportClient> sport_client_;
-};
 }  // namespace
 
 Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
 {
+  const bool configured_enabled = declare_parameter<bool>("enabled", false);
   network_interface_ = declare_parameter("network_interface", "enP8p1s0");
   domain_id_ = declare_parameter("domain_id", 0);
-  rcl_interfaces::msg::ParameterDescriptor enabled_descriptor;
-  enabled_descriptor.description =
-    "Deprecated startup setting; must remain false. Use ~/enable_motion at runtime.";
-  enabled_descriptor.read_only = true;
-  const bool configured_enabled =
-    declare_parameter<bool>("enabled", false, enabled_descriptor);
   command_rate_ = declare_parameter("command_rate", 20.0);
   path_timeout_ = declare_parameter("path_timeout", 1.0);
   odom_timeout_ = declare_parameter("odom_timeout", 0.5);
-  sport_state_timeout_ = declare_parameter("sport_state_timeout", 1.0);
-  timestamp_future_tolerance_ = declare_parameter("timestamp_future_tolerance", 0.2);
-  lookahead_distance_ = declare_parameter("lookahead_distance", 0.6);
-  rcl_interfaces::msg::ParameterDescriptor path_cross_track_descriptor;
-  path_cross_track_descriptor.description =
-    "Enforce the 0.05 m path/rotation-waypoint/final-distance stop gate; finite-value checks "
-    "remain active when disabled";
-  path_cross_track_descriptor.read_only = true;
-  path_cross_track_safety_gate_enabled_ = declare_parameter<bool>(
-    "path_cross_track_safety_gate_enabled", true, path_cross_track_descriptor);
+  lookahead_distance_ = declare_parameter("lookahead_distance", 0.35);
+  waypoint_tolerance_ = declare_parameter("waypoint_tolerance", 0.12);
   goal_position_tolerance_ = declare_parameter("goal_position_tolerance", 0.15);
   goal_yaw_tolerance_ = declare_parameter("goal_yaw_tolerance", 0.20);
-  heading_alignment_enter_angle_ =
-    declare_parameter("heading_alignment_enter_angle", 0.7853981633974483);
-  heading_alignment_exit_angle_ =
-    declare_parameter("heading_alignment_exit_angle", 0.2617993877991494);
-  explicit_rotation_tolerance_ =
-    declare_parameter("explicit_rotation_tolerance", 0.05);
-  linear_gain_ = declare_parameter("linear_gain", 1.0);
+  heading_alignment_enter_angle_ = declare_parameter(
+    "heading_alignment_enter_angle", 0.35);
+  heading_alignment_exit_angle_ = declare_parameter(
+    "heading_alignment_exit_angle", 0.12);
+  explicit_rotation_tolerance_ = declare_parameter(
+    "explicit_rotation_tolerance", 0.08);
+  translation_speed_ = declare_parameter("translation_speed", 0.20);
   yaw_gain_ = declare_parameter("yaw_gain", 1.5);
-  rcl_interfaces::msg::ParameterDescriptor velocity_limit_descriptor;
-  velocity_limit_descriptor.description =
-    "Read-only operating limit loaded from YAML or an explicit launch override";
-  velocity_limit_descriptor.read_only = true;
-  max_vx_ = declare_parameter<double>("max_vx", velocity_limit_descriptor);
-  max_vy_ = declare_parameter<double>("max_vy", velocity_limit_descriptor);
-  max_yaw_rate_ = declare_parameter<double>("max_yaw_rate", velocity_limit_descriptor);
-  rcl_interfaces::msg::ParameterDescriptor response_descriptor;
-  response_descriptor.description =
-    "Read-only low-speed execution and physical-response safety setting";
-  response_descriptor.read_only = true;
-  minimum_translation_speed_ =
-    declare_parameter<double>("minimum_translation_speed", 0.20, response_descriptor);
-  motion_response_timeout_ =
-    declare_parameter<double>("motion_response_timeout", 2.0, response_descriptor);
-  motion_response_min_translation_ = declare_parameter<double>(
-    "motion_response_min_translation", 0.04, response_descriptor);
-  motion_response_min_yaw_ =
-    declare_parameter<double>("motion_response_min_yaw", 0.05, response_descriptor);
+  max_vx_ = declare_parameter("max_vx", 0.6);
+  max_vy_ = declare_parameter("max_vy", 0.35);
+  max_yaw_rate_ = declare_parameter("max_yaw_rate", 0.8);
   world_frame_ = declare_parameter("world_frame", "world");
   body_frame_ = declare_parameter("body_frame", "base_link");
   const std::string path_topic = declare_parameter("path_topic", "/body_path");
@@ -108,49 +61,63 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
 
   if (configured_enabled) {
     throw std::invalid_argument(
-            "enabled=true at startup is forbidden; start disabled and call "
-            "~/enable_motion only after the operator verifies the robot is safe");
+            "enabled=true at startup is forbidden; call ~/enable_motion explicitly");
   }
   if (network_interface_.empty()) {
-    throw std::invalid_argument("network_interface must name the NIC connected to the Go2");
+    throw std::invalid_argument("network_interface must name the Go2 NIC");
   }
   if (domain_id_ < 0 || domain_id_ > 232) {
     throw std::invalid_argument("domain_id must be in [0, 232]");
   }
   if (world_frame_.empty() || body_frame_.empty() || path_topic.empty() || odom_topic.empty()) {
-    throw std::invalid_argument(
-            "world_frame, body_frame, path_topic, and odom_topic must not be empty");
+    throw std::invalid_argument("world_frame, body_frame, and topics must not be empty");
   }
-  const ControlParameters parameters{
-    command_rate_, path_timeout_, odom_timeout_, sport_state_timeout_, timestamp_future_tolerance_,
-    lookahead_distance_, goal_position_tolerance_, goal_yaw_tolerance_,
-    heading_alignment_enter_angle_, heading_alignment_exit_angle_,
-    explicit_rotation_tolerance_,
-    linear_gain_, yaw_gain_, minimum_translation_speed_, motion_response_timeout_,
-    motion_response_min_translation_, motion_response_min_yaw_,
-    max_vx_, max_vy_, max_yaw_rate_};
-  const std::string parameter_error = validateControlParameters(parameters);
-  if (!parameter_error.empty()) {
-    throw std::invalid_argument(parameter_error);
+  if (!finite(command_rate_) || command_rate_ < 20.0 || command_rate_ > 200.0) {
+    throw std::invalid_argument("command_rate must be finite and in [20, 200] Hz");
   }
-  // SDK2 owns its DDS participant. Initialize it once before constructing SportClient.
+  if (!finite(path_timeout_) || path_timeout_ <= 0.0 || path_timeout_ > 60.0 ||
+    !finite(odom_timeout_) || odom_timeout_ <= 0.0 || odom_timeout_ > 60.0)
+  {
+    throw std::invalid_argument("path_timeout and odom_timeout must be in (0, 60] seconds");
+  }
+  if (!finite(lookahead_distance_) || lookahead_distance_ <= 0.0 ||
+    !finite(waypoint_tolerance_) || waypoint_tolerance_ <= 0.0 ||
+    !finite(goal_position_tolerance_) || goal_position_tolerance_ <= 0.0 ||
+    !finite(goal_yaw_tolerance_) || goal_yaw_tolerance_ <= 0.0 ||
+    goal_yaw_tolerance_ > kPi)
+  {
+    throw std::invalid_argument("path tolerances and lookahead must be finite and positive");
+  }
+  if (!finite(heading_alignment_enter_angle_) || heading_alignment_enter_angle_ <= 0.0 ||
+    heading_alignment_enter_angle_ > kPi ||
+    !finite(heading_alignment_exit_angle_) || heading_alignment_exit_angle_ < 0.0 ||
+    heading_alignment_exit_angle_ >= heading_alignment_enter_angle_ ||
+    !finite(explicit_rotation_tolerance_) || explicit_rotation_tolerance_ <= 0.0 ||
+    explicit_rotation_tolerance_ > heading_alignment_enter_angle_)
+  {
+    throw std::invalid_argument("heading alignment tolerances are invalid");
+  }
+  if (!finite(translation_speed_) || translation_speed_ <= 0.0 ||
+    !finite(yaw_gain_) || yaw_gain_ < 0.0 ||
+    !finite(max_vx_) || max_vx_ <= 0.0 ||
+    !finite(max_vy_) || max_vy_ <= 0.0 ||
+    !finite(max_yaw_rate_) || max_yaw_rate_ <= 0.0 ||
+    translation_speed_ > max_vx_)
+  {
+    throw std::invalid_argument("translation speed and SDK limits are invalid");
+  }
+
+  // SDK2 owns its CycloneDDS participant. Initialize it once, then the
+  // control timer calls the official synchronous SportClient surface directly.
   unitree::robot::ChannelFactory::Instance()->Init(domain_id_, network_interface_);
-  auto sport_client = std::make_unique<unitree::robot::go2::SportClient>();
-  sport_client->SetTimeout(0.5F);
-  sport_client->Init();
-  command_worker_ = std::make_unique<SdkCommandWorker>(
-    std::make_shared<SportClientCommandBackend>(std::move(sport_client)));
+  sport_client_ = std::make_unique<unitree::robot::go2::SportClient>();
+  sport_client_->SetTimeout(0.5F);
+  sport_client_->Init();
 
-  sport_state_sub_ = std::make_shared<
-    unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::SportModeState_>>(
-    "rt/sportmodestate");
-  sport_state_sub_->InitChannel(
-    std::bind(&Go2Sdk2BridgeNode::sportStateCallback, this, std::placeholders::_1), 1);
-
+  // Do not replay the planner's transient-local cache when the bridge starts.
+  // The planner will publish the next live refresh, which is the path the
+  // operator actually authorized.
   path_sub_ = create_subscription<nav_msgs::msg::Path>(
-    // Execute only paths published after this bridge subscription is matched.
-    // The planner remains transient-local for RViz, but replaying its cached path
-    // here can disarm a freshly armed bridge before the operator sends a new goal.
     path_topic, rclcpp::QoS(1).reliable().durability_volatile(),
     std::bind(&Go2Sdk2BridgeNode::pathCallback, this, std::placeholders::_1));
   odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -162,6 +129,7 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     std::bind(
       &Go2Sdk2BridgeNode::enableCallback, this,
       std::placeholders::_1, std::placeholders::_2));
+
   const auto period = std::chrono::duration<double>(1.0 / command_rate_);
   control_timer_ = create_wall_timer(
     std::chrono::duration_cast<std::chrono::nanoseconds>(period),
@@ -169,362 +137,181 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
 
   RCLCPP_WARN(
     get_logger(),
-    "Go2 SDK2 bridge on interface '%s'; motion is disabled and can only be enabled via "
-    "~/enable_motion",
-    network_interface_.c_str());
-  if (!path_cross_track_safety_gate_enabled_) {
-    RCLCPP_WARN(
-      get_logger(),
-      "The 0.05 m path geometry stop gate is DISABLED by configuration; "
-      "the bridge follows the planner path through small projection, endpoint, "
-      "and rotation-waypoint offsets; finite-value and command-direction checks remain active");
-  }
+    "Go2 SDK2 path executor on '%s': disabled until ~/enable_motion; "
+    "Move is refreshed at %.1f Hz with fixed translation speed %.2f m/s",
+    network_interface_.c_str(), command_rate_, translation_speed_);
+  RCLCPP_INFO(
+    get_logger(),
+    "Route completion holds Move(0,0,0); only SDK failure, input timeout, /lowcmd, "
+    "explicit disable, or shutdown calls StopMove");
 }
 
 Go2Sdk2BridgeNode::~Go2Sdk2BridgeNode() noexcept
 {
-  if (!command_worker_) {
+  motion_enabled_ = false;
+  if (!sport_client_) {
     return;
   }
-
   try {
-    motion_authorization_.disarm();
-    command_worker_->shutdown();
-    const auto status = command_worker_->status();
-    if (status.stop_state == SdkStopState::kConfirmed) {
-      command_active_ = false;
-      RCLCPP_WARN(get_logger(), "Go2 stopped during SDK2 bridge shutdown");
-    } else {
-      RCLCPP_FATAL(get_logger(), "Unable to confirm StopMove during SDK2 bridge shutdown");
+    const int32_t status = sport_client_->StopMove();
+    if (status != 0) {
+      std::fprintf(stderr, "go2_sdk2_bridge: shutdown StopMove failed with status %d\n", status);
     }
-  } catch (const std::exception & exception) {
-    std::fprintf(
-      stderr, "go2_sdk2_bridge: shutdown stop failed while logging: %s\n", exception.what());
   } catch (...) {
-    std::fprintf(stderr, "go2_sdk2_bridge: shutdown stop failed with an unknown exception\n");
+    std::fprintf(stderr, "go2_sdk2_bridge: shutdown StopMove threw\n");
   }
+  command_active_ = false;
 }
 
 void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
 {
-  try {
-    if (!msg) {
-      failSafe("null path message");
-      RCLCPP_ERROR(get_logger(), "Rejected null path message");
-      return;
-    }
-    if (msg->header.frame_id != world_frame_) {
-      failSafe("path frame mismatch");
-      RCLCPP_ERROR(
-        get_logger(), "Rejected path frame '%s'; expected '%s'",
-        msg->header.frame_id.c_str(), world_frame_.c_str());
-      return;
-    }
-    if (msg->poses.empty()) {
-      // A path callback never submits Move directly. The next fully gated
-      // control tick holds zero while preserving the operator authorization.
-      path_progress_tracker_.reset();
-      if (!waitForNewPath("empty path")) {
-        RCLCPP_ERROR(
-          get_logger(), "Body path cleared, but StopMove remains unconfirmed while disarmed");
-        return;
-      }
-      if (motion_authorization_.armed()) {
-        RCLCPP_INFO(
-          get_logger(), "Body path cleared; waiting for a new path while remaining armed");
-      } else {
-        RCLCPP_WARN(get_logger(), "Body path cleared while motion is disarmed");
-      }
-      return;
-    }
-    const rclcpp::Time current_time = now();
-    const rclcpp::Time message_time(msg->header.stamp, current_time.get_clock_type());
-    if (!messageStampFresh(message_time, current_time, path_timeout_)) {
-      const double age = messageAgeSeconds(message_time, current_time);
-      failSafe("stale or future path timestamp");
-      RCLCPP_ERROR(
-        get_logger(),
-        "Rejected path with age %.3f s; accepted range is [-%.3f, %.3f] s",
-        age, timestamp_future_tolerance_, path_timeout_);
-      return;
-    }
-    for (std::size_t index = 0; index < msg->poses.size(); ++index) {
-      const auto & stamped_pose = msg->poses[index];
-      if (!stamped_pose.header.frame_id.empty() &&
-        stamped_pose.header.frame_id != world_frame_)
-      {
-        failSafe("path pose frame mismatch");
-        RCLCPP_ERROR(
-          get_logger(), "Rejected path pose %zu frame '%s'; expected empty or '%s'",
-          index, stamped_pose.header.frame_id.c_str(), world_frame_.c_str());
-        return;
-      }
-      if (!isFinitePose(stamped_pose.pose)) {
-        failSafe("invalid path pose");
-        RCLCPP_ERROR(
-          get_logger(), "Rejected path pose %zu: position or quaternion is invalid", index);
-        return;
-      }
-    }
-    const auto goal_generation = pathGoalGeneration(msg->poses);
-    if (!goal_generation) {
-      failSafe("invalid path goal generation");
-      RCLCPP_ERROR(
-        get_logger(),
-        "Rejected body path because pose stamps do not contain one valid goal generation");
-      return;
-    }
-    switch (completed_goal_latch_.evaluate(*goal_generation)) {
-      case GoalGenerationDecision::kAccept:
-        break;
-      case GoalGenerationDecision::kCompletedReplay:
-        path_progress_tracker_.reset();
-        if (!waitForNewPath("completed goal generation replay")) {
-          RCLCPP_ERROR(
-            get_logger(), "Completed goal replay was rejected, but StopMove remains unconfirmed");
-        }
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "Ignored body path for completed goal generation %lld",
-          static_cast<long long>(*goal_generation));
-        return;
-      case GoalGenerationDecision::kSuperseded:
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "Ignored superseded body path generation %lld without interrupting the active path",
-          static_cast<long long>(*goal_generation));
-        return;
-      case GoalGenerationDecision::kInvalid:
-        failSafe("invalid path goal generation decision");
-        RCLCPP_ERROR(
-          get_logger(), "Rejected invalid body path goal generation %lld",
-          static_cast<long long>(*goal_generation));
-        return;
-    }
-    const bool same_goal_refresh =
-      path_ && path_goal_generation_ && *path_goal_generation_ == *goal_generation;
-    path_ = msg;
-    path_goal_generation_ = *goal_generation;
-    ++accepted_path_sequence_;
-    if (same_goal_refresh) {
-      // Keep the monotonic cursor. The next control tick reanchors it against
-      // the new geometry using the latest validated odometry.
-      path_refresh_pending_reanchor_ = true;
-    } else {
-      path_progress_tracker_.reset();
-      path_refresh_pending_reanchor_ = false;
-      direction_conflict_started_at_.reset();
-      direction_conflict_path_sequence_.reset();
-    }
-    motion_authorization_.pathAvailable();
-  } catch (const std::exception & exception) {
-    failSafe("exception while validating path");
-    RCLCPP_ERROR(get_logger(), "Rejected path after exception: %s", exception.what());
-  } catch (...) {
-    failSafe("unknown exception while validating path");
-    RCLCPP_ERROR(get_logger(), "Rejected path after an unknown exception");
+  if (!msg) {
+    return;
   }
+  if (msg->header.frame_id != world_frame_) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Ignoring body path frame '%s'; expected '%s'",
+      msg->header.frame_id.c_str(), world_frame_.c_str());
+    return;
+  }
+
+  if (msg->poses.empty()) {
+    // An empty planner path is a normal wait state. Keep authorization and let
+    // the next timer tick continue the zero-speed Move stream.
+    path_.reset();
+    path_refresh_pending_reanchor_ = false;
+    path_cursor_index_ = 0U;
+    heading_alignment_active_ = false;
+    last_path_received_ = std::chrono::steady_clock::now();
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Planner path is empty; holding Move(0,0,0) while waiting for a new path");
+    return;
+  }
+
+  for (std::size_t index = 0; index < msg->poses.size(); ++index) {
+    const auto & pose = msg->poses[index];
+    if (!pose.header.frame_id.empty() && pose.header.frame_id != world_frame_) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Ignoring body path pose %zu in frame '%s'; expected '%s'",
+        index, pose.header.frame_id.c_str(), world_frame_.c_str());
+      return;
+    }
+    if (!isFinitePose(pose.pose)) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Ignoring body path pose %zu with a non-finite position or quaternion", index);
+      return;
+    }
+  }
+
+  const auto new_generation = pathGoalGeneration(msg->poses);
+  const bool same_goal_refresh = path_goal_generation_ && new_generation &&
+    *path_goal_generation_ == *new_generation;
+  const bool completed_replay = path_waiting_for_new_goal_ &&
+    completed_goal_generation_ && new_generation &&
+    *completed_goal_generation_ == *new_generation;
+
+  path_ = msg;
+  path_goal_generation_ = new_generation;
+  last_path_received_ = std::chrono::steady_clock::now();
+
+  if (completed_replay) {
+    // Keep the newest copy for diagnostics/freshness, but do not restart a
+    // goal that has already reached its endpoint.
+    return;
+  }
+
+  if (path_waiting_for_new_goal_) {
+    path_waiting_for_new_goal_ = false;
+    completed_goal_generation_.reset();
+    path_cursor_index_ = 0U;
+    heading_alignment_active_ = false;
+    RCLCPP_INFO(get_logger(), "Accepted a new path after route completion");
+  } else if (!same_goal_refresh) {
+    path_cursor_index_ = 0U;
+    heading_alignment_active_ = false;
+  }
+
+  // Every live planner refresh is reconciled against the current odometry on
+  // the next control tick. No callback performs an SDK motion RPC.
+  path_refresh_pending_reanchor_ = true;
 }
 
 void Go2Sdk2BridgeNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
-  try {
-    if (!msg) {
-      failSafe("null odometry message");
-      RCLCPP_ERROR(get_logger(), "Rejected null odometry message");
-      return;
-    }
-    if (msg->header.frame_id != world_frame_) {
-      failSafe("odometry frame mismatch");
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "Rejected odometry frame '%s'; expected '%s'",
-        msg->header.frame_id.c_str(), world_frame_.c_str());
-      return;
-    }
-    if (msg->child_frame_id != body_frame_) {
-      failSafe("odometry body frame mismatch");
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "Rejected odometry child frame '%s'; expected '%s'",
-        msg->child_frame_id.c_str(), body_frame_.c_str());
-      return;
-    }
-    if (!isFinitePose(msg->pose.pose)) {
-      failSafe("invalid odometry pose");
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "Rejected odometry: position or quaternion is invalid");
-      return;
-    }
-    const rclcpp::Time current_time = now();
-    const rclcpp::Time message_time(msg->header.stamp, current_time.get_clock_type());
-    if (!messageStampFresh(message_time, current_time, odom_timeout_)) {
-      const double age = messageAgeSeconds(message_time, current_time);
-      failSafe("stale or future odometry timestamp");
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "Rejected odometry with age %.3f s; accepted range is [-%.3f, %.3f] s",
-        age, timestamp_future_tolerance_, odom_timeout_);
-      return;
-    }
-    if (odom_) {
-      const rclcpp::Time previous_time(odom_->header.stamp, current_time.get_clock_type());
-      if (message_time <= previous_time) {
-        failSafe("nonmonotonic odometry timestamp");
-        RCLCPP_ERROR_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "Rejected nonmonotonic odometry timestamp: delta %.6f s",
-          (message_time - previous_time).seconds());
-        return;
-      }
-    }
-    odom_ = msg;
-  } catch (const std::exception & exception) {
-    failSafe("exception while validating odometry");
-    RCLCPP_ERROR(get_logger(), "Rejected odometry after exception: %s", exception.what());
-  } catch (...) {
-    failSafe("unknown exception while validating odometry");
-    RCLCPP_ERROR(get_logger(), "Rejected odometry after an unknown exception");
-  }
-}
-
-void Go2Sdk2BridgeNode::sportStateCallback(const void * message)
-{
-  if (!message) {
+  if (!msg) {
     return;
   }
-  const auto * state =
-    static_cast<const unitree_go::msg::dds_::SportModeState_ *>(message);
-  const SportStateSample sample{
-    state->error_code(), state->mode(), state->gait_type()};
-  const std::lock_guard<std::mutex> lock(sport_state_mutex_);
-  sport_state_ = sample;
-  unsafe_sport_state_latch_.observe(sample);
-  sport_state_received_at_ = std::chrono::steady_clock::now();
+  if (msg->header.frame_id != world_frame_ || msg->child_frame_id != body_frame_) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Ignoring odometry frames '%s' -> '%s'; expected '%s' -> '%s'",
+      msg->header.frame_id.c_str(), msg->child_frame_id.c_str(),
+      world_frame_.c_str(), body_frame_.c_str());
+    return;
+  }
+  if (!isFinitePose(msg->pose.pose)) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Ignoring odometry with a non-finite position or quaternion");
+    return;
+  }
+
+  // Use receipt time for the input watchdog. The corrected odometry header can
+  // legitimately lag wall time on the Jetson; rejecting it by header age was
+  // the source of the previous 0.600 s false stop.
+  odom_ = msg;
+  last_odom_received_ = std::chrono::steady_clock::now();
 }
 
 void Go2Sdk2BridgeNode::enableCallback(
   const std_srvs::srv::SetBool::Request::SharedPtr request,
   std_srvs::srv::SetBool::Response::SharedPtr response)
 {
-  try {
-    if (!request || !response) {
-      failSafe("invalid enable service request");
-      return;
-    }
-    const bool sdk_completions_healthy = processSdkCompletions();
-    if (!request->data) {
-      motion_authorization_.disarm();
-      path_.reset();
-      path_goal_generation_.reset();
-      path_refresh_pending_reanchor_ = false;
-      direction_conflict_started_at_.reset();
-      direction_conflict_path_sequence_.reset();
-      path_progress_tracker_.reset();
-      motion_response_watchdog_.reset();
-      completed_goal_latch_.clear();
-      heading_alignment_active_ = false;
-      const bool stopped = stopRobot("motion disabled by service");
-      const auto worker_status = command_worker_->status();
-      const bool stop_queued =
-        worker_status.stop_state == SdkStopState::kPending && pending_stop_sequence_.has_value();
-      response->success = stopped;
-      response->message = stopped ? "Go2 motion disabled" :
-        (stop_queued ? "Motion authorization disabled; StopMove confirmation is pending" :
-        "Disable requested, but StopMove could not be queued");
-      return;
-    }
-    if (!sdk_completions_healthy) {
-      response->success = false;
-      response->message =
-        "Cannot arm: an SDK2 command failure was processed; verify state and call again";
-      return;
-    }
-    if (lowcmdPublisherPresent()) {
-      failSafe("a /lowcmd publisher is active");
-      response->success = false;
-      response->message = "Cannot enable: a /lowcmd publisher is active";
-      return;
-    }
-    if (!motion_authorization_.armed() && command_active_) {
-      response->success = false;
-      response->message = "Cannot enable: waiting for StopMove confirmation";
-      return;
-    }
-    const rclcpp::Time current_time = now();
-    if (!cachedOdomValid() || !odomFresh(current_time)) {
-      failSafe("invalid or stale odometry while enabling motion");
-      response->success = false;
-      response->message = "Cannot arm: odometry is invalid, missing, or stale";
-      return;
-    }
-    if (path_ && !cachedPathValid()) {
-      failSafe("invalid path while enabling motion");
-      response->success = false;
-      response->message = "Cannot arm: cached body path is invalid";
-      return;
-    }
-    if (path_ && !pathFresh(current_time)) {
-      if (motion_authorization_.armed()) {
-        failSafe("path timeout while enabling motion");
-        response->success = false;
-        response->message =
-          "Cannot remain armed: cached body path timed out; re-arm after a fresh path";
-        return;
-      }
-      if (!waitForNewPath("discarding stale path before arming")) {
-        response->success = false;
-        response->message = "Cannot arm: StopMove is not confirmed";
-        return;
-      }
-    }
-    const auto sport_state = freshSportState();
-    if (!sport_state) {
-      failSafe("missing or stale Unitree sport state while enabling motion");
-      response->success = false;
-      response->message = "Cannot arm: rt/sportmodestate is missing or stale";
-      return;
-    }
-    if (!isExecutableSportState(sport_state->state_code)) {
-      failSafe("Unitree sport state is not executable while enabling motion");
-      response->success = false;
-      response->message =
-        "Cannot arm: Unitree motion state " + std::to_string(sport_state->state_code) +
-        " (" + sportStateName(sport_state->state_code) + ") is not executable";
-      return;
-    }
-    if (motion_authorization_.armed()) {
-      response->success = true;
-      response->message = motion_authorization_.executionAuthorized() ?
-        "Go2 motion is already armed" : "Go2 motion is already armed and waiting for a path";
-      return;
-    }
-    if (!command_worker_->resetFaultAfterConfirmedStop()) {
-      response->success = false;
-      response->message = "Cannot arm: SDK2 StopMove is not confirmed";
-      return;
-    }
-    motion_authorization_.arm(path_ != nullptr);
-    motion_response_watchdog_.reset();
-    response->success = true;
-    response->message = path_ ?
-      "Go2 motion armed" : "Go2 motion armed; waiting for a fresh body path";
-  } catch (const std::exception & exception) {
-    failSafe("exception while changing motion state");
-    if (response) {
-      response->success = false;
-      response->message = std::string("Motion remains disabled: ") + exception.what();
-    }
-    RCLCPP_ERROR(get_logger(), "Motion enable service failed: %s", exception.what());
-  } catch (...) {
-    failSafe("unknown exception while changing motion state");
-    if (response) {
-      response->success = false;
-      response->message = "Motion remains disabled after an unknown exception";
-    }
-    RCLCPP_ERROR(get_logger(), "Motion enable service failed with an unknown exception");
+  if (!request || !response) {
+    return;
   }
+
+  if (!request->data) {
+    motion_enabled_ = false;
+    clearExecutionState();
+    const bool stopped = stopRobot("motion disabled by service", true);
+    response->success = stopped;
+    response->message = stopped ? "Go2 motion disabled" : "StopMove failed; motion disabled";
+    return;
+  }
+
+  if (lowcmdPublisherPresent()) {
+    motion_enabled_ = false;
+    clearExecutionState();
+    (void)stopRobot("/lowcmd publisher is active while enabling");
+    response->success = false;
+    response->message = "Cannot enable: a /lowcmd publisher is active";
+    return;
+  }
+  if (!cachedOdomValid() || !odomFresh()) {
+    response->success = false;
+    response->message = "Cannot enable: waiting for body odometry";
+    return;
+  }
+  if (motion_enabled_) {
+    response->success = true;
+    response->message = "Go2 motion is already enabled";
+    return;
+  }
+  if (command_active_ && !stopRobot("clearing the previous SDK command before enabling")) {
+    response->success = false;
+    response->message = "Cannot enable: previous StopMove failed";
+    return;
+  }
+
+  motion_enabled_ = true;
+  response->success = true;
+  response->message = path_ ?
+    "Go2 motion enabled" : "Go2 motion enabled; waiting for a body path";
 }
 
 void Go2Sdk2BridgeNode::controlTick()
@@ -532,504 +319,379 @@ void Go2Sdk2BridgeNode::controlTick()
   try {
     controlTickImpl();
   } catch (const std::exception & exception) {
-    failSafe("exception in control loop");
-    RCLCPP_ERROR(get_logger(), "Control loop exception: %s", exception.what());
+    disableAfterFault("control loop exception");
+    RCLCPP_ERROR(get_logger(), "SDK2 path executor exception: %s", exception.what());
   } catch (...) {
-    failSafe("unknown exception in control loop");
-    RCLCPP_ERROR(get_logger(), "Control loop failed with an unknown exception");
+    disableAfterFault("unknown control loop exception");
+    RCLCPP_ERROR(get_logger(), "SDK2 path executor failed with an unknown exception");
   }
 }
 
 void Go2Sdk2BridgeNode::controlTickImpl()
 {
-  if (!processSdkCompletions()) {
+  if (lowcmdPublisherPresent()) {
+    if (motion_enabled_ || command_active_) {
+      disableAfterFault("/lowcmd publisher appeared");
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Stopped SDK2 Move because a /lowcmd publisher is active");
+    }
     return;
   }
-  if (lowcmdPublisherPresent()) {
-    failSafe("a /lowcmd publisher appeared");
+
+  if (!motion_enabled_) {
+    (void)stopRobot("motion disabled");
+    return;
+  }
+  if (!cachedOdomValid() || !odomFresh()) {
+    disableAfterFault("body odometry input timeout");
     RCLCPP_ERROR_THROTTLE(
       get_logger(), *get_clock(), 3000,
-      "A /lowcmd publisher is active; SportClient motion is disabled");
-    return;
-  }
-  if (!motion_authorization_.armed()) {
-    stopRobot("retrying unconfirmed stop while motion is disabled");
-    return;
-  }
-  const auto sport_state = freshSportState();
-  if (!sport_state) {
-    failSafe("Unitree sport state timeout");
-    RCLCPP_ERROR(get_logger(), "Stopped because rt/sportmodestate is missing or stale");
-    return;
-  }
-  if (!isExecutableSportState(sport_state->state_code)) {
-    failSafe("Unitree sport state became non-executable");
-    RCLCPP_ERROR(
-      get_logger(), "Stopped in Unitree motion state %u (%s), mode=%u gait_type=%u",
-      sport_state->state_code, sportStateName(sport_state->state_code),
-      static_cast<unsigned>(sport_state->mode),
-      static_cast<unsigned>(sport_state->gait_type));
-    return;
-  }
-  const rclcpp::Time current_time = now();
-  if (!cachedOdomValid()) {
-    failSafe("odometry became invalid");
-    RCLCPP_ERROR(get_logger(), "Cached odometry failed safety validation");
-    return;
-  }
-  if (!odomFresh(current_time)) {
-    failSafe("odometry timeout");
-    return;
-  }
-  if (!path_) {
-    if (!holdZeroMoveWhileWaiting("waiting for a path")) {
-      motion_authorization_.disarm();
-      odom_.reset();
-    }
-    return;
-  }
-  if (!cachedPathValid()) {
-    failSafe("path became invalid");
-    RCLCPP_ERROR(get_logger(), "Cached path failed safety validation");
-    return;
-  }
-  if (!pathFresh(current_time)) {
-    failSafe("path timeout");
-    return;
-  }
-  if (!motion_authorization_.executionAuthorized()) {
-    motion_authorization_.pathAvailable();
-  }
-  if (!motion_authorization_.executionAuthorized()) {
-    failSafe("path execution was not authorized");
+      "Stopped SDK2 Move because /lio/body_odom timed out");
     return;
   }
 
-  const auto & current = odom_->pose.pose;
+  if (!path_ || path_waiting_for_new_goal_) {
+    // This is the official keep-alive pattern: do not transition through
+    // StopMove between goals; refresh a zero velocity through Move instead.
+    (void)sendMove(0.0, 0.0, 0.0);
+    return;
+  }
+  if (!cachedPathValid() || !pathFresh()) {
+    disableAfterFault("body path input timeout");
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Stopped SDK2 Move because /body_path timed out or became invalid");
+    return;
+  }
+
   if (path_refresh_pending_reanchor_) {
-    const auto refresh_path_sequence = accepted_path_sequence_;
-    const auto refresh_goal_generation = path_goal_generation_.value_or(-1);
-    if (!path_progress_tracker_.reanchor(
-        path_->poses, current.position.x, current.position.y))
-    {
-      failSafe("same-goal path reanchor failed");
-      RCLCPP_ERROR(
-        get_logger(),
-        "Rejected refreshed path because its tracker reanchor was invalid: "
-        "path_sequence=%llu goal_generation=%lld current=(%.9f,%.9f)",
-        static_cast<unsigned long long>(refresh_path_sequence),
-        static_cast<long long>(refresh_goal_generation),
-        current.position.x, current.position.y);
-      return;
-    }
+    reanchorPathCursor();
     path_refresh_pending_reanchor_ = false;
   }
-  const auto & goal = path_->poses.back().pose;
-  const auto current_yaw = quaternionYaw(current.orientation);
-  const auto goal_yaw = quaternionYaw(goal.orientation);
-  if (!current_yaw || !goal_yaw) {
-    failSafe("invalid quaternion during goal calculation");
-    return;
-  }
-  const double goal_dx = goal.position.x - current.position.x;
-  const double goal_dy = goal.position.y - current.position.y;
-  const double goal_distance = std::hypot(goal_dx, goal_dy);
-  const double goal_yaw_error = normalizeAngle(*goal_yaw - *current_yaw);
-  if (!std::isfinite(goal_dx) || !std::isfinite(goal_dy) ||
-    !std::isfinite(goal_distance) || !std::isfinite(goal_yaw_error))
-  {
-    failSafe("non-finite goal calculation");
-    return;
-  }
-  PathTrackingDiagnostics tracking_diagnostics;
-  const auto tracking_target = path_progress_tracker_.update(
-    path_->poses, current.position.x, current.position.y, *current_yaw,
-    lookahead_distance_, explicit_rotation_tolerance_, &tracking_diagnostics,
-    path_cross_track_safety_gate_enabled_);
-  const auto completion_ready = goalCompletionReady(
-    goal_distance, goal_yaw_error, goal_position_tolerance_, goal_yaw_tolerance_,
-    tracking_target);
-  if (!completion_ready) {
-    const rclcpp::Time path_time(path_->header.stamp, current_time.get_clock_type());
-    const double path_age = messageAgeSeconds(path_time, current_time);
-    const std::size_t path_pose_count = path_->poses.size();
-    const std::int64_t goal_generation = path_goal_generation_.value_or(-1);
-    failSafe("path progress could not be confirmed");
-    RCLCPP_ERROR(
-      get_logger(),
-      "Stopped because bounded monotonic path progress could not be confirmed: "
-      "failure=%s target=%s path_sequence=%llu goal_generation=%lld path_age=%.6f "
-      "pose_count=%zu tracker_initialized=%s tracker_pose=%zu tracker_fraction=%.9f "
-      "current_progress=%.9f cross_track=%.9f projection_distance=%.9f "
-      "waypoint_distance=%.9f final_distance=%.9f previous_progress=%.9f "
-      "maximum_progress=%.9f projected_progress=%.9f block_end=%zu block_length=%.9f "
-      "current=(%.9f,%.9f,%.9f) segment=(%.9f,%.9f)->(%.9f,%.9f) "
-      "path_start=(%.9f,%.9f) path_final=(%.9f,%.9f)",
-      pathTrackingFailureName(tracking_diagnostics.failure),
-      tracking_target ? "present" : "absent",
-      static_cast<unsigned long long>(accepted_path_sequence_),
-      static_cast<long long>(goal_generation), path_age, path_pose_count,
-      tracking_diagnostics.tracker_initialized ? "true" : "false",
-      tracking_diagnostics.pose_index, tracking_diagnostics.segment_fraction,
-      tracking_diagnostics.current_progress, tracking_diagnostics.cross_track,
-      tracking_diagnostics.projection_distance, tracking_diagnostics.waypoint_distance,
-      tracking_diagnostics.final_distance, tracking_diagnostics.previous_progress,
-      tracking_diagnostics.maximum_progress, tracking_diagnostics.projected_progress,
-      tracking_diagnostics.block_end, tracking_diagnostics.block_length,
-      tracking_diagnostics.current_x, tracking_diagnostics.current_y,
-      tracking_diagnostics.current_yaw, tracking_diagnostics.segment_start_x,
-      tracking_diagnostics.segment_start_y, tracking_diagnostics.segment_end_x,
-      tracking_diagnostics.segment_end_y, tracking_diagnostics.path_start_x,
-      tracking_diagnostics.path_start_y, tracking_diagnostics.path_final_x,
-      tracking_diagnostics.path_final_y);
-    return;
-  }
-  if (*completion_ready) {
-    if (!path_goal_generation_) {
-      failSafe("missing path goal generation at completion");
-      return;
-    }
-    completed_goal_latch_.markCompleted(*path_goal_generation_);
-    (void)waitForNewPath("goal reached");
-    return;
-  }
-  const double world_dx = tracking_target->target_x - current.position.x;
-  const double world_dy = tracking_target->target_y - current.position.y;
-  const double cos_yaw = std::cos(*current_yaw);
-  const double sin_yaw = std::sin(*current_yaw);
-  const double body_dx = cos_yaw * world_dx + sin_yaw * world_dy;
-  const double body_dy = -sin_yaw * world_dx + cos_yaw * world_dy;
-  const auto local_heading_yaw = quaternionYaw(
-    path_->poses[tracking_target->heading_pose].pose.orientation);
-  if (!local_heading_yaw) {
-    failSafe("invalid target quaternion during command calculation");
-    return;
-  }
-  const auto target_yaw_error = selectAlignmentYawError(
-    normalizeAngle(*local_heading_yaw - *current_yaw), goal_yaw_error,
-    goal_distance, goal_position_tolerance_,
-    tracking_target->explicit_rotation_waypoint,
-    tracking_target->pending_explicit_rotation);
-  if (!target_yaw_error) {
-    failSafe("invalid target heading selection");
-    return;
-  }
 
-  const auto gate_active = updateHeadingAlignmentGate(
-    heading_alignment_active_, *target_yaw_error,
-    heading_alignment_enter_angle_, heading_alignment_exit_angle_);
-  if (!gate_active) {
-    failSafe("invalid heading alignment calculation");
-    return;
-  }
-  const auto rotate_in_place = requireRotateInPlace(
-    *gate_active, tracking_target->explicit_rotation_waypoint, *target_yaw_error,
-    explicit_rotation_tolerance_, goal_distance, goal_position_tolerance_,
-    tracking_target->pending_explicit_rotation);
-  if (!rotate_in_place) {
-    failSafe("invalid rotate-in-place decision");
-    return;
-  }
-  heading_alignment_active_ = *rotate_in_place;
-
-  const double requested_vx = *rotate_in_place ? 0.0 : linear_gain_ * body_dx;
-  const auto raw_vx = filterLongitudinalCommand(
-    requested_vx, tracking_target->translation_direction);
-  const auto holdDirectionConflict = [this]() {
-      const auto steady_now = std::chrono::steady_clock::now();
-      if (!direction_conflict_started_at_) {
-        return false;
-      }
-      const double conflict_age = std::chrono::duration<double>(
-        steady_now - *direction_conflict_started_at_).count();
-      if (!std::isfinite(conflict_age) || conflict_age >= kDirectionConflictWaitTimeout) {
-        RCLCPP_ERROR(
-          get_logger(),
-          "Direction conflict persisted for %.3f s without a refreshed path; stopping",
-          conflict_age);
-        failSafe("direction conflict wait timeout");
-        return false;
-      }
-      if (!holdZeroMoveWhileWaiting("waiting for refreshed path after direction conflict")) {
-        failSafe("direction conflict zero hold failed");
-        return false;
-      }
-      return true;
-    };
-  if (!raw_vx) {
-    const bool transient_direction_conflict =
-      !*rotate_in_place &&
-      tracking_target->translation_direction == PlannedTranslationDirection::kForward &&
-      std::isfinite(requested_vx) && requested_vx < -kUnexpectedReverseTolerance;
-    if (!transient_direction_conflict) {
-      failSafe("invalid longitudinal command");
-      RCLCPP_ERROR(
-        get_logger(),
-        "Rejected invalid longitudinal command: requested_vx=%.9f direction=%d",
-        requested_vx, static_cast<int>(tracking_target->translation_direction));
-      return;
-    }
-
-    const auto steady_now = std::chrono::steady_clock::now();
-    if (!direction_conflict_started_at_) {
-      direction_conflict_started_at_ = steady_now;
-      direction_conflict_path_sequence_ = accepted_path_sequence_;
-      RCLCPP_WARN(
-        get_logger(),
-        "Transient forward/reverse conflict; holding zero for a refreshed path: "
-        "path_sequence=%llu goal_generation=%lld tracker_pose=%zu "
-        "forward_alignment=%.6f body_target=(%.6f,%.6f) requested_vx=%.6f",
-        static_cast<unsigned long long>(accepted_path_sequence_),
-        static_cast<long long>(path_goal_generation_.value_or(-1)),
-        tracking_diagnostics.pose_index, tracking_diagnostics.forward_alignment,
-        body_dx, body_dy, requested_vx);
-    }
-    (void)holdDirectionConflict();
-    return;
-  }
-  if (direction_conflict_started_at_) {
-    const bool refreshed_path = direction_conflict_path_sequence_ &&
-      accepted_path_sequence_ != *direction_conflict_path_sequence_;
-    if (!refreshed_path) {
-      (void)holdDirectionConflict();
-      return;
-    }
-  }
-  const double raw_vy = linear_gain_ * body_dy;
-  const double raw_yaw_rate = yaw_gain_ * (*target_yaw_error);
-  const auto bounded_command = makeHeadingAwareCommand(
-    *raw_vx, raw_vy, raw_yaw_rate, heading_alignment_active_,
-    max_vx_, max_vy_, max_yaw_rate_);
-  if (!bounded_command) {
-    failSafe("non-finite or invalid velocity command");
-    RCLCPP_ERROR(get_logger(), "Rejected unsafe velocity command before SportClient::Move");
-    return;
-  }
-  const auto command = applyMinimumPlanarSpeed(
-    *bounded_command, minimum_translation_speed_, max_vx_, max_vy_);
+  const auto command = makePathCommand();
   if (!command) {
-    failSafe("invalid minimum-speed command");
-    RCLCPP_ERROR(get_logger(), "Rejected invalid minimum-speed command before SportClient::Move");
-    return;
-  }
-
-  const double steady_time = std::chrono::duration<double>(
-    std::chrono::steady_clock::now().time_since_epoch()).count();
-  const auto response_healthy = motion_response_watchdog_.observe(
-    *command, current.position.x, current.position.y, *current_yaw, steady_time,
-    motion_response_timeout_, motion_response_min_translation_, motion_response_min_yaw_);
-  if (!response_healthy) {
-    failSafe("invalid motion response watchdog state");
-    RCLCPP_ERROR(get_logger(), "Motion response watchdog rejected invalid state");
-    return;
-  }
-  if (!*response_healthy) {
-    failSafe("motion response timeout");
+    disableAfterFault("invalid body path command input");
     RCLCPP_ERROR(
-      get_logger(),
-      "Stopped after %.2f s without %.3f m/%.3f rad of odometry response",
-      motion_response_timeout_, motion_response_min_translation_, motion_response_min_yaw_);
+      get_logger(), "Stopped SDK2 Move because the active body path cannot be followed");
     return;
   }
-
-  if (!sendMove(command->vx, command->vy, command->yaw_rate)) {
-    failSafe("SDK2 Move could not be queued");
+  if (command->completed) {
+    path_waiting_for_new_goal_ = true;
+    completed_goal_generation_ = path_goal_generation_;
+    heading_alignment_active_ = false;
+    RCLCPP_INFO_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Path endpoint reached; holding Move(0,0,0) until a new path arrives");
+    (void)sendMove(0.0, 0.0, 0.0);
     return;
   }
-  if (direction_conflict_started_at_) {
-    RCLCPP_INFO(
-      get_logger(), "Direction conflict cleared by a valid refreshed-path command");
-    direction_conflict_started_at_.reset();
-    direction_conflict_path_sequence_.reset();
-  }
+  (void)sendMove(command->vx, command->vy, command->yaw_rate);
 }
 
-bool Go2Sdk2BridgeNode::processSdkCompletions()
+std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand()
 {
-  if (!command_worker_) {
-    return false;
+  if (!path_ || path_->poses.empty() || !odom_) {
+    return std::nullopt;
   }
 
-  bool healthy = true;
-  SdkCommandCompletion completion;
-  while (command_worker_->tryPopCompletion(completion)) {
-    if (completion.outcome == SdkCommandOutcome::kSuperseded ||
-      completion.outcome == SdkCommandOutcome::kDiscarded ||
-      completion.outcome == SdkCommandOutcome::kPreemptedByStop)
+  const auto current_yaw = quaternionYaw(odom_->pose.pose.orientation);
+  if (!current_yaw) {
+    return std::nullopt;
+  }
+  const double current_x = odom_->pose.pose.position.x;
+  const double current_y = odom_->pose.pose.position.y;
+  if (!finite(current_x) || !finite(current_y)) {
+    return std::nullopt;
+  }
+
+  const auto rotationCommand = [this](double yaw_error)
+    -> std::optional<PathCommand> {
+      if (!finite(yaw_error)) {
+        return std::nullopt;
+      }
+      const auto bounded = makeBoundedCommand(
+        0.0, 0.0, yaw_gain_ * yaw_error,
+        max_vx_, max_vy_, max_yaw_rate_);
+      if (!bounded) {
+        return std::nullopt;
+      }
+      return PathCommand{bounded->vx, bounded->vy, bounded->yaw_rate, false};
+    };
+
+  const auto translationCommand = [this, &current_yaw, &rotationCommand](double desired_yaw)
+    -> std::optional<PathCommand> {
+      if (!finite(desired_yaw)) {
+        return std::nullopt;
+      }
+      const double yaw_error = normalizeAngle(desired_yaw - *current_yaw);
+      if (!finite(yaw_error)) {
+        return std::nullopt;
+      }
+      const double absolute_error = std::abs(yaw_error);
+      if (heading_alignment_active_) {
+        if (absolute_error > heading_alignment_exit_angle_) {
+          return rotationCommand(yaw_error);
+        }
+        heading_alignment_active_ = false;
+      } else if (absolute_error >= heading_alignment_enter_angle_) {
+        heading_alignment_active_ = true;
+        return rotationCommand(yaw_error);
+      }
+
+      // The vector has exactly translation_speed_ planar magnitude. It is
+      // expressed in the body frame expected by the official Move API.
+      const double local_angle = normalizeAngle(desired_yaw - *current_yaw);
+      const auto bounded = makeBoundedCommand(
+        translation_speed_ * std::cos(local_angle),
+        translation_speed_ * std::sin(local_angle),
+        yaw_gain_ * yaw_error,
+        max_vx_, max_vy_, max_yaw_rate_);
+      if (!bounded) {
+        return std::nullopt;
+      }
+      return PathCommand{bounded->vx, bounded->vy, bounded->yaw_rate, false};
+    };
+
+  const auto & poses = path_->poses;
+  if (path_cursor_index_ >= poses.size()) {
+    path_cursor_index_ = poses.size() - 1U;
+  }
+
+  // Each loop either advances the cursor or returns one command. This handles
+  // short connector poses and same-position rotation poses without treating a
+  // small geometric offset as a fault.
+  for (std::size_t iteration = 0; iteration <= poses.size() + 2U; ++iteration) {
+    if (path_cursor_index_ + 1U >= poses.size()) {
+      const auto & final_pose = poses.back().pose;
+      const double final_dx = final_pose.position.x - current_x;
+      const double final_dy = final_pose.position.y - current_y;
+      const double final_distance = std::hypot(final_dx, final_dy);
+      const auto final_yaw = quaternionYaw(final_pose.orientation);
+      if (!final_yaw || !finite(final_distance)) {
+        return std::nullopt;
+      }
+      const double final_yaw_error = normalizeAngle(*final_yaw - *current_yaw);
+      if (!finite(final_yaw_error)) {
+        return std::nullopt;
+      }
+      if (final_distance <= goal_position_tolerance_) {
+        if (std::abs(final_yaw_error) <= goal_yaw_tolerance_) {
+          heading_alignment_active_ = false;
+          return PathCommand{0.0, 0.0, 0.0, true};
+        }
+        heading_alignment_active_ = true;
+        return rotationCommand(final_yaw_error);
+      }
+
+      const double desired_yaw = std::atan2(final_dy, final_dx);
+      return translationCommand(desired_yaw);
+    }
+
+    const auto & start = poses[path_cursor_index_].pose;
+    const auto & end = poses[path_cursor_index_ + 1U].pose;
+    const double dx = end.position.x - start.position.x;
+    const double dy = end.position.y - start.position.y;
+    const double length = std::hypot(dx, dy);
+    if (!finite(length)) {
+      return std::nullopt;
+    }
+
+    const auto end_yaw = quaternionYaw(end.orientation);
+    if (!end_yaw) {
+      return std::nullopt;
+    }
+
+    if (length <= kGeometryEpsilon) {
+      const double rotation_error = normalizeAngle(*end_yaw - *current_yaw);
+      if (!finite(rotation_error)) {
+        return std::nullopt;
+      }
+      if (std::abs(rotation_error) > explicit_rotation_tolerance_) {
+        heading_alignment_active_ = true;
+        return rotationCommand(rotation_error);
+      }
+      ++path_cursor_index_;
+      heading_alignment_active_ = false;
+      continue;
+    }
+
+    const double length_squared = length * length;
+    const double projection = (
+      (current_x - start.position.x) * dx + (current_y - start.position.y) * dy) /
+      length_squared;
+    const double endpoint_distance = std::hypot(
+      end.position.x - current_x, end.position.y - current_y);
+    if (!finite(projection) || !finite(endpoint_distance)) {
+      return std::nullopt;
+    }
+    if (projection >= 1.0 || endpoint_distance <= waypoint_tolerance_) {
+      ++path_cursor_index_;
+      continue;
+    }
+
+    // Follow the route direction. The planner refreshes the path from current
+    // odometry, so a modest lateral offset is corrected by the next refresh;
+    // it is never converted into a disarm decision here.
+    const double desired_yaw = std::atan2(dy, dx);
+    return translationCommand(desired_yaw);
+  }
+
+  return std::nullopt;
+}
+
+void Go2Sdk2BridgeNode::reanchorPathCursor()
+{
+  if (!path_ || path_->poses.empty() || !odom_) {
+    path_cursor_index_ = 0U;
+    return;
+  }
+  const auto & poses = path_->poses;
+  if (poses.size() == 1U) {
+    path_cursor_index_ = 0U;
+    return;
+  }
+
+  const double current_x = odom_->pose.pose.position.x;
+  const double current_y = odom_->pose.pose.position.y;
+  double best_distance_squared = std::numeric_limits<double>::infinity();
+  std::size_t best_index = 0U;
+  for (std::size_t index = 0; index + 1U < poses.size(); ++index) {
+    const auto & start = poses[index].pose.position;
+    const auto & end = poses[index + 1U].pose.position;
+    const double dx = end.x - start.x;
+    const double dy = end.y - start.y;
+    const double length_squared = dx * dx + dy * dy;
+    double projected_x = start.x;
+    double projected_y = start.y;
+    if (length_squared > kGeometryEpsilon * kGeometryEpsilon) {
+      const double projection = std::clamp(
+        ((current_x - start.x) * dx + (current_y - start.y) * dy) / length_squared,
+        0.0, 1.0);
+      projected_x += projection * dx;
+      projected_y += projection * dy;
+    }
+    const double distance_squared =
+      (current_x - projected_x) * (current_x - projected_x) +
+      (current_y - projected_y) * (current_y - projected_y);
+    if (!finite(distance_squared)) {
+      continue;
+    }
+    // At a shared waypoint prefer the later edge so a refreshed path does not
+    // replay the short edge that the body has already crossed.
+    if (distance_squared < best_distance_squared - 1.0e-10 ||
+      (std::abs(distance_squared - best_distance_squared) <= 1.0e-10 &&
+      index > best_index))
     {
-      continue;
+      best_distance_squared = distance_squared;
+      best_index = index;
     }
-
-    if (completion.kind == SdkCommandKind::kStop) {
-      if (pending_stop_sequence_ && *pending_stop_sequence_ == completion.sequence) {
-        pending_stop_sequence_.reset();
-      }
-      if (completion.outcome == SdkCommandOutcome::kSucceeded) {
-        command_active_ = false;
-        const std::string reason = pending_stop_reason_.empty() ?
-          "SDK2 stop request" : pending_stop_reason_;
-        pending_stop_reason_.clear();
-        RCLCPP_WARN(get_logger(), "Go2 stopped: %s", reason.c_str());
-      } else {
-        healthy = false;
-        RCLCPP_ERROR_THROTTLE(
-          get_logger(), *get_clock(), 3000,
-          "SportClient::StopMove worker failed with status %d; will retry",
-          completion.sdk_status);
-      }
-      continue;
-    }
-
-    if (completion.outcome == SdkCommandOutcome::kSucceeded) {
-      geometry_msgs::msg::TwistStamped command_message;
-      command_message.header.stamp = now();
-      command_message.header.frame_id = body_frame_;
-      command_message.twist.linear.x = completion.command.vx;
-      command_message.twist.linear.y = completion.command.vy;
-      command_message.twist.angular.z = completion.command.yaw_rate;
-      command_pub_->publish(command_message);
-      continue;
-    }
-
-    healthy = false;
-    RCLCPP_ERROR(
-      get_logger(), "SportClient::Move worker failed with status %d%s",
-      completion.sdk_status,
-      completion.outcome == SdkCommandOutcome::kSdkException ? " after an exception" : "");
-    failSafe("SDK2 Move worker reported an error");
   }
-  return healthy;
+  path_cursor_index_ = best_index;
 }
 
-void Go2Sdk2BridgeNode::failSafe(const char * reason)
+void Go2Sdk2BridgeNode::clearExecutionState()
 {
-  motion_authorization_.disarm();
   path_.reset();
   path_goal_generation_.reset();
+  completed_goal_generation_.reset();
+  path_cursor_index_ = 0U;
+  path_waiting_for_new_goal_ = false;
   path_refresh_pending_reanchor_ = false;
-  direction_conflict_started_at_.reset();
-  direction_conflict_path_sequence_.reset();
-  odom_.reset();
-  path_progress_tracker_.reset();
-  motion_response_watchdog_.reset();
-  completed_goal_latch_.clear();
   heading_alignment_active_ = false;
-  stopRobot(reason);
 }
 
-bool Go2Sdk2BridgeNode::waitForNewPath(const char * reason)
+void Go2Sdk2BridgeNode::disableAfterFault(const char * reason)
 {
-  if (command_worker_) {
-    // Prevent a coalesced nonzero command from outliving the path that
-    // produced it. This changes only the worker mailbox and performs no RPC.
-    (void)command_worker_->discardPendingMove();
-  }
-  path_.reset();
-  path_goal_generation_.reset();
-  path_refresh_pending_reanchor_ = false;
-  direction_conflict_started_at_.reset();
-  direction_conflict_path_sequence_.reset();
-  path_progress_tracker_.reset();
-  motion_response_watchdog_.reset();
-  motion_authorization_.waitForPath();
-  heading_alignment_active_ = false;
-
-  if (motion_authorization_.armed()) {
-    // This helper is also called from subscription callbacks. Never enqueue a
-    // Move here: the next control tick must pass every safety gate first.
-    return true;
-  }
-  return stopRobot(reason);
-}
-
-bool Go2Sdk2BridgeNode::holdZeroMoveWhileWaiting(const char * reason)
-{
-  motion_response_watchdog_.reset();
-  if (!motion_authorization_.armed()) {
-    return stopRobot(reason);
-  }
-
-  // Keep the locomotion stream active without a StopMove transition. This is
-  // an A/B test for the observed wake symptom; hardware feedback must confirm
-  // whether it changes physical execution.
-  if (sendMove(0.0, 0.0, 0.0)) {
-    return true;
-  }
-
-  stopRobot("zero-speed wait command failed");
-  return false;
+  motion_enabled_ = false;
+  clearExecutionState();
+  (void)stopRobot(reason);
 }
 
 bool Go2Sdk2BridgeNode::sendMove(double vx, double vy, double yaw_rate)
 {
-  if (!command_worker_) {
+  if (!sport_client_ || !finite(vx) || !finite(vy) || !finite(yaw_rate)) {
+    disableAfterFault("invalid SDK2 Move input");
     return false;
   }
+
+  command_active_ = true;
+  int32_t status = -1;
   try {
-    const auto sequence = command_worker_->submitMove(
-      SdkVelocityCommand{
-        static_cast<float>(vx), static_cast<float>(vy), static_cast<float>(yaw_rate)});
-    if (!sequence) {
-      RCLCPP_ERROR(get_logger(), "SDK2 worker rejected Move while stopping or faulted");
-      return false;
-    }
-    // The RPC may reach the robot before its completion is observed. Treat the
-    // command as active as soon as it enters the serialized SDK mailbox.
-    command_active_ = true;
-    return true;
+    // This is intentionally the official synchronous call. The timer invokes
+    // it again on the next tick, keeping the robot's short command lease alive.
+    status = sport_client_->Move(vx, vy, yaw_rate);
   } catch (const std::exception & exception) {
-    RCLCPP_ERROR(get_logger(), "Could not queue SDK2 Move: %s", exception.what());
+    RCLCPP_ERROR(get_logger(), "SportClient::Move threw: %s", exception.what());
+    motion_enabled_ = false;
+    clearExecutionState();
+    (void)stopRobot("SportClient::Move exception");
     return false;
   } catch (...) {
-    RCLCPP_ERROR(get_logger(), "Could not queue SDK2 Move after an unknown exception");
+    RCLCPP_ERROR(get_logger(), "SportClient::Move threw an unknown exception");
+    motion_enabled_ = false;
+    clearExecutionState();
+    (void)stopRobot("SportClient::Move exception");
     return false;
   }
+
+  if (status != 0) {
+    RCLCPP_ERROR(get_logger(), "SportClient::Move failed with status %d", status);
+    motion_enabled_ = false;
+    clearExecutionState();
+    (void)stopRobot("SportClient::Move failure");
+    return false;
+  }
+
+  geometry_msgs::msg::TwistStamped command;
+  command.header.stamp = now();
+  command.header.frame_id = body_frame_;
+  command.twist.linear.x = vx;
+  command.twist.linear.y = vy;
+  command.twist.angular.z = yaw_rate;
+  command_pub_->publish(command);
+  return true;
 }
 
-bool Go2Sdk2BridgeNode::stopRobot(const char * reason) noexcept
+bool Go2Sdk2BridgeNode::stopRobot(const char * reason, bool force) noexcept
 {
-  if (!command_active_) {return true;}
-  try {
-    if (pending_stop_sequence_) {
-      return false;
-    }
-    const auto sequence = command_worker_->submitStop();
-    if (!sequence) {
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "SDK2 worker rejected StopMove (%s); will retry", reason);
-      return false;
-    }
-    pending_stop_sequence_ = *sequence;
-    if (pending_stop_reason_.empty()) {
-      pending_stop_reason_ = reason;
-    }
-    return false;
-  } catch (const std::exception & exception) {
-    try {
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "Could not queue SDK2 StopMove (%s): %s; will retry", reason, exception.what());
-    } catch (...) {
-      std::fprintf(stderr, "go2_sdk2_bridge: could not queue StopMove: %s\n", exception.what());
-    }
-    return false;
-  } catch (...) {
-    try {
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(), *get_clock(), 3000,
-        "Could not queue SDK2 StopMove after an unknown exception (%s); will retry", reason);
-    } catch (...) {
-      std::fprintf(stderr, "go2_sdk2_bridge: could not queue StopMove\n");
-    }
+  if (force && !command_active_) {
+    // An explicit stop is an SDK request even when this process has not yet
+    // sent a non-zero command. Keep the retry state if that request fails.
+    command_active_ = true;
+  }
+  if (!command_active_ && !force) {
+    return true;
+  }
+  if (!sport_client_) {
     return false;
   }
+  try {
+    const int32_t status = sport_client_->StopMove();
+    if (status == 0) {
+      command_active_ = false;
+      RCLCPP_WARN(get_logger(), "Go2 stopped: %s", reason);
+      return true;
+    }
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "SportClient::StopMove failed with status %d (%s); retrying", status, reason);
+  } catch (const std::exception & exception) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "SportClient::StopMove threw (%s): %s; retrying", reason, exception.what());
+  } catch (...) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "SportClient::StopMove threw (%s); retrying", reason);
+  }
+  return false;
 }
 
 bool Go2Sdk2BridgeNode::cachedPathValid() const
 {
-  if (!path_ || path_->poses.empty() || path_->header.frame_id != world_frame_)
-  {
+  if (!path_ || path_->poses.empty() || path_->header.frame_id != world_frame_) {
     return false;
   }
   return std::all_of(
@@ -1046,61 +708,24 @@ bool Go2Sdk2BridgeNode::cachedOdomValid() const
          odom_->child_frame_id == body_frame_ && isFinitePose(odom_->pose.pose);
 }
 
-bool Go2Sdk2BridgeNode::pathFresh(const rclcpp::Time & current_time) const
+bool Go2Sdk2BridgeNode::pathFresh() const
 {
-  const auto clock_type = current_time.get_clock_type();
-  return path_ && messageStampFresh(
-           rclcpp::Time(path_->header.stamp, clock_type), current_time, path_timeout_);
-}
-
-bool Go2Sdk2BridgeNode::odomFresh(const rclcpp::Time & current_time) const
-{
-  const auto clock_type = current_time.get_clock_type();
-  return odom_ && messageStampFresh(
-           rclcpp::Time(odom_->header.stamp, clock_type), current_time, odom_timeout_);
-}
-
-double Go2Sdk2BridgeNode::messageAgeSeconds(
-  const rclcpp::Time & message_time,
-  const rclcpp::Time & current_time) const
-{
-  return (current_time - message_time).seconds();
-}
-
-bool Go2Sdk2BridgeNode::messageStampFresh(
-  const rclcpp::Time & message_time,
-  const rclcpp::Time & current_time,
-  double timeout) const
-{
-  const double age = messageAgeSeconds(message_time, current_time);
-  return std::isfinite(age) && age >= -timestamp_future_tolerance_ && age <= timeout;
-}
-
-std::optional<SportStateSample> Go2Sdk2BridgeNode::freshSportState()
-{
-  SportStateSample sample{};
-  std::chrono::steady_clock::time_point received_at;
-  {
-    const std::lock_guard<std::mutex> lock(sport_state_mutex_);
-    if (motion_authorization_.armed()) {
-      if (const auto unsafe_sample = unsafe_sport_state_latch_.take()) {
-        return unsafe_sample;
-      }
-    } else {
-      (void)unsafe_sport_state_latch_.take();
-    }
-    if (!sport_state_) {
-      return std::nullopt;
-    }
-    sample = *sport_state_;
-    received_at = sport_state_received_at_;
+  if (last_path_received_ == std::chrono::steady_clock::time_point{}) {
+    return false;
   }
   const double age = std::chrono::duration<double>(
-    std::chrono::steady_clock::now() - received_at).count();
-  if (!std::isfinite(age) || age < 0.0 || age > sport_state_timeout_) {
-    return std::nullopt;
+    std::chrono::steady_clock::now() - last_path_received_).count();
+  return finite(age) && age >= 0.0 && age <= path_timeout_;
+}
+
+bool Go2Sdk2BridgeNode::odomFresh() const
+{
+  if (last_odom_received_ == std::chrono::steady_clock::time_point{}) {
+    return false;
   }
-  return sample;
+  const double age = std::chrono::duration<double>(
+    std::chrono::steady_clock::now() - last_odom_received_).count();
+  return finite(age) && age >= 0.0 && age <= odom_timeout_;
 }
 
 bool Go2Sdk2BridgeNode::lowcmdPublisherPresent()

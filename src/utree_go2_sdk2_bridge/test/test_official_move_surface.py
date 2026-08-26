@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 import pathlib
 import unittest
 
@@ -20,7 +18,7 @@ DIRECT_HEADER = (
 
 
 class OfficialMoveSurfaceTest(unittest.TestCase):
-    def test_bridge_uses_only_move_and_stop_motion_rpcs(self):
+    def test_bridges_use_only_move_and_stop_motion_rpcs(self):
         for node_source in NODE_SOURCES:
             with self.subTest(source=node_source.name):
                 source = node_source.read_text(encoding="utf-8")
@@ -42,6 +40,13 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
                 ):
                     self.assertNotIn(forbidden_call, source)
 
+    def test_standard_bridge_consumes_the_planner_path(self):
+        source = NODE_SOURCES[0].read_text(encoding="utf-8")
+        self.assertIn("nav_msgs::msg::Path", source)
+        self.assertIn("path_sub_", source)
+        self.assertIn("path_refresh_pending_reanchor_", source)
+        self.assertIn("translation_speed_", source)
+
     def test_direct_bridge_does_not_consume_or_launch_the_planner(self):
         source = NODE_SOURCES[1].read_text(encoding="utf-8")
         launch = DIRECT_LAUNCH.read_text(encoding="utf-8")
@@ -59,13 +64,13 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
             self.assertNotIn(planner_executable, launch)
             self.assertNotIn(planner_executable, start)
 
-    def test_direct_bridge_does_not_stop_between_route_segments(self):
-        source = NODE_SOURCES[1].read_text(encoding="utf-8")
-
-        self.assertNotIn('stopRobot("segment heading aligned")', source)
-        self.assertNotIn('stopRobot("right-angle waypoint reached")', source)
-        self.assertIn("continuing with translation", source)
-        self.assertIn("continuing with next segment", source)
+    def test_standard_bridge_does_not_disarm_for_geometry_or_no_motion(self):
+        source = NODE_SOURCES[0].read_text(encoding="utf-8")
+        self.assertNotIn("PathProgressTracker", source)
+        self.assertNotIn("motion_response_watchdog_", source)
+        self.assertNotIn("direction_conflict", source)
+        self.assertNotIn("path_cross_track", source)
+        self.assertIn("holding Move(0,0,0)", source)
 
     def test_direct_bridge_keeps_move_stream_active_between_goals(self):
         source = NODE_SOURCES[1].read_text(encoding="utf-8")
@@ -74,13 +79,6 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
         self.assertNotIn('stopRobot("simple goal reached")', source)
         self.assertIn("Hold a zero-speed Move while armed between goals", source)
         self.assertNotIn("if (command_active_) {\n      (void)sendMove(0.0", source)
-
-    def test_path_bridge_keeps_zero_move_stream_while_armed_without_a_path(self):
-        source = NODE_SOURCES[0].read_text(encoding="utf-8")
-
-        self.assertIn("holdZeroMoveWhileWaiting", source)
-        self.assertIn("sendMove(0.0, 0.0, 0.0", source)
-        self.assertNotIn('waitForNewPath("waiting for a path")', source)
 
     def test_direct_bridge_can_recover_after_passing_a_waypoint(self):
         source = NODE_SOURCES[1].read_text(encoding="utf-8")
@@ -96,6 +94,7 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
         self.assertIn("targetDeltaInBody(", controller)
         self.assertIn("progress >= segment_length", controller)
         self.assertIn("SimpleNavigationController navigation_", header)
+        self.assertIn("continuing with next segment", source)
 
 
 if __name__ == "__main__":

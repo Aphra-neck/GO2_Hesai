@@ -8,39 +8,22 @@ go2_sdk2_bridge:
     body_frame: base_link
     path_topic: /body_path
     odom_topic: /lio/body_odom
+    # SportClient::Move is refreshed continuously at this rate.
     command_rate: 20.0
+    # Receipt-time input watchdogs; there is no path-geometry stop gate.
     path_timeout: 1.0
     odom_timeout: 0.5
-    sport_state_timeout: 1.0
-    timestamp_future_tolerance: 0.2
-    lookahead_distance: 0.6
-    # Commissioning mode: do not disarm solely because the current pose is
-    # When true, stop if the body, a rotation waypoint, or the final pose is
-    # more than 0.05 m from the active path geometry. The deployed flat-ground
-    # run keeps this false so small planner/grid offsets do not disarm motion;
-    # non-finite geometry, stale inputs, reverse-command, and motion-response
-    # gates remain active.
-    path_cross_track_safety_gate_enabled: false
-    # Same-goal path refreshes preserve tracker progress. A transient forward /
-    # reverse mismatch holds a zero Move for at most 0.75 s while waiting for
-    # the next planner path; the negative-vx safety gate is not disabled.
+    lookahead_distance: 0.35
+    waypoint_tolerance: 0.12
     goal_position_tolerance: 0.15
     goal_yaw_tolerance: 0.20
-    # Rotate in place above 45 deg; resume translation only after reaching 15 deg.
-    heading_alignment_enter_angle: 0.7853981633974483
-    heading_alignment_exit_angle: 0.2617993877991494
-    # Explicit zero-length path rotations use a tighter completion threshold.
-    explicit_rotation_tolerance: 0.05
-    linear_gain: 1.0
+    # Turn in place before a new route segment, then resume translation.
+    heading_alignment_enter_angle: 0.35
+    heading_alignment_exit_angle: 0.12
+    explicit_rotation_tolerance: 0.08
+    # Fixed planar speed requested for every translating Move command.
+    translation_speed: 0.20
     yaw_gain: 1.5
-    # The synchronized hardware capture showed repeated no-response episodes
-    # while commands stayed at 0.069-0.137 m/s. Preserve direction but lift
-    # non-zero translation above that observed band.
-    minimum_translation_speed: 0.20
-    # Disarm instead of leaving an unexecuted command stream armed indefinitely.
-    motion_response_timeout: 2.0
-    motion_response_min_translation: 0.04
-    motion_response_min_yaw: 0.05
     max_vx: 0.6
     max_vy: 0.35
     max_yaw_rate: 0.8

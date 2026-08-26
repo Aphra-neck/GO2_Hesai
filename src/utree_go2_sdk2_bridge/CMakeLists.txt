@@ -56,7 +56,7 @@ add_executable(go2_sdk2_bridge_node
   src/go2_sdk2_bridge_main.cpp)
 target_include_directories(go2_sdk2_bridge_node PRIVATE include)
 target_include_directories(go2_sdk2_bridge_node PRIVATE ${UNITREE_DDSCXX_INCLUDE_DIR})
-target_link_libraries(go2_sdk2_bridge_node control_safety sdk_command_worker unitree_sdk2)
+target_link_libraries(go2_sdk2_bridge_node control_safety unitree_sdk2)
 ament_target_dependencies(go2_sdk2_bridge_node
   geometry_msgs nav_msgs rclcpp rcl_interfaces std_srvs tf2 tf2_geometry_msgs)
 
