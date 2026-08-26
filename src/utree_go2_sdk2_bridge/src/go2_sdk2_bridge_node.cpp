@@ -36,7 +36,7 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   const bool configured_enabled = declare_parameter<bool>("enabled", false);
   network_interface_ = declare_parameter("network_interface", "enP8p1s0");
   domain_id_ = declare_parameter("domain_id", 0);
-  command_rate_ = declare_parameter("command_rate", 20.0);
+  command_rate_ = declare_parameter("command_rate", 200.0);
   path_timeout_ = declare_parameter("path_timeout", 1.0);
   odom_timeout_ = declare_parameter("odom_timeout", 0.5);
   lookahead_distance_ = declare_parameter("lookahead_distance", 0.35);
@@ -50,7 +50,7 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   explicit_rotation_tolerance_ = declare_parameter(
     "explicit_rotation_tolerance", 0.08);
   translation_speed_ = declare_parameter("translation_speed", 0.20);
-  yaw_gain_ = declare_parameter("yaw_gain", 1.5);
+  rotation_speed_ = declare_parameter("rotation_speed", 0.30);
   max_vx_ = declare_parameter("max_vx", 0.6);
   max_vy_ = declare_parameter("max_vy", 0.35);
   max_yaw_rate_ = declare_parameter("max_yaw_rate", 0.8);
@@ -98,11 +98,11 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     throw std::invalid_argument("heading alignment tolerances are invalid");
   }
   if (!finite(translation_speed_) || translation_speed_ <= 0.0 ||
-    !finite(yaw_gain_) || yaw_gain_ < 0.0 ||
+    !finite(rotation_speed_) || rotation_speed_ <= 0.0 ||
     !finite(max_vx_) || max_vx_ <= 0.0 ||
     !finite(max_vy_) || max_vy_ <= 0.0 ||
     !finite(max_yaw_rate_) || max_yaw_rate_ <= 0.0 ||
-    translation_speed_ > max_vx_)
+    translation_speed_ > max_vx_ || rotation_speed_ > max_yaw_rate_)
   {
     throw std::invalid_argument("translation speed and SDK limits are invalid");
   }
@@ -138,8 +138,9 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   RCLCPP_WARN(
     get_logger(),
     "Go2 SDK2 path executor on '%s': disabled until ~/enable_motion; "
-    "Move is refreshed at %.1f Hz with fixed translation speed %.2f m/s",
-    network_interface_.c_str(), command_rate_, translation_speed_);
+    "Move is refreshed at %.1f Hz with fixed translation speed %.2f m/s and "
+    "fixed turn speed %.2f rad/s",
+    network_interface_.c_str(), command_rate_, translation_speed_, rotation_speed_);
   RCLCPP_INFO(
     get_logger(),
     "Route completion holds Move(0,0,0); only SDK failure, input timeout, /lowcmd, "
@@ -412,7 +413,7 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
         return std::nullopt;
       }
       const auto bounded = makeBoundedCommand(
-        0.0, 0.0, yaw_gain_ * yaw_error,
+        0.0, 0.0, std::copysign(rotation_speed_, yaw_error),
         max_vx_, max_vy_, max_yaw_rate_);
       if (!bounded) {
         return std::nullopt;
@@ -440,13 +441,11 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
         return rotationCommand(yaw_error);
       }
 
-      // The vector has exactly translation_speed_ planar magnitude. It is
-      // expressed in the body frame expected by the official Move API.
-      const double local_angle = normalizeAngle(desired_yaw - *current_yaw);
+      // Segment changes are handled by the rotation-only branch above. Once
+      // aligned, use the same fixed forward command as the official SDK2
+      // velocity example instead of shrinking it near a waypoint.
       const auto bounded = makeBoundedCommand(
-        translation_speed_ * std::cos(local_angle),
-        translation_speed_ * std::sin(local_angle),
-        yaw_gain_ * yaw_error,
+        translation_speed_, 0.0, 0.0,
         max_vx_, max_vy_, max_yaw_rate_);
       if (!bounded) {
         return std::nullopt;

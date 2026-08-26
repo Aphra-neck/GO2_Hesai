@@ -66,7 +66,7 @@ private:
   std::string body_frame_;
   int domain_id_{0};
 
-  double command_rate_{20.0};
+  double command_rate_{200.0};
   double path_timeout_{1.0};
   double odom_timeout_{0.5};
   double lookahead_distance_{0.35};
@@ -77,7 +77,7 @@ private:
   double heading_alignment_exit_angle_{0.12};
   double explicit_rotation_tolerance_{0.08};
   double translation_speed_{0.20};
-  double yaw_gain_{1.5};
+  double rotation_speed_{0.30};
   double max_vx_{0.6};
   double max_vy_{0.35};
   double max_yaw_rate_{0.8};

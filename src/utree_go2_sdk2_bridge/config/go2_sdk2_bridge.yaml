@@ -9,7 +9,8 @@ go2_sdk2_bridge:
     path_topic: /body_path
     odom_topic: /lio/body_odom
     # SportClient::Move is refreshed continuously at this rate.
-    command_rate: 20.0
+    # Match Unitree's official 5 ms recurrent Move loop.
+    command_rate: 200.0
     # Receipt-time input watchdogs; there is no path-geometry stop gate.
     path_timeout: 1.0
     odom_timeout: 0.5
@@ -23,7 +24,8 @@ go2_sdk2_bridge:
     explicit_rotation_tolerance: 0.08
     # Fixed planar speed requested for every translating Move command.
     translation_speed: 0.20
-    yaw_gain: 1.5
+    # Rotate in place at a fixed rate so SDK2 never receives a vanishing turn.
+    rotation_speed: 0.30
     max_vx: 0.6
     max_vy: 0.35
     max_yaw_rate: 0.8

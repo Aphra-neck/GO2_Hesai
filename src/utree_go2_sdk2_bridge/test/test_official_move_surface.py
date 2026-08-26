@@ -46,6 +46,9 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
         self.assertIn("path_sub_", source)
         self.assertIn("path_refresh_pending_reanchor_", source)
         self.assertIn("translation_speed_", source)
+        self.assertIn("rotation_speed_", source)
+        self.assertIn("std::copysign(rotation_speed_, yaw_error)", source)
+        self.assertIn("translation_speed_, 0.0, 0.0", source)
 
     def test_direct_bridge_does_not_consume_or_launch_the_planner(self):
         source = NODE_SOURCES[1].read_text(encoding="utf-8")

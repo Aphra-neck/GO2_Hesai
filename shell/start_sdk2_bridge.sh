@@ -113,7 +113,8 @@ IFS='|' read -r MAX_YAW_RATE MAX_YAW_RATE_SOURCE < <(
 )
 COMMAND_RATE="$(yaml_number command_rate)"
 TRANSLATION_SPEED="$(yaml_number translation_speed)"
-for required_value in COMMAND_RATE TRANSLATION_SPEED; do
+ROTATION_SPEED="$(yaml_number rotation_speed)"
+for required_value in COMMAND_RATE TRANSLATION_SPEED ROTATION_SPEED; do
   if [[ -z "${!required_value}" ]]; then
     echo "Missing ${required_value} in bridge config: ${BRIDGE_CONFIG}" >&2
     exit 1
@@ -200,6 +201,7 @@ echo "   vx=${MAX_VX} m/s [${MAX_VX_SOURCE}]"
 echo "   vy=${MAX_VY} m/s [${MAX_VY_SOURCE}]"
 echo "   yaw=${MAX_YAW_RATE} rad/s [${MAX_YAW_RATE_SOURCE}]"
 echo " Fixed translation speed: ${TRANSLATION_SPEED} m/s [YAML: ${BRIDGE_CONFIG}]"
+echo " Fixed rotation speed: ${ROTATION_SPEED} rad/s [YAML: ${BRIDGE_CONFIG}]"
 echo "======================================"
 echo "In another Jetson terminal, verify the scene and arm once with:"
 echo "cd ${WORKSPACE_DIR}"

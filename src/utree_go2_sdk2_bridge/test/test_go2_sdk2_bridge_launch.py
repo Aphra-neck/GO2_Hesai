@@ -10,6 +10,7 @@ NODE_SOURCE = os.path.join(PACKAGE_ROOT, "src", "go2_sdk2_bridge_node.cpp")
 NODE_HEADER = os.path.join(
     PACKAGE_ROOT, "include", "utree_go2_sdk2_bridge", "go2_sdk2_bridge_node.hpp"
 )
+CONFIG_FILE = os.path.join(PACKAGE_ROOT, "config", "go2_sdk2_bridge.yaml")
 
 
 class _Entity:
@@ -112,6 +113,8 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
             self.source = stream.read()
         with open(NODE_HEADER, "r", encoding="utf-8") as stream:
             self.header = stream.read()
+        with open(CONFIG_FILE, "r", encoding="utf-8") as stream:
+            self.config = stream.read()
 
     def test_execution_path_subscription_does_not_replay_history(self):
         subscription = self.source[
@@ -132,6 +135,15 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
         self.assertNotIn("SdkCommandWorker", self.source)
         self.assertNotIn("motion_response_watchdog_", self.source)
         self.assertNotIn("PathProgressTracker", self.source)
+
+    def test_official_five_millisecond_fixed_speed_loop(self):
+        self.assertIn('declare_parameter("command_rate", 200.0)', self.source)
+        self.assertIn("command_rate: 200.0", self.config)
+        self.assertIn("translation_speed: 0.20", self.config)
+        self.assertIn("rotation_speed: 0.30", self.config)
+        self.assertIn("std::copysign(rotation_speed_, yaw_error)", self.source)
+        self.assertIn("translation_speed_, 0.0, 0.0", self.source)
+        self.assertNotIn("yaw_gain_", self.source)
 
     def test_route_completion_keeps_authorization_and_refreshes_zero_move(self):
         completion = self.source[

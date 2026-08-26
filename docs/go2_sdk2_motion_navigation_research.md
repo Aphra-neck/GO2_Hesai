@@ -16,8 +16,8 @@
 2. Go2 Edu 软件版本 `>= V1.1.6` 应使用当前 V2.0 高层运控接口。当前运控模式名为
    `mcf`。官方当前高层示例直接初始化并调用 `SportClient`，没有把
    `MotionSwitcherClient::SelectMode()` 或 `ReleaseMode()` 作为前置步骤。
-3. `Move()` 是机体系速度接口。最新命令维持 1 秒，运控不替调用者滤波；因此本工程以至少
-   20 Hz 直接刷新固定平移速度，在 armed 等待和正常完成时持续发送零速 `Move()`，并在
+3. `Move()` 是机体系速度接口。最新命令维持 1 秒，运控不替调用者滤波；因此本工程按官方
+   示例的 `5 ms / 200 Hz` 周期直接刷新固定速度，在 armed 等待和正常完成时持续发送零速 `Move()`，并在
    SDK 调用失败、路径/里程计输入超时、`/lowcmd` 冲突、显式禁用或退出时调用 `StopMove()`。
 4. `BalanceStand()` 的作用是从“站立锁定”切到“平衡站立”，但官方速度示例没有把它列为
    `Move()` 的前置调用。当前 bridge 不自动调用它，也不根据 `rt/sportmodestate` 自动选择
@@ -49,7 +49,7 @@
 | domain `0`、指定机器狗网卡初始化 SDK2 | `ChannelFactory::Init(domain_id_, network_interface_)` | 已一致 |
 | 初始化 `go2::SportClient` | 构造、`SetTimeout()`、`Init()` | 已一致 |
 | 发送机体系 `vx`、`vy`、`vyaw` | 把 ROS `/body_path` 与 `/lio/body_odom` 转为 `Move(...)` | 架构正确 |
-| 周期刷新速度 | 控制定时器按配置频率直接同步提交 `Move(...)`，默认 `20 Hz` | 已一致 |
+| 周期刷新速度 | 控制定时器每 `5 ms` 直接同步提交 `Move(...)`，默认 `200 Hz` | 已一致 |
 | 停止与等待 | armed 等待/正常完成发送 `Move(0,0,0)`；禁用、故障和退出调用 `StopMove()` | 已一致 |
 | 原生遥控器是否响应 | 可选 `SwitchJoystick(bool)` | 不是 `Move()` 前置步骤；当前不调用 |
 | 高层/低层运控切换 | `MotionSwitcherClient` | 高层 bridge 不 `ReleaseMode()`，不发布 `/lowcmd` |
@@ -148,8 +148,7 @@ V2.0 文档定义：
 [`Move(0.3, 0, 0.3)`](https://github.com/unitreerobotics/unitree_sdk2/blob/21d0a3b2c46ee48c8fdf2783becb6be3beb0a59b/example/go2/go2_sport_client.cpp#L69-L71)，
 控制步长为
 [`0.005 s`](https://github.com/unitreerobotics/unitree_sdk2/blob/21d0a3b2c46ee48c8fdf2783becb6be3beb0a59b/example/go2/go2_sport_client.cpp#L131-L138)。
-这支持“周期刷新速度”的使用方式，但官方没有要求固定为该示例的 200 Hz；本工程的 20 Hz
-仍远快于 1 秒保持窗口。
+本工程直接采用该示例的 `5 ms / 200 Hz` 刷新周期，以排除低频刷新差异。
 
 ### 4. `BalanceStand()` 与状态机
 
@@ -208,8 +207,8 @@ V2.0 文档的定义非常明确：
 1. 操作员先用原生遥控器或官方 App 把机器人置于普通可行走站立状态，并确认没有 `/lowcmd`
    发布者。
 2. bridge 在 disarmed 时不发送运动 RPC；armed、等待新路径时周期发送零速 `Move()`。
-3. 执行期间按控制周期发送固定平移速度 `0.20 m/s` 的 `Move(vx, vy, vyaw)`，换段时先
-   原地旋转。
+3. 执行期间每 `5 ms` 刷新固定前进命令 `Move(0.20, 0, 0)`；换段时先以固定
+   `0.30 rad/s` 原地旋转。
 4. 正常到达时继续发送零速 `Move()` 并等待新路径；SDK 调用失败、输入超时、`/lowcmd`
    冲突、显式禁用或退出时，对本进程可能发出的运动调用 `StopMove()`。
 5. bridge 不调用 `SwitchJoystick()`。原生遥控器保持响应，安全员在自动执行期间不同时发送

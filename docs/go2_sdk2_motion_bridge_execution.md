@@ -6,12 +6,11 @@ separate:
 1. body_lattice_planner publishes /body_path.
 2. The bridge reads /body_path and /lio/body_odom.
 3. After one explicit ~/enable_motion authorization, the control timer calls
-   SportClient::Move(vx, vy, vyaw) directly at command_rate (20 Hz by
-   default).
-4. Translation commands have a fixed planar speed of translation_speed
-   (0.20 m/s by default). At a new route heading the bridge sends a
-   zero-planar, non-zero-yaw Move until the heading is aligned, then resumes
-   translation.
+   SportClient::Move(vx, vy, vyaw) directly every 5 ms (200 Hz by default),
+   matching Unitree's official recurrent velocity example.
+4. Translation sends Move(0.20, 0, 0). At a new route heading the bridge
+   rotates in place at a fixed 0.30 rad/s until aligned, then resumes the
+   fixed forward command.
 5. At the final pose it continues sending Move(0, 0, 0) while remaining
    armed. A path with a new /goal_pose generation resumes execution.
 
