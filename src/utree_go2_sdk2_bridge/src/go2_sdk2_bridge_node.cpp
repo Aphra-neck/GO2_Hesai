@@ -139,7 +139,7 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     get_logger(),
     "Go2 SDK2 path executor on '%s': disabled until ~/enable_motion; "
     "Move is refreshed at %.1f Hz with fixed translation speed %.2f m/s and "
-    "fixed turn speed %.2f rad/s",
+    "official-style arc turns at %.2f rad/s",
     network_interface_.c_str(), command_rate_, translation_speed_, rotation_speed_);
   RCLCPP_INFO(
     get_logger(),
@@ -407,13 +407,17 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
     return std::nullopt;
   }
 
-  const auto rotationCommand = [this](double yaw_error)
+  const auto turnCommand = [this](double yaw_error)
     -> std::optional<PathCommand> {
       if (!finite(yaw_error)) {
         return std::nullopt;
       }
+      // Unitree's official recurrent velocity example combines forward and
+      // yaw motion. Use the configured fixed forward speed during heading
+      // alignment as well, instead of relying on a pure-yaw command that the
+      // on-robot sport controller has only acknowledged with weak motion.
       const auto bounded = makeBoundedCommand(
-        0.0, 0.0, std::copysign(rotation_speed_, yaw_error),
+        translation_speed_, 0.0, std::copysign(rotation_speed_, yaw_error),
         max_vx_, max_vy_, max_yaw_rate_);
       if (!bounded) {
         return std::nullopt;
@@ -421,7 +425,7 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
       return PathCommand{bounded->vx, bounded->vy, bounded->yaw_rate, false};
     };
 
-  const auto translationCommand = [this, &current_yaw, &rotationCommand](double desired_yaw)
+  const auto translationCommand = [this, &current_yaw, &turnCommand](double desired_yaw)
     -> std::optional<PathCommand> {
       if (!finite(desired_yaw)) {
         return std::nullopt;
@@ -433,17 +437,15 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
       const double absolute_error = std::abs(yaw_error);
       if (heading_alignment_active_) {
         if (absolute_error > heading_alignment_exit_angle_) {
-          return rotationCommand(yaw_error);
+          return turnCommand(yaw_error);
         }
         heading_alignment_active_ = false;
       } else if (absolute_error >= heading_alignment_enter_angle_) {
         heading_alignment_active_ = true;
-        return rotationCommand(yaw_error);
+        return turnCommand(yaw_error);
       }
 
-      // Segment changes are handled by the rotation-only branch above. Once
-      // aligned, use the same fixed forward command as the official SDK2
-      // velocity example instead of shrinking it near a waypoint.
+      // Once aligned, continue with the fixed straight-ahead command.
       const auto bounded = makeBoundedCommand(
         translation_speed_, 0.0, 0.0,
         max_vx_, max_vy_, max_yaw_rate_);
@@ -481,7 +483,7 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
           return PathCommand{0.0, 0.0, 0.0, true};
         }
         heading_alignment_active_ = true;
-        return rotationCommand(final_yaw_error);
+        return turnCommand(final_yaw_error);
       }
 
       const double desired_yaw = std::atan2(final_dy, final_dx);
@@ -509,7 +511,7 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
       }
       if (std::abs(rotation_error) > explicit_rotation_tolerance_) {
         heading_alignment_active_ = true;
-        return rotationCommand(rotation_error);
+        return turnCommand(rotation_error);
       }
       ++path_cursor_index_;
       heading_alignment_active_ = false;

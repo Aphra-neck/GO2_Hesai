@@ -18,13 +18,13 @@ go2_sdk2_bridge:
     waypoint_tolerance: 0.12
     goal_position_tolerance: 0.15
     goal_yaw_tolerance: 0.20
-    # Turn in place before a new route segment, then resume translation.
+    # Use an official-example-style forward arc before a new route segment.
     heading_alignment_enter_angle: 0.35
     heading_alignment_exit_angle: 0.12
     explicit_rotation_tolerance: 0.08
     # Fixed planar speed requested for every translating Move command.
     translation_speed: 0.20
-    # Rotate in place at a fixed rate so SDK2 never receives a vanishing turn.
+    # Combine this fixed yaw rate with translation_speed during every turn.
     rotation_speed: 0.30
     max_vx: 0.6
     max_vy: 0.35

@@ -37,10 +37,9 @@ SH
 cat > "${workspace}/src/utree_go2_sdk2_bridge/config/go2_sdk2_bridge.yaml" <<'YAML'
 go2_sdk2_bridge:
   ros__parameters:
-    minimum_translation_speed: 0.20
-    motion_response_timeout: 2.0
-    motion_response_min_translation: 0.04
-    motion_response_min_yaw: 0.05
+    command_rate: 200.0
+    translation_speed: 0.20
+    rotation_speed: 0.30
     max_vx: 0.6
     max_vy: 0.35
     max_yaw_rate: 0.8
@@ -120,9 +119,10 @@ default_output="$(
 grep -Fq ' vx=0.6 m/s [YAML:' <<< "${default_output}"
 grep -Fq ' vy=0.35 m/s [YAML:' <<< "${default_output}"
 grep -Fq ' yaw=0.8 rad/s [YAML:' <<< "${default_output}"
-grep -Fq ' Minimum translation: 0.20 m/s [YAML:' <<< "${default_output}"
-grep -Fq ' Motion-response watchdog: 2.0 s' <<< "${default_output}"
-grep -Fq '   progress=0.04 m / 0.05 rad' <<< "${default_output}"
+grep -Fq ' Control: direct SportClient::Move refresh at 200.0 Hz' <<< "${default_output}"
+grep -Fq ' Fixed translation speed: 0.20 m/s [YAML:' <<< "${default_output}"
+grep -Fq ' Arc turn: Move(0.20,0,+/-0.30) [YAML:' <<< "${default_output}"
+[[ "${default_output}" != *'Motion-response watchdog'* ]]
 grep -Fq 'config:='"${workspace}"'/src/utree_go2_sdk2_bridge/config/go2_sdk2_bridge.yaml' \
   "${trace_file}"
 test "$(grep -c 'max_vx:=' "${trace_file}" || true)" -eq 0

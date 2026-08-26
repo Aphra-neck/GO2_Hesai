@@ -142,7 +142,14 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
         self.assertIn("translation_speed: 0.20", self.config)
         self.assertIn("rotation_speed: 0.30", self.config)
         self.assertIn("std::copysign(rotation_speed_, yaw_error)", self.source)
+        self.assertIn(
+            "translation_speed_, 0.0, std::copysign(rotation_speed_, yaw_error)",
+            self.source,
+        )
         self.assertIn("translation_speed_, 0.0, 0.0", self.source)
+        self.assertNotIn(
+            "0.0, 0.0, std::copysign(rotation_speed_, yaw_error)", self.source
+        )
         self.assertNotIn("yaw_gain_", self.source)
 
     def test_route_completion_keeps_authorization_and_refreshes_zero_move(self):

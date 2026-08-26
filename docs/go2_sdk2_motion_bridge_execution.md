@@ -9,8 +9,8 @@ separate:
    SportClient::Move(vx, vy, vyaw) directly every 5 ms (200 Hz by default),
    matching Unitree's official recurrent velocity example.
 4. Translation sends Move(0.20, 0, 0). At a new route heading the bridge
-   rotates in place at a fixed 0.30 rad/s until aligned, then resumes the
-   fixed forward command.
+   follows Unitree's combined-velocity example with Move(0.20, 0, +/-0.30)
+   until aligned, then resumes the fixed straight command.
 5. At the final pose it continues sending Move(0, 0, 0) while remaining
    armed. A path with a new /goal_pose generation resumes execution.
 
