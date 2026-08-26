@@ -74,10 +74,9 @@ private:
   double truncated_path_discount_{0.95};
   double waypoint_tolerance_{0.12};
   double goal_position_tolerance_{0.15};
-  double goal_yaw_tolerance_{0.20};
   double heading_alignment_enter_angle_{0.35};
   double heading_alignment_exit_angle_{0.12};
-  double explicit_rotation_tolerance_{0.08};
+  double persistent_arc_switch_angle_{0.04};
   double translation_speed_{0.20};
   double rotation_speed_{0.30};
   double max_vx_{0.6};
@@ -87,6 +86,7 @@ private:
   bool motion_enabled_{false};
   bool command_active_{false};
   bool heading_alignment_active_{false};
+  int persistent_arc_sign_{0};
   bool path_waiting_for_new_goal_{false};
   bool path_refresh_pending_reanchor_{false};
 

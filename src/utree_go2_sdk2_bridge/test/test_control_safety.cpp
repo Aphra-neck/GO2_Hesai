@@ -108,6 +108,23 @@ TEST(TruncatedPathSurrogate, RejectsInvalidSamplingContract)
       poses, 0U, 0.0, 0.0, 0.0, 8U, 0.95).has_value());
 }
 
+TEST(PersistentArcSign, RetainsDirectionInsideSwitchBand)
+{
+  ASSERT_EQ(selectPersistentArcSign(0.0, 0.04, 0), 1);
+  ASSERT_EQ(selectPersistentArcSign(-0.02, 0.04, 1), 1);
+  ASSERT_EQ(selectPersistentArcSign(-0.04, 0.04, 1), -1);
+  ASSERT_EQ(selectPersistentArcSign(0.02, 0.04, -1), -1);
+  ASSERT_EQ(selectPersistentArcSign(0.04, 0.04, -1), 1);
+}
+
+TEST(PersistentArcSign, RejectsInvalidInputs)
+{
+  EXPECT_FALSE(selectPersistentArcSign(
+      std::numeric_limits<double>::quiet_NaN(), 0.04, 1).has_value());
+  EXPECT_FALSE(selectPersistentArcSign(0.0, 0.0, 1).has_value());
+  EXPECT_FALSE(selectPersistentArcSign(0.0, 0.04, 2).has_value());
+}
+
 TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
 {
   auto parameters = validParameters();

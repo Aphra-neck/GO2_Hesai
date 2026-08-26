@@ -42,6 +42,9 @@ struct FlatObstacleConfig
   double footprint_length{0.60};
   double footprint_width{0.30};
   double obstacle_clearance{0.00};
+  // Commissioning recovery: if the measured body pose overlaps a mapped
+  // obstacle, connect it to the nearest free start inside start_snap_radius.
+  bool recover_colliding_start{false};
   // Surface elevation used by PlannedGridState. The node may instead lock body Z directly.
   double surface_elevation{0.0};
 };
@@ -137,6 +140,7 @@ struct PlanningResult
   VerifiedFlatStartStatus start_status{VerifiedFlatStartStatus::kNotNeeded};
   bool include_exact_start{false};
   bool exact_start_inferred{false};
+  bool colliding_start_recovered{false};
   bool start_connector_translation{false};
   double exact_start_elevation{0.0};
   double exact_start_dzdx{0.0};

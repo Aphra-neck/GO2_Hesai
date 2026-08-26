@@ -47,12 +47,10 @@ class OfficialMoveSurfaceTest(unittest.TestCase):
         self.assertIn("path_refresh_pending_reanchor_", source)
         self.assertIn("translation_speed_", source)
         self.assertIn("rotation_speed_", source)
-        self.assertIn("std::copysign(rotation_speed_, yaw_error)", source)
-        self.assertIn(
-            "translation_speed_, 0.0, std::copysign(rotation_speed_, yaw_error)",
-            source,
-        )
-        self.assertIn("translation_speed_, 0.0, 0.0", source)
+        self.assertIn("selectPersistentArcSign(", source)
+        self.assertIn("persistent_arc_sign_", source)
+        self.assertNotIn("translation_speed_, 0.0, 0.0", source)
+        self.assertIn("without chasing final yaw", source)
 
     def test_direct_bridge_does_not_consume_or_launch_the_planner(self):
         source = NODE_SOURCES[1].read_text(encoding="utf-8")

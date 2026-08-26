@@ -593,11 +593,15 @@ class TerrainNavigationLaunchTest(unittest.TestCase):
                 "flat_obstacle.obstacle_clearance": planner[
                     "flat_obstacle.obstacle_clearance"
                 ],
+                "flat_obstacle.recover_colliding_start": planner[
+                    "flat_obstacle.recover_colliding_start"
+                ],
             },
             {
                 "flat_obstacle.footprint_length": 0.60,
                 "flat_obstacle.footprint_width": 0.30,
                 "flat_obstacle.obstacle_clearance": 0.00,
+                "flat_obstacle.recover_colliding_start": True,
             },
         )
         self.assertEqual(mapper["flat_obstacle.obstacle_clearance"], 0.00)

@@ -463,6 +463,56 @@ TEST(LatticePlanner, FlatObstacleModeValidatesExactStartPoseBeforeGridCenter)
   EXPECT_FALSE(result.include_exact_start);
 }
 
+TEST(LatticePlanner, FlatObstacleModeRecoversCollidingExactStartWithinRadius)
+{
+  auto map = makeFlatObstacleMap(1.0F, 6, 6);
+  // The measured pose clips the obstacle cell by 9 mm, while its containing
+  // grid centre and the route ahead remain free.
+  markFlatObstacle(map, 0, 1);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.flat_obstacle.footprint_length = 0.02;
+  config.flat_obstacle.footprint_width = 0.02;
+  config.flat_obstacle.obstacle_clearance = 0.0;
+  config.flat_obstacle.recover_colliding_start = true;
+  config.start_snap_radius = 2.0;
+  config.snap_radius = 0.0;
+  config.motion_step = 1.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({1.001, 1.5, 0.0}, {2.5, 1.5, 0.0});
+
+  ASSERT_TRUE(result.success);
+  EXPECT_TRUE(result.colliding_start_recovered);
+  EXPECT_TRUE(result.include_exact_start);
+  EXPECT_TRUE(result.start_connector_translation);
+  ASSERT_FALSE(result.states.empty());
+  EXPECT_EQ(result.states.front().x, 1);
+  EXPECT_EQ(result.states.front().y, 1);
+}
+
+TEST(LatticePlanner, FlatObstacleModeRejectsCollidingStartWithoutFreeRecoveryPose)
+{
+  auto map = makeFlatObstacleMap(1.0F, 6, 6);
+  markFlatObstacle(map, 1, 1);
+  LatticePlannerConfig config;
+  config.planning_mode = PlanningMode::kFlatObstacle;
+  config.flat_obstacle.footprint_length = 0.02;
+  config.flat_obstacle.footprint_width = 0.02;
+  config.flat_obstacle.recover_colliding_start = true;
+  config.start_snap_radius = 0.0;
+  config.snap_radius = 0.0;
+  LatticePlanner planner(config);
+  planner.setMap(map);
+
+  const auto result = planner.plan({1.5, 1.5, 0.0}, {3.5, 1.5, 0.0});
+
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(result.failure_reason, PlanningFailureReason::kExactStartCollision);
+  EXPECT_FALSE(result.colliding_start_recovered);
+}
+
 TEST(LatticePlanner, FlatObstacleModeFindsExecutableStartWithinStartSnapRadius)
 {
   constexpr double kPi = 3.14159265358979323846;

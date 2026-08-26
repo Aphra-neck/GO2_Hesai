@@ -45,13 +45,12 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   truncated_path_discount_ = declare_parameter("truncated_path_discount", 0.95);
   waypoint_tolerance_ = declare_parameter("waypoint_tolerance", 0.12);
   goal_position_tolerance_ = declare_parameter("goal_position_tolerance", 0.15);
-  goal_yaw_tolerance_ = declare_parameter("goal_yaw_tolerance", 0.20);
   heading_alignment_enter_angle_ = declare_parameter(
     "heading_alignment_enter_angle", 0.35);
   heading_alignment_exit_angle_ = declare_parameter(
     "heading_alignment_exit_angle", 0.12);
-  explicit_rotation_tolerance_ = declare_parameter(
-    "explicit_rotation_tolerance", 0.08);
+  persistent_arc_switch_angle_ = declare_parameter(
+    "persistent_arc_switch_angle", 0.04);
   translation_speed_ = declare_parameter("translation_speed", 0.20);
   rotation_speed_ = declare_parameter("rotation_speed", 0.30);
   max_vx_ = declare_parameter("max_vx", 0.6);
@@ -85,9 +84,7 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   }
   if (!finite(lookahead_distance_) || lookahead_distance_ <= 0.0 ||
     !finite(waypoint_tolerance_) || waypoint_tolerance_ <= 0.0 ||
-    !finite(goal_position_tolerance_) || goal_position_tolerance_ <= 0.0 ||
-    !finite(goal_yaw_tolerance_) || goal_yaw_tolerance_ <= 0.0 ||
-    goal_yaw_tolerance_ > kPi)
+    !finite(goal_position_tolerance_) || goal_position_tolerance_ <= 0.0)
   {
     throw std::invalid_argument("path tolerances and lookahead must be finite and positive");
   }
@@ -103,10 +100,10 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     heading_alignment_enter_angle_ > kPi ||
     !finite(heading_alignment_exit_angle_) || heading_alignment_exit_angle_ < 0.0 ||
     heading_alignment_exit_angle_ >= heading_alignment_enter_angle_ ||
-    !finite(explicit_rotation_tolerance_) || explicit_rotation_tolerance_ <= 0.0 ||
-    explicit_rotation_tolerance_ > heading_alignment_enter_angle_)
+    !finite(persistent_arc_switch_angle_) || persistent_arc_switch_angle_ <= 0.0 ||
+    persistent_arc_switch_angle_ >= heading_alignment_enter_angle_)
   {
-    throw std::invalid_argument("heading alignment tolerances are invalid");
+    throw std::invalid_argument("heading and persistent arc steering tolerances are invalid");
   }
   if (!finite(translation_speed_) || translation_speed_ <= 0.0 ||
     !finite(rotation_speed_) || rotation_speed_ <= 0.0 ||
@@ -150,8 +147,8 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     get_logger(),
     "Go2 SDK2 path executor on '%s': disabled until ~/enable_motion; "
     "Move is refreshed at %.1f Hz with fixed translation speed %.2f m/s and "
-    "official-style arc turns at %.2f rad/s; local path direction uses %zu "
-    "discounted samples over %.2f m",
+    "persistent +/-%.2f rad/s arc steering; local path direction uses %zu "
+    "discounted samples over %.2f m and route completion is position-only",
     network_interface_.c_str(), command_rate_, translation_speed_, rotation_speed_,
     truncated_path_sample_count_, lookahead_distance_);
   RCLCPP_INFO(
@@ -197,6 +194,7 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
     path_refresh_pending_reanchor_ = false;
     path_cursor_index_ = 0U;
     heading_alignment_active_ = false;
+    persistent_arc_sign_ = 0;
     last_path_received_ = std::chrono::steady_clock::now();
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 3000,
@@ -243,10 +241,12 @@ void Go2Sdk2BridgeNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
     completed_goal_generation_.reset();
     path_cursor_index_ = 0U;
     heading_alignment_active_ = false;
+    persistent_arc_sign_ = 0;
     RCLCPP_INFO(get_logger(), "Accepted a new path after route completion");
   } else if (!same_goal_refresh) {
     path_cursor_index_ = 0U;
     heading_alignment_active_ = false;
+    persistent_arc_sign_ = 0;
   }
 
   // Every live planner refresh is reconciled against the current odometry on
@@ -395,9 +395,10 @@ void Go2Sdk2BridgeNode::controlTickImpl()
     path_waiting_for_new_goal_ = true;
     completed_goal_generation_ = path_goal_generation_;
     heading_alignment_active_ = false;
+    persistent_arc_sign_ = 0;
     RCLCPP_INFO_THROTTLE(
       get_logger(), *get_clock(), 3000,
-      "Path endpoint reached; holding Move(0,0,0) until a new path arrives");
+      "Path position endpoint reached; holding Move(0,0,0) without chasing final yaw");
     (void)sendMove(0.0, 0.0, 0.0);
     return;
   }
@@ -420,17 +421,29 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
     return std::nullopt;
   }
 
-  const auto turnCommand = [this](double yaw_error)
+  const auto arcCommand = [this](double yaw_error, bool force_error_sign)
     -> std::optional<PathCommand> {
       if (!finite(yaw_error)) {
         return std::nullopt;
       }
-      // Unitree's official recurrent velocity example combines forward and
-      // yaw motion. Use the configured fixed forward speed during heading
-      // alignment as well, instead of relying on a pure-yaw command that the
-      // on-robot sport controller has only acknowledged with weak motion.
+      if (force_error_sign) {
+        persistent_arc_sign_ = std::signbit(yaw_error) ? -1 : 1;
+      } else {
+        const auto selected_sign = selectPersistentArcSign(
+          yaw_error, persistent_arc_switch_angle_, persistent_arc_sign_);
+        if (!selected_sign) {
+          return std::nullopt;
+        }
+        persistent_arc_sign_ = *selected_sign;
+      }
+
+      // This Go2 responded to translating arc commands on every observed
+      // sample but acknowledged only about half of Move(vx, 0, 0) samples.
+      // Keep a non-zero yaw component on every translating command and use a
+      // Schmitt-style direction switch to approximate a straight heading.
       const auto bounded = makeBoundedCommand(
-        translation_speed_, 0.0, std::copysign(rotation_speed_, yaw_error),
+        translation_speed_, 0.0,
+        static_cast<double>(persistent_arc_sign_) * rotation_speed_,
         max_vx_, max_vy_, max_yaw_rate_);
       if (!bounded) {
         return std::nullopt;
@@ -438,7 +451,7 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
       return PathCommand{bounded->vx, bounded->vy, bounded->yaw_rate, false};
     };
 
-  const auto translationCommand = [this, &current_yaw, &turnCommand](double desired_yaw)
+  const auto translationCommand = [this, &current_yaw, &arcCommand](double desired_yaw)
     -> std::optional<PathCommand> {
       if (!finite(desired_yaw)) {
         return std::nullopt;
@@ -450,25 +463,28 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
       const double absolute_error = std::abs(yaw_error);
       if (heading_alignment_active_) {
         if (absolute_error > heading_alignment_exit_angle_) {
-          return turnCommand(yaw_error);
+          return arcCommand(yaw_error, true);
         }
         heading_alignment_active_ = false;
       } else if (absolute_error >= heading_alignment_enter_angle_) {
         heading_alignment_active_ = true;
-        return turnCommand(yaw_error);
+        return arcCommand(yaw_error, true);
       }
-
-      // Once aligned, continue with the fixed straight-ahead command.
-      const auto bounded = makeBoundedCommand(
-        translation_speed_, 0.0, 0.0,
-        max_vx_, max_vy_, max_yaw_rate_);
-      if (!bounded) {
-        return std::nullopt;
-      }
-      return PathCommand{bounded->vx, bounded->vy, bounded->yaw_rate, false};
-    };
+      return arcCommand(yaw_error, false);
+  };
 
   const auto & poses = path_->poses;
+  const double route_final_distance = std::hypot(
+    poses.back().pose.position.x - current_x,
+    poses.back().pose.position.y - current_y);
+  if (!finite(route_final_distance)) {
+    return std::nullopt;
+  }
+  if (route_final_distance <= goal_position_tolerance_) {
+    heading_alignment_active_ = false;
+    persistent_arc_sign_ = 0;
+    return PathCommand{0.0, 0.0, 0.0, true};
+  }
   if (path_cursor_index_ >= poses.size()) {
     path_cursor_index_ = poses.size() - 1U;
   }
@@ -482,21 +498,8 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
       const double final_dx = final_pose.position.x - current_x;
       const double final_dy = final_pose.position.y - current_y;
       const double final_distance = std::hypot(final_dx, final_dy);
-      const auto final_yaw = quaternionYaw(final_pose.orientation);
-      if (!final_yaw || !finite(final_distance)) {
+      if (!finite(final_distance)) {
         return std::nullopt;
-      }
-      const double final_yaw_error = normalizeAngle(*final_yaw - *current_yaw);
-      if (!finite(final_yaw_error)) {
-        return std::nullopt;
-      }
-      if (final_distance <= goal_position_tolerance_) {
-        if (std::abs(final_yaw_error) <= goal_yaw_tolerance_) {
-          heading_alignment_active_ = false;
-          return PathCommand{0.0, 0.0, 0.0, true};
-        }
-        heading_alignment_active_ = true;
-        return turnCommand(final_yaw_error);
       }
 
       const double desired_yaw = std::atan2(final_dy, final_dx);
@@ -512,26 +515,10 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
       return std::nullopt;
     }
 
-    const auto end_yaw = quaternionYaw(end.orientation);
-    if (!end_yaw) {
-      return std::nullopt;
-    }
-
     if (length <= kGeometryEpsilon) {
-      const double rotation_error = normalizeAngle(*end_yaw - *current_yaw);
-      if (!finite(rotation_error)) {
-        return std::nullopt;
-      }
-      const bool terminal_rotation = path_cursor_index_ + 2U >= poses.size();
-      if (terminal_rotation &&
-        std::abs(rotation_error) > explicit_rotation_tolerance_)
-      {
-        heading_alignment_active_ = true;
-        return turnCommand(rotation_error);
-      }
-      // Intermediate same-position yaw states are lattice bookkeeping. The
-      // truncated local surrogate below sees the next translating edges and
-      // produces one forward arc instead of stopping at every discrete bin.
+      // Same-position yaw states, including the final one, are lattice
+      // bookkeeping. Route completion is position-only so these states never
+      // make the robot orbit an already reached goal while chasing yaw.
       ++path_cursor_index_;
       heading_alignment_active_ = false;
       continue;
@@ -626,6 +613,7 @@ void Go2Sdk2BridgeNode::clearExecutionState()
   path_waiting_for_new_goal_ = false;
   path_refresh_pending_reanchor_ = false;
   heading_alignment_active_ = false;
+  persistent_arc_sign_ = 0;
 }
 
 void Go2Sdk2BridgeNode::disableAfterFault(const char * reason)

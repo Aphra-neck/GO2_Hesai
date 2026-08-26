@@ -128,6 +128,9 @@ body_lattice_planner:
     flat_obstacle.footprint_length: 0.60
     flat_obstacle.footprint_width: 0.30
     flat_obstacle.obstacle_clearance: 0.00
+    # If perception overlaps the measured body footprint, escape toward the
+    # nearest free start inside start_snap_radius instead of clearing the path.
+    flat_obstacle.recover_colliding_start: true
     verified_flat_start.enabled: false
     verified_flat_start.support_inner_radius: 1.0
     verified_flat_start.support_outer_radius: 2.5

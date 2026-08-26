@@ -384,6 +384,30 @@ std::optional<bool> updateHeadingAlignmentGate(
   return currently_active ? absolute_error > exit_angle : absolute_error >= enter_angle;
 }
 
+std::optional<int> selectPersistentArcSign(
+  double yaw_error,
+  double switch_angle,
+  int previous_sign)
+{
+  if (!std::isfinite(yaw_error) || !inPositiveRange(switch_angle, kPi) ||
+    (previous_sign != -1 && previous_sign != 0 && previous_sign != 1))
+  {
+    return std::nullopt;
+  }
+
+  const double normalized_error = std::remainder(yaw_error, 2.0 * kPi);
+  if (normalized_error >= switch_angle) {
+    return 1;
+  }
+  if (normalized_error <= -switch_angle) {
+    return -1;
+  }
+  if (previous_sign != 0) {
+    return previous_sign;
+  }
+  return std::signbit(normalized_error) ? -1 : 1;
+}
+
 std::optional<double> selectAlignmentYawError(
   double local_yaw_error,
   double goal_yaw_error,

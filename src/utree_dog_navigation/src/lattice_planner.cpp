@@ -225,11 +225,19 @@ PlanningResult LatticePlanner::plan(
 
   PlanningOverlay overlay;
   if (config_.planning_mode == PlanningMode::kFlatObstacle) {
-    if (!flatWorldPoseCollisionFree(start_world.x, start_world.y, start_world.yaw)) {
-      result.failure_reason = PlanningFailureReason::kExactStartCollision;
-      return result;
-    }
-    if (!nearestReachableFlatStart(
+    const bool exact_start_collision = !flatWorldPoseCollisionFree(
+      start_world.x, start_world.y, start_world.yaw);
+    if (exact_start_collision) {
+      if (!config_.flat_obstacle.recover_colliding_start ||
+        !nearestFlatValid(
+          start_world.x, start_world.y, config_.start_snap_radius,
+          start.grid.yaw, start.grid.x, start.grid.y))
+      {
+        result.failure_reason = PlanningFailureReason::kExactStartCollision;
+        return result;
+      }
+      result.colliding_start_recovered = true;
+    } else if (!nearestReachableFlatStart(
         start_world.x, start_world.y, start_world.yaw, config_.start_snap_radius,
         start.grid.yaw, start.grid.x, start.grid.y))
     {

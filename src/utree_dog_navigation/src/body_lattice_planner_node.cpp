@@ -140,6 +140,8 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
     declare_parameter("flat_obstacle.footprint_width", 0.30);
   config.flat_obstacle.obstacle_clearance =
     declare_parameter("flat_obstacle.obstacle_clearance", 0.00);
+  config.flat_obstacle.recover_colliding_start =
+    declare_parameter("flat_obstacle.recover_colliding_start", true);
   config.verified_flat_start.enabled =
     declare_parameter("verified_flat_start.enabled", false);
   config.verified_flat_start.support_inner_radius =
@@ -357,11 +359,19 @@ void BodyLatticePlannerNode::requestPlan()
   const auto inferred_count = static_cast<std::size_t>(std::count_if(
       result.states.begin(), result.states.end(),
       [](const PlannedGridState & state) {return state.inferred;}));
+  if (result.colliding_start_recovered) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Recovered a colliding exact start through the nearest free pose inside "
+      "start_snap_radius; the connector begins at current odometry");
+  }
   RCLCPP_INFO(
     get_logger(),
-    "Planned %zu body poses after %d expansions (start=%.*s inferred_prefix=%zu)",
+    "Planned %zu body poses after %d expansions "
+    "(start=%.*s inferred_prefix=%zu colliding_recovery=%s)",
     path.poses.size(), result.expansions, static_cast<int>(start_status.size()),
-    start_status.data(), inferred_count);
+    start_status.data(), inferred_count,
+    result.colliding_start_recovered ? "true" : "false");
 }
 
 void BodyLatticePlannerNode::watchdogTick()

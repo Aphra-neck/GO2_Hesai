@@ -20,15 +20,17 @@ go2_sdk2_bridge:
     truncated_path_sample_count: 8
     truncated_path_discount: 0.95
     waypoint_tolerance: 0.12
+    # Reaching this position radius completes the route immediately. Final
+    # lattice yaw is deliberately not chased with a forward arc.
     goal_position_tolerance: 0.15
-    goal_yaw_tolerance: 0.20
-    # Use an official-example-style forward arc before a new route segment.
+    # Large heading errors force their sign; inside this switch band the last
+    # +/- direction is retained so every translating Move keeps non-zero yaw.
     heading_alignment_enter_angle: 0.35
     heading_alignment_exit_angle: 0.12
-    explicit_rotation_tolerance: 0.08
+    persistent_arc_switch_angle: 0.04
     # Fixed planar speed requested for every translating Move command.
     translation_speed: 0.20
-    # Combine this fixed yaw rate with translation_speed during every turn.
+    # Combine this fixed non-zero yaw rate with every translating command.
     rotation_speed: 0.30
     max_vx: 0.6
     max_vy: 0.35

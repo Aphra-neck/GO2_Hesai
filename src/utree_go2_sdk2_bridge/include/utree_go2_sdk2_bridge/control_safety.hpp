@@ -332,6 +332,15 @@ std::optional<VelocityCommand> makeBoundedCommand(
   double max_vy,
   double max_yaw_rate);
 
+// Selects a persistent +/- steering direction for translating arc commands.
+// The previous direction is retained inside the symmetric switch band, which
+// prevents 200 Hz sign chatter while ensuring that translation never falls
+// back to a zero-yaw Move command.
+std::optional<int> selectPersistentArcSign(
+  double yaw_error,
+  double switch_angle,
+  int previous_sign);
+
 std::optional<bool> updateHeadingAlignmentGate(
   bool currently_active,
   double yaw_error,
