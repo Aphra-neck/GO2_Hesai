@@ -14,7 +14,11 @@ go2_sdk2_bridge:
     # Receipt-time input watchdogs; there is no path-geometry stop gate.
     path_timeout: 1.0
     odom_timeout: 0.5
+    # L_T-style local route approximation: uniformly sample this truncated
+    # prefix and combine all samples into one discounted heading target.
     lookahead_distance: 0.35
+    truncated_path_sample_count: 8
+    truncated_path_discount: 0.95
     waypoint_tolerance: 0.12
     goal_position_tolerance: 0.15
     goal_yaw_tolerance: 0.20

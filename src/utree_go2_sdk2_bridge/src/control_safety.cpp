@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace utree_go2_sdk2_bridge
 {
@@ -460,6 +461,146 @@ std::optional<VelocityCommand> makeHeadingAwareCommand(
     heading_alignment_active ? 0.0 : raw_vx,
     heading_alignment_active ? 0.0 : raw_vy,
     raw_yaw_rate, max_vx, max_vy, max_yaw_rate);
+}
+
+std::optional<TruncatedPathSurrogate> makeTruncatedPathSurrogate(
+  const std::vector<geometry_msgs::msg::PoseStamped> & poses,
+  std::size_t segment_index,
+  double current_x,
+  double current_y,
+  double maximum_horizon,
+  std::size_t sample_count,
+  double discount)
+{
+  constexpr double geometry_epsilon = 1.0e-9;
+  constexpr std::size_t maximum_sample_count = 64U;
+  if (poses.size() < 2U || segment_index + 1U >= poses.size() ||
+    !std::isfinite(current_x) || !std::isfinite(current_y) ||
+    !inPositiveRange(maximum_horizon, 10.0) ||
+    sample_count < 3U || sample_count > maximum_sample_count ||
+    !std::isfinite(discount) || discount <= 0.0 || discount > 1.0)
+  {
+    return std::nullopt;
+  }
+
+  for (std::size_t index = segment_index; index < poses.size(); ++index) {
+    const auto & position = poses[index].pose.position;
+    if (!std::isfinite(position.x) || !std::isfinite(position.y)) {
+      return std::nullopt;
+    }
+  }
+
+  std::size_t first_segment = segment_index;
+  double first_fraction = 0.0;
+  double first_length = 0.0;
+  bool have_first_segment = false;
+  for (; first_segment + 1U < poses.size(); ++first_segment) {
+    const auto & start = poses[first_segment].pose.position;
+    const auto & end = poses[first_segment + 1U].pose.position;
+    const double dx = end.x - start.x;
+    const double dy = end.y - start.y;
+    first_length = std::hypot(dx, dy);
+    if (!std::isfinite(first_length)) {
+      return std::nullopt;
+    }
+    if (first_length <= geometry_epsilon) {
+      continue;
+    }
+    first_fraction = std::clamp(
+      ((current_x - start.x) * dx + (current_y - start.y) * dy) /
+      (first_length * first_length),
+      0.0, 1.0);
+    have_first_segment = true;
+    break;
+  }
+  if (!have_first_segment) {
+    return std::nullopt;
+  }
+
+  double remaining_length = first_length * (1.0 - first_fraction);
+  for (std::size_t index = first_segment + 1U; index + 1U < poses.size(); ++index) {
+    const auto & start = poses[index].pose.position;
+    const auto & end = poses[index + 1U].pose.position;
+    const double length = std::hypot(end.x - start.x, end.y - start.y);
+    if (!std::isfinite(length)) {
+      return std::nullopt;
+    }
+    remaining_length += length;
+  }
+  if (!std::isfinite(remaining_length) || remaining_length <= geometry_epsilon) {
+    return std::nullopt;
+  }
+  const double sampled_horizon = std::min(maximum_horizon, remaining_length);
+
+  const auto point_at_distance = [&](double requested_distance)
+    -> std::optional<std::pair<double, double>>
+    {
+      double distance = requested_distance;
+      for (std::size_t index = first_segment; index + 1U < poses.size(); ++index) {
+        const auto & start = poses[index].pose.position;
+        const auto & end = poses[index + 1U].pose.position;
+        const double dx = end.x - start.x;
+        const double dy = end.y - start.y;
+        const double length = std::hypot(dx, dy);
+        if (!std::isfinite(length)) {
+          return std::nullopt;
+        }
+        if (length <= geometry_epsilon) {
+          continue;
+        }
+        const double start_fraction = index == first_segment ? first_fraction : 0.0;
+        const double available = length * (1.0 - start_fraction);
+        if (distance <= available + geometry_epsilon) {
+          const double fraction = std::clamp(
+            start_fraction + std::max(0.0, distance) / length, 0.0, 1.0);
+          return std::pair<double, double>{
+            start.x + fraction * dx,
+            start.y + fraction * dy};
+        }
+        distance -= available;
+      }
+      const auto & final_position = poses.back().pose.position;
+      return std::pair<double, double>{final_position.x, final_position.y};
+    };
+
+  double weighted_x = 0.0;
+  double weighted_y = 0.0;
+  double total_weight = 0.0;
+  double weight = 1.0;
+  std::size_t used_samples = 0U;
+  for (std::size_t index = 0U; index < sample_count; ++index) {
+    const double distance = sampled_horizon *
+      static_cast<double>(index + 1U) / static_cast<double>(sample_count);
+    const auto point = point_at_distance(distance);
+    if (!point) {
+      return std::nullopt;
+    }
+    weighted_x += weight * point->first;
+    weighted_y += weight * point->second;
+    total_weight += weight;
+    weight *= discount;
+    ++used_samples;
+  }
+  if (!std::isfinite(total_weight) || total_weight <= 0.0 || used_samples < 3U) {
+    return std::nullopt;
+  }
+
+  const double target_x = weighted_x / total_weight;
+  const double target_y = weighted_y / total_weight;
+  const double target_dx = target_x - current_x;
+  const double target_dy = target_y - current_y;
+  if (!std::isfinite(target_x) || !std::isfinite(target_y) ||
+    std::hypot(target_dx, target_dy) <= geometry_epsilon)
+  {
+    return std::nullopt;
+  }
+
+  const double desired_yaw = std::atan2(target_dy, target_dx);
+  if (!std::isfinite(desired_yaw)) {
+    return std::nullopt;
+  }
+  return TruncatedPathSurrogate{
+    desired_yaw, target_x, target_y, sampled_horizon, used_samples};
 }
 
 const char * pathTrackingFailureName(PathTrackingFailure failure)

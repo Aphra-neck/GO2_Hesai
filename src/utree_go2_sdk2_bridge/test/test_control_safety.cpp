@@ -46,6 +46,68 @@ TEST(ControlParameters, AcceptsShippedDefaults)
   EXPECT_TRUE(validateControlParameters(validParameters()).empty());
 }
 
+TEST(TruncatedPathSurrogate, UsesAllSamplesAcrossStraightLocalHorizon)
+{
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(0.0, 0.0), pathPose(0.2, 0.0),
+    pathPose(0.4, 0.0), pathPose(0.6, 0.0)};
+
+  const auto surrogate = makeTruncatedPathSurrogate(
+    poses, 0U, 0.0, 0.0, 0.35, 8U, 0.95);
+
+  ASSERT_TRUE(surrogate.has_value());
+  EXPECT_EQ(surrogate->sample_count, 8U);
+  EXPECT_NEAR(surrogate->sampled_horizon, 0.35, 1.0e-12);
+  EXPECT_NEAR(surrogate->desired_yaw, 0.0, 1.0e-12);
+  EXPECT_GT(surrogate->weighted_target_x, 0.0);
+  EXPECT_NEAR(surrogate->weighted_target_y, 0.0, 1.0e-12);
+}
+
+TEST(TruncatedPathSurrogate, AnticipatesCornerWithoutFittingWholeRoute)
+{
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(0.0, 0.0), pathPose(0.2, 0.0),
+    pathPose(0.2, 0.4), pathPose(-0.8, 0.4)};
+
+  const auto surrogate = makeTruncatedPathSurrogate(
+    poses, 0U, 0.0, 0.0, 0.35, 8U, 0.95);
+
+  ASSERT_TRUE(surrogate.has_value());
+  EXPECT_GT(surrogate->desired_yaw, 0.0);
+  EXPECT_LT(surrogate->desired_yaw, 1.5707963267948966);
+  // The far reversal starts outside the 0.35 m local horizon and cannot pull
+  // the command away from the current corner.
+  EXPECT_GT(surrogate->weighted_target_x, 0.0);
+}
+
+TEST(TruncatedPathSurrogate, IgnoresIntermediateSamePositionYawStates)
+{
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(0.0, 0.0, 0.0),
+    pathPose(0.0, 0.0, 1.5707963267948966),
+    pathPose(0.0, 0.4, 1.5707963267948966)};
+
+  const auto surrogate = makeTruncatedPathSurrogate(
+    poses, 0U, 0.0, 0.0, 0.35, 8U, 0.95);
+
+  ASSERT_TRUE(surrogate.has_value());
+  EXPECT_EQ(surrogate->sample_count, 8U);
+  EXPECT_NEAR(surrogate->desired_yaw, 1.5707963267948966, 1.0e-12);
+}
+
+TEST(TruncatedPathSurrogate, RejectsInvalidSamplingContract)
+{
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(0.0, 0.0), pathPose(0.4, 0.0)};
+
+  EXPECT_FALSE(makeTruncatedPathSurrogate(
+      poses, 0U, 0.0, 0.0, 0.35, 2U, 0.95).has_value());
+  EXPECT_FALSE(makeTruncatedPathSurrogate(
+      poses, 0U, 0.0, 0.0, 0.35, 8U, 0.0).has_value());
+  EXPECT_FALSE(makeTruncatedPathSurrogate(
+      poses, 0U, 0.0, 0.0, 0.0, 8U, 0.95).has_value());
+}
+
 TEST(ControlParameters, RejectsNonFiniteAndOutOfRangeValues)
 {
   auto parameters = validParameters();

@@ -130,6 +130,29 @@ struct PathTrackingTarget
   PlannedTranslationDirection translation_direction;
 };
 
+// A bounded local surrogate for the planner path. The next path prefix is
+// sampled uniformly over maximum_horizon and the discounted sample
+// displacements are combined into one desired heading. This deliberately does
+// not fit or replace the planner route; it only prevents the SDK executor from
+// chasing every short lattice edge independently.
+struct TruncatedPathSurrogate
+{
+  double desired_yaw;
+  double weighted_target_x;
+  double weighted_target_y;
+  double sampled_horizon;
+  std::size_t sample_count;
+};
+
+std::optional<TruncatedPathSurrogate> makeTruncatedPathSurrogate(
+  const std::vector<geometry_msgs::msg::PoseStamped> & poses,
+  std::size_t segment_index,
+  double current_x,
+  double current_y,
+  double maximum_horizon,
+  std::size_t sample_count,
+  double discount);
+
 enum class PathTrackingFailure
 {
   kNone,

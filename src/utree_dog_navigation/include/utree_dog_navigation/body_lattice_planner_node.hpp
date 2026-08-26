@@ -54,7 +54,7 @@ private:
   double max_map_age_{1.0};
   double max_odom_age_{0.5};
   double max_goal_age_{2.0};
-  double goal_retention_timeout_{30.0};
+  double goal_retention_timeout_{120.0};
   double timestamp_future_tolerance_{0.2};
   double input_watchdog_rate_{10.0};
   PlanningMode planning_mode_{PlanningMode::kFlatObstacle};

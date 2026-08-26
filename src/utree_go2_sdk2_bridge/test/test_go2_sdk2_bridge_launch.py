@@ -141,6 +141,10 @@ class Go2Sdk2BridgeLaunchTest(unittest.TestCase):
         self.assertIn("command_rate: 200.0", self.config)
         self.assertIn("translation_speed: 0.20", self.config)
         self.assertIn("rotation_speed: 0.30", self.config)
+        self.assertIn("lookahead_distance: 0.35", self.config)
+        self.assertIn("truncated_path_sample_count: 8", self.config)
+        self.assertIn("truncated_path_discount: 0.95", self.config)
+        self.assertIn("makeTruncatedPathSurrogate(", self.source)
         self.assertIn("std::copysign(rotation_speed_, yaw_error)", self.source)
         self.assertIn(
             "translation_speed_, 0.0, std::copysign(rotation_speed_, yaw_error)",

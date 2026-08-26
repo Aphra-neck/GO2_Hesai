@@ -103,7 +103,7 @@ class PlannerFreshnessSettings:
     future_tolerance: float = 0.2
     input_watchdog_rate: float = 10.0
     max_goal_age: float = 2.0
-    goal_retention_timeout: float = 30.0
+    goal_retention_timeout: float = 120.0
 
 
 @dataclass(frozen=True)
@@ -114,7 +114,7 @@ class InputContract:
     max_odom_age: float = 0.5
     max_goal_age: float = 2.0
     future_tolerance: float = 0.2
-    goal_retention_timeout: float = 30.0
+    goal_retention_timeout: float = 120.0
 
 
 @dataclass(frozen=True)

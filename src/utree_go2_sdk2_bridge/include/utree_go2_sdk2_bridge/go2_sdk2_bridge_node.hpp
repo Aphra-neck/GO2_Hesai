@@ -70,6 +70,8 @@ private:
   double path_timeout_{1.0};
   double odom_timeout_{0.5};
   double lookahead_distance_{0.35};
+  std::size_t truncated_path_sample_count_{8U};
+  double truncated_path_discount_{0.95};
   double waypoint_tolerance_{0.12};
   double goal_position_tolerance_{0.15};
   double goal_yaw_tolerance_{0.20};

@@ -78,7 +78,7 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
   max_map_age_ = declare_parameter("max_map_age", 1.0);
   max_odom_age_ = declare_parameter("max_odom_age", 0.5);
   max_goal_age_ = declare_parameter("max_goal_age", 2.0);
-  goal_retention_timeout_ = declare_parameter("goal_retention_timeout", 30.0);
+  goal_retention_timeout_ = declare_parameter("goal_retention_timeout", 120.0);
   timestamp_future_tolerance_ = declare_parameter("timestamp_future_tolerance", 0.2);
   input_watchdog_rate_ = declare_parameter("input_watchdog_rate", 10.0);
   const auto finite_in_range = [](double value, double minimum, double maximum) {

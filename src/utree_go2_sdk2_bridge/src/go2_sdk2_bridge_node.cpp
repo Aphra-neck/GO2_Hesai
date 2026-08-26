@@ -40,6 +40,9 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   path_timeout_ = declare_parameter("path_timeout", 1.0);
   odom_timeout_ = declare_parameter("odom_timeout", 0.5);
   lookahead_distance_ = declare_parameter("lookahead_distance", 0.35);
+  const int truncated_path_sample_count = declare_parameter(
+    "truncated_path_sample_count", 8);
+  truncated_path_discount_ = declare_parameter("truncated_path_discount", 0.95);
   waypoint_tolerance_ = declare_parameter("waypoint_tolerance", 0.12);
   goal_position_tolerance_ = declare_parameter("goal_position_tolerance", 0.15);
   goal_yaw_tolerance_ = declare_parameter("goal_yaw_tolerance", 0.20);
@@ -88,6 +91,14 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   {
     throw std::invalid_argument("path tolerances and lookahead must be finite and positive");
   }
+  if (truncated_path_sample_count < 3 || truncated_path_sample_count > 64 ||
+    !finite(truncated_path_discount_) || truncated_path_discount_ <= 0.0 ||
+    truncated_path_discount_ > 1.0)
+  {
+    throw std::invalid_argument(
+            "truncated path sampling requires 3..64 samples and discount in (0, 1]");
+  }
+  truncated_path_sample_count_ = static_cast<std::size_t>(truncated_path_sample_count);
   if (!finite(heading_alignment_enter_angle_) || heading_alignment_enter_angle_ <= 0.0 ||
     heading_alignment_enter_angle_ > kPi ||
     !finite(heading_alignment_exit_angle_) || heading_alignment_exit_angle_ < 0.0 ||
@@ -139,8 +150,10 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     get_logger(),
     "Go2 SDK2 path executor on '%s': disabled until ~/enable_motion; "
     "Move is refreshed at %.1f Hz with fixed translation speed %.2f m/s and "
-    "official-style arc turns at %.2f rad/s",
-    network_interface_.c_str(), command_rate_, translation_speed_, rotation_speed_);
+    "official-style arc turns at %.2f rad/s; local path direction uses %zu "
+    "discounted samples over %.2f m",
+    network_interface_.c_str(), command_rate_, translation_speed_, rotation_speed_,
+    truncated_path_sample_count_, lookahead_distance_);
   RCLCPP_INFO(
     get_logger(),
     "Route completion holds Move(0,0,0); only SDK failure, input timeout, /lowcmd, "
@@ -509,10 +522,16 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
       if (!finite(rotation_error)) {
         return std::nullopt;
       }
-      if (std::abs(rotation_error) > explicit_rotation_tolerance_) {
+      const bool terminal_rotation = path_cursor_index_ + 2U >= poses.size();
+      if (terminal_rotation &&
+        std::abs(rotation_error) > explicit_rotation_tolerance_)
+      {
         heading_alignment_active_ = true;
         return turnCommand(rotation_error);
       }
+      // Intermediate same-position yaw states are lattice bookkeeping. The
+      // truncated local surrogate below sees the next translating edges and
+      // produces one forward arc instead of stopping at every discrete bin.
       ++path_cursor_index_;
       heading_alignment_active_ = false;
       continue;
@@ -532,11 +551,17 @@ std::optional<Go2Sdk2BridgeNode::PathCommand> Go2Sdk2BridgeNode::makePathCommand
       continue;
     }
 
-    // Follow the route direction. The planner refreshes the path from current
-    // odometry, so a modest lateral offset is corrected by the next refresh;
-    // it is never converted into a disarm decision here.
-    const double desired_yaw = std::atan2(dy, dx);
-    return translationCommand(desired_yaw);
+    // Approximate the ideal route by a bounded L_T-style local surrogate:
+    // sample only the next lookahead prefix, discount those samples, and move
+    // toward their weighted direction. This preserves the planner path while
+    // avoiding stop-and-turn reactions to every 0.20 m lattice edge.
+    const auto surrogate = makeTruncatedPathSurrogate(
+      poses, path_cursor_index_, current_x, current_y,
+      lookahead_distance_, truncated_path_sample_count_, truncated_path_discount_);
+    if (!surrogate) {
+      return std::nullopt;
+    }
+    return translationCommand(surrogate->desired_yaw);
   }
 
   return std::nullopt;
