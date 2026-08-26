@@ -15,8 +15,11 @@ go2_sdk2_bridge:
     timestamp_future_tolerance: 0.2
     lookahead_distance: 0.6
     # Commissioning mode: do not disarm solely because the current pose is
-    # more than 0.05 m from the active path projection/final pose. Non-finite
-    # geometry, stale inputs, reverse-command, and motion-response gates remain.
+    # When true, stop if the body, a rotation waypoint, or the final pose is
+    # more than 0.05 m from the active path geometry. The deployed flat-ground
+    # run keeps this false so small planner/grid offsets do not disarm motion;
+    # non-finite geometry, stale inputs, reverse-command, and motion-response
+    # gates remain active.
     path_cross_track_safety_gate_enabled: false
     # Same-goal path refreshes preserve tracker progress. A transient forward /
     # reverse mismatch holds a zero Move for at most 0.75 s while waiting for

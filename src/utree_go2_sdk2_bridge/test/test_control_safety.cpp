@@ -643,6 +643,37 @@ TEST(PathProgress, ReanchorDoesNotSkipAnExplicitRotationWaypoint)
   EXPECT_EQ(target->heading_pose, 2U);
 }
 
+TEST(PathProgress, ReanchorReconcilesARegeneratedExactStartBeforeRotation)
+{
+  constexpr double half_pi = 1.5707963267948966;
+  const std::vector<geometry_msgs::msg::PoseStamped> initial_path{
+    pathPose(0.0, 0.0), pathPose(0.1, 0.1),
+    pathPose(0.1, 0.1, half_pi), pathPose(0.3, 0.1, half_pi)};
+  PathProgressTracker tracker;
+
+  const auto initial = tracker.update(
+    initial_path, 0.1, 0.1, 0.0, 0.3, 0.1);
+  ASSERT_TRUE(initial.has_value());
+  EXPECT_TRUE(initial->explicit_rotation_waypoint);
+  EXPECT_EQ(initial->heading_pose, 2U);
+
+  // A planner refresh puts the exact current pose back at pose zero, while
+  // retaining the old cursor would incorrectly evaluate pose one as a
+  // rotation waypoint before the connector has been traversed.
+  const std::vector<geometry_msgs::msg::PoseStamped> refreshed_path{
+    pathPose(0.0, 0.0), pathPose(0.1, 0.1),
+    pathPose(0.1, 0.1, half_pi), pathPose(0.3, 0.1, half_pi)};
+  ASSERT_TRUE(tracker.reanchor(refreshed_path, 0.0, 0.0));
+
+  PathTrackingDiagnostics diagnostics;
+  const auto target = tracker.update(
+    refreshed_path, 0.0, 0.0, 0.0, 0.3, 0.1, &diagnostics, false);
+  ASSERT_TRUE(target.has_value());
+  EXPECT_FALSE(target->explicit_rotation_waypoint);
+  EXPECT_EQ(target->progress_pose, 0U);
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kNone);
+}
+
 TEST(PathProgress, OvershotCornerRotatesThenTargetsForwardWithoutBackingUp)
 {
   constexpr double half_pi = 1.5707963267948966;
@@ -704,6 +735,22 @@ TEST(PathProgress, RejectsRotationWhenTheBodyIsNotAtTheWaypoint)
     tracker.update(poses, 0.20, 0.0, 0.0, 0.3, 0.1, &diagnostics).has_value());
   EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kRotationWaypointTooFar);
   EXPECT_NEAR(diagnostics.waypoint_distance, 0.20, 1.0e-12);
+}
+
+TEST(PathProgress, AllowsSmallRotationOffsetWhenGeometryGateIsDisabled)
+{
+  constexpr double half_pi = 1.5707963267948966;
+  const std::vector<geometry_msgs::msg::PoseStamped> poses{
+    pathPose(0.0, 0.0, 0.0), pathPose(0.0, 0.0, half_pi)};
+  PathProgressTracker tracker;
+  PathTrackingDiagnostics diagnostics;
+
+  const auto target = tracker.update(
+    poses, 0.058, 0.0, 0.0, 0.3, 0.1, &diagnostics, false);
+  ASSERT_TRUE(target.has_value());
+  EXPECT_TRUE(target->explicit_rotation_waypoint);
+  EXPECT_EQ(diagnostics.failure, PathTrackingFailure::kNone);
+  EXPECT_NEAR(diagnostics.waypoint_distance, 0.058, 1.0e-12);
 }
 
 TEST(PathProgress, RejectsUnconfirmedProgressInsteadOfJumpingForward)

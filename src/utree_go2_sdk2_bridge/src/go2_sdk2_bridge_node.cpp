@@ -67,8 +67,8 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   lookahead_distance_ = declare_parameter("lookahead_distance", 0.6);
   rcl_interfaces::msg::ParameterDescriptor path_cross_track_descriptor;
   path_cross_track_descriptor.description =
-    "Enforce the 0.05 m path cross-track/final-distance stop gate; finite-value checks remain "
-    "active when disabled";
+    "Enforce the 0.05 m path/rotation-waypoint/final-distance stop gate; finite-value checks "
+    "remain active when disabled";
   path_cross_track_descriptor.read_only = true;
   path_cross_track_safety_gate_enabled_ = declare_parameter<bool>(
     "path_cross_track_safety_gate_enabled", true, path_cross_track_descriptor);
@@ -175,8 +175,9 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
   if (!path_cross_track_safety_gate_enabled_) {
     RCLCPP_WARN(
       get_logger(),
-      "The 0.05 m path cross-track safety gate is DISABLED by configuration; "
-      "finite-value and command-direction safety checks remain active");
+      "The 0.05 m path geometry stop gate is DISABLED by configuration; "
+      "the bridge follows the planner path through small projection, endpoint, "
+      "and rotation-waypoint offsets; finite-value and command-direction checks remain active");
   }
 }
 

@@ -545,12 +545,34 @@ bool PathProgressTracker::reanchor(
     return true;
   }
 
+  const double refreshed_start_distance = std::hypot(
+    current_x - poses.front().pose.position.x,
+    current_y - poses.front().pose.position.y);
+  if (!std::isfinite(refreshed_start_distance)) {
+    return false;
+  }
+
+  // The flat-obstacle planner emits the exact current body pose followed by
+  // a regenerated grid connector on every same-goal refresh. Its pose
+  // indices therefore do not identify the same physical waypoint from one
+  // refresh to the next. If the refreshed path starts at the robot, an old
+  // cursor at (for example) the connector's rotation endpoint is not safe to
+  // reuse: it can make update() evaluate a zero-length rotation edge before
+  // the robot has reached that endpoint. Reconcile this regenerated prefix
+  // from pose zero; the signed crossing checks below still prevent skipping
+  // an unconfirmed segment or jumping to a future U-turn branch.
+  const bool refreshed_exact_start_prefix =
+    previous_pose_index > 0U &&
+    refreshed_start_distance <= kShortStartConnectorReachTolerance;
+
   // Keep the old cursor as the lower bound. Reanchoring is intentionally not
   // a nearest-segment search: a future U-turn segment can be geometrically
   // closer than the active segment and must never be selected merely for that
   // reason.
-  pose_index_ = std::min(previous_pose_index, poses.size() - 1U);
-  segment_fraction_ = std::clamp(previous_segment_fraction, 0.0, 1.0);
+  pose_index_ = refreshed_exact_start_prefix ? 0U :
+    std::min(previous_pose_index, poses.size() - 1U);
+  segment_fraction_ = refreshed_exact_start_prefix ? 0.0 :
+    std::clamp(previous_segment_fraction, 0.0, 1.0);
   double advanced_length = 0.0;
 
   // Consume only a connector that the prior cursor had already begun or that
@@ -753,7 +775,8 @@ std::optional<PathTrackingTarget> PathProgressTracker::update(
         diagnostics->waypoint_distance = waypoint_distance;
       }
       if (!std::isfinite(waypoint_distance) ||
-        waypoint_distance > kRotationWaypointTolerance)
+        (enforce_path_cross_track_safety_gate &&
+        waypoint_distance > kRotationWaypointTolerance))
       {
         return fail(
           !std::isfinite(waypoint_distance) ?
