@@ -581,6 +581,14 @@ void TerrainMapperNode::processCloud(
         update.ground_plane.rmse, update.ground_plane.slope_x,
         update.ground_plane.slope_y);
     }
+    if (update.reused_trusted_ground_plane) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Reused the validated world ground plane after the moving-frame fit was rejected: "
+        "reason=%s, support_cells=%zu, support_rmse=%.4f",
+        update.rejected_ground_fit_reason.c_str(),
+        update.ground_plane.inlier_points, update.ground_plane.rmse);
+    }
     last_processed_flat_pose_ = *flat_pose;
     have_processed_flat_pose_ = true;
     last_in_map_cell_count_ = update.filtered_voxels;
@@ -708,6 +716,8 @@ void TerrainMapperNode::invalidateFlatEpoch(const FlatBodyPose & pose)
   last_cloud_stamp_ = builtin_interfaces::msg::Time{};
   last_accepted_point_count_ = 0U;
   last_in_map_cell_count_ = 0U;
+  have_published_valid_flat_state_ = false;
+  last_published_valid_flat_stamp_ = builtin_interfaces::msg::Time{};
 
   publishUnusableFlatState(pose.stamp);
   RCLCPP_WARN(
@@ -781,16 +791,38 @@ void TerrainMapperNode::publishMap()
     }
   }
   if (flat_obstacle_mode_ && !source_is_fresh) {
-    publishUnusableFlatState(last_cloud_stamp_);
+    if (have_published_valid_flat_state_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Holding the last validated flat-obstacle publications at source stamp "
+        "%d.%09u while current cloud timing is invalid; the planner freshness "
+        "watchdog remains authoritative",
+        last_published_valid_flat_stamp_.sec,
+        last_published_valid_flat_stamp_.nanosec);
+    } else {
+      publishUnusableFlatState(last_cloud_stamp_);
+    }
     return;
   }
   if (flat_obstacle_mode_) {
     const auto snapshot = flat_obstacle_layer_->snapshot();
     if (!snapshot.usable) {
-      publishUnusableFlatState(
-        last_cloud_stamp_, snapshot.status == FlatObstacleLayerStatus::kWarmingUp);
+      if (have_published_valid_flat_state_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "Holding the last validated flat-obstacle publications at source stamp "
+          "%d.%09u while the current layer is unusable: status=%s reason=%s",
+          last_published_valid_flat_stamp_.sec,
+          last_published_valid_flat_stamp_.nanosec,
+          toString(snapshot.status), snapshot.reason.c_str());
+      } else {
+        publishUnusableFlatState(
+          last_cloud_stamp_, snapshot.status == FlatObstacleLayerStatus::kWarmingUp);
+      }
       return;
     }
+    have_published_valid_flat_state_ = true;
+    last_published_valid_flat_stamp_ = last_cloud_stamp_;
     const auto terrain = makeFlatTerrain(snapshot, last_cloud_stamp_);
     terrain_pub_->publish(terrain);
     cost_pub_->publish(makeCostmap(terrain, &snapshot.inflated_obstacles));

@@ -65,8 +65,8 @@ BodyLatticePlannerNode::BodyLatticePlannerNode(const rclcpp::NodeOptions & optio
   }
   if (planning_mode_ == PlanningMode::kFlatObstacle && !flat_ground_confirmed_) {
     throw std::invalid_argument(
-            "flat_obstacle mode requires a standing, stationary robot and "
-            "flat_ground_confirmed=true");
+            "flat_obstacle mode requires flat_ground_confirmed=true after "
+            "initial standing ground validation");
   }
   map_topic_ = declare_parameter("terrain_map_topic", "terrain_map");
   odom_topic_ = declare_parameter("odom_topic", "/lio/body_odom");

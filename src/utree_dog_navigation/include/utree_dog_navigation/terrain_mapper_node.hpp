@@ -118,6 +118,7 @@ private:
   bool have_odom_{false};
   bool have_processed_flat_pose_{false};
   bool have_cloud_interval_{false};
+  bool have_published_valid_flat_state_{false};
   bool last_published_start_feature_ready_{false};
   bool confidence_rebuild_active_{false};
   std::size_t suppressed_confidence_rebuild_maps_{0};
@@ -127,6 +128,7 @@ private:
   std::size_t last_in_map_cell_count_{0};
   std::chrono::steady_clock::time_point last_cloud_received_{};
   builtin_interfaces::msg::Time last_cloud_stamp_;
+  builtin_interfaces::msg::Time last_published_valid_flat_stamp_;
   FlatBodyPose last_processed_flat_pose_;
   std::deque<FlatBodyPose> flat_odom_history_;
   std::deque<PendingFlatCloud> pending_flat_clouds_;

@@ -297,14 +297,20 @@ FlatObstacleLayerUpdate FlatObstacleLayer::update(const FlatObstacleFrame & fram
   FlatGroundPlane plane;
   std::string fit_reason;
   if (!fitGroundPlane(frame, cos_yaw, sin_yaw, plane, fit_reason)) {
-    clearState(FlatObstacleLayerStatus::kGroundFitFailed, std::move(fit_reason));
-    latest_stamp_seconds_ = frame.stamp_seconds;
-    have_stamp_ = true;
-    result.accepted = true;
-    result.status = snapshot_.status;
-    result.reason = snapshot_.reason;
-    result.ground_plane = plane;
-    return result;
+    FlatGroundPlane trusted_plane;
+    if (!trustedGroundPlaneSupported(frame, cos_yaw, sin_yaw, trusted_plane)) {
+      clearState(FlatObstacleLayerStatus::kGroundFitFailed, std::move(fit_reason));
+      latest_stamp_seconds_ = frame.stamp_seconds;
+      have_stamp_ = true;
+      result.accepted = true;
+      result.status = snapshot_.status;
+      result.reason = snapshot_.reason;
+      result.ground_plane = plane;
+      return result;
+    }
+    result.reused_trusted_ground_plane = true;
+    result.rejected_ground_fit_reason = std::move(fit_reason);
+    plane = trusted_plane;
   }
 
   std::unordered_map<VoxelKey, TerrainPoint, VoxelKeyHash> frame_obstacles;
@@ -418,11 +424,13 @@ FlatObstacleLayerUpdate FlatObstacleLayer::update(const FlatObstacleFrame & fram
   have_stamp_ = true;
   snapshot_.stamp_seconds = frame.stamp_seconds;
   snapshot_.ground_plane = plane;
-  trusted_ground_plane_ = plane;
-  have_trusted_ground_plane_ = true;
-  trusted_body_ground_clearance_ = frame.body_position.z -
-    plane.heightAt(frame.body_position.x, frame.body_position.y);
-  have_trusted_body_ground_clearance_ = true;
+  if (!result.reused_trusted_ground_plane) {
+    trusted_ground_plane_ = plane;
+    have_trusted_ground_plane_ = true;
+    trusted_body_ground_clearance_ = frame.body_position.z -
+      plane.heightAt(frame.body_position.x, frame.body_position.y);
+    have_trusted_body_ground_clearance_ = true;
+  }
   snapshot_.raw_obstacles.assign(width_ * height_, 0U);
   snapshot_.obstacle_points.clear();
   std::size_t confirmed = 0U;
@@ -643,6 +651,87 @@ bool FlatObstacleLayer::fitGroundPlane(
     reason = "ground_anchor_error_above_limit";
     return false;
   }
+  return true;
+}
+
+bool FlatObstacleLayer::trustedGroundPlaneSupported(
+  const FlatObstacleFrame & frame, double cos_yaw, double sin_yaw,
+  FlatGroundPlane & plane) const
+{
+  if (!have_trusted_ground_plane_ || !have_trusted_body_ground_clearance_) {
+    return false;
+  }
+  const double trusted_ground_at_body = trusted_ground_plane_.heightAt(
+    frame.body_position.x, frame.body_position.y);
+  const double body_ground_clearance = frame.body_position.z - trusted_ground_at_body;
+  if (!std::isfinite(body_ground_clearance) ||
+    std::abs(body_ground_clearance - trusted_body_ground_clearance_) >
+    config_.ground_fit.max_anchor_error)
+  {
+    return false;
+  }
+
+  struct SupportCell
+  {
+    TerrainPoint point;
+    double residual;
+  };
+  std::unordered_map<std::uint64_t, SupportCell> support_cells;
+  for (const auto & point : frame.points) {
+    if (!finitePoint(point)) {
+      continue;
+    }
+    const double dx = point.x - frame.body_position.x;
+    const double dy = point.y - frame.body_position.y;
+    const double range = std::hypot(dx, dy);
+    if (range < config_.min_range || range > config_.ground_fit.max_range) {
+      continue;
+    }
+    const double body_x = cos_yaw * dx + sin_yaw * dy;
+    const double body_y = -sin_yaw * dx + cos_yaw * dy;
+    if (std::abs(body_x) < 0.5 * config_.self_length &&
+      std::abs(body_y) < 0.5 * config_.self_width)
+    {
+      continue;
+    }
+    const double residual = std::abs(
+      point.z - trusted_ground_plane_.heightAt(point.x, point.y));
+    if (residual > config_.ground_fit.inlier_distance) {
+      continue;
+    }
+    const std::uint64_t key = packedCell(
+      gridCoordinate(point.x, config_.ground_fit.cell_size),
+      gridCoordinate(point.y, config_.ground_fit.cell_size));
+    const auto found = support_cells.find(key);
+    if (found == support_cells.end() || residual < found->second.residual) {
+      support_cells[key] = {point, residual};
+    }
+  }
+  if (support_cells.size() < config_.ground_fit.min_points) {
+    return false;
+  }
+
+  std::vector<TerrainPoint> support;
+  support.reserve(support_cells.size());
+  double squared_error = 0.0;
+  for (const auto & entry : support_cells) {
+    support.push_back(entry.second.point);
+    squared_error += entry.second.residual * entry.second.residual;
+  }
+  std::vector<std::size_t> support_indices(support.size());
+  for (std::size_t index = 0U; index < support_indices.size(); ++index) {
+    support_indices[index] = index;
+  }
+  if (!hasMinimumPlanarSpan(
+      support, support_indices, config_.ground_fit.min_span))
+  {
+    return false;
+  }
+
+  plane = trusted_ground_plane_;
+  plane.candidate_points = support.size();
+  plane.inlier_points = support.size();
+  plane.rmse = std::sqrt(squared_error / static_cast<double>(support.size()));
   return true;
 }
 

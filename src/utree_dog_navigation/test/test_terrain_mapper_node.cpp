@@ -811,6 +811,21 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleModePublishesRawTerrainAndInflatedVisu
   ASSERT_EQ(confirmed_points.size(), 1U);
   EXPECT_TRUE(contains_point(confirmed_points, confirmed_obstacle));
 
+  const builtin_interfaces::msg::Time failed_stamp = harness_node_->now();
+  odom.header.stamp = failed_stamp;
+  flat_odom_pub->publish(odom);
+  flat_cloud_pub->publish(makeCloud(
+      failed_stamp, {{{1.0F, 0.0F, 0.0F}}}));
+  spinFor(100ms);
+  ASSERT_FALSE(maps.empty());
+  EXPECT_FALSE(maps.back().traversability.empty());
+  EXPECT_EQ(maps.back().header.stamp.sec, second_stamp.sec);
+  EXPECT_EQ(maps.back().header.stamp.nanosec, second_stamp.nanosec);
+  ASSERT_FALSE(raw_layers.empty());
+  EXPECT_EQ(raw_layers.back().cells.size(), 1U);
+  ASSERT_FALSE(inflated_layers.empty());
+  EXPECT_EQ(inflated_layers.back().cells.size(), 9U);
+
   executor_.remove_node(flat_mapper);
 }
 
@@ -1169,7 +1184,7 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleUnmatchedCloudTimeoutPreservesValidate
   executor_.remove_node(flat_mapper);
 }
 
-TEST_F(TerrainMapperNodeTest, FlatObstacleStaleSourcePublishesFullyFailClosedState)
+TEST_F(TerrainMapperNodeTest, FlatObstacleStaleSourceRetainsLastValidatedPublications)
 {
   const std::string namespace_name =
     "/flat_mapper_stale_layers_" + std::to_string(instance_count_);
@@ -1251,12 +1266,14 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleStaleSourcePublishesFullyFailClosedSta
   odom.pose.pose.position.z = 0.34;
   odom.pose.pose.orientation.w = 1.0;
   const std::vector<std::array<float, 3>> obstacle{{{0.80F, 0.30F, 0.12F}}};
+  builtin_interfaces::msg::Time ready_stamp;
   for (int frame = 0; frame < 2; ++frame) {
     spinFor(20ms);
-    const builtin_interfaces::msg::Time stamp = harness_node_->now();
-    odom.header.stamp = stamp;
+    ready_stamp = harness_node_->now();
+    odom.header.stamp = ready_stamp;
     flat_odom_pub->publish(odom);
-    flat_cloud_pub->publish(makeFlatSceneCloud(stamp, 0.0, 0.0, 0.0, obstacle));
+    flat_cloud_pub->publish(makeFlatSceneCloud(
+        ready_stamp, 0.0, 0.0, 0.0, obstacle));
   }
   ASSERT_TRUE(spinUntil(
       [&maps, &raw_layers, &costmaps, &filtered_points, &filtered_maps]() {
@@ -1269,19 +1286,23 @@ TEST_F(TerrainMapperNodeTest, FlatObstacleStaleSourcePublishesFullyFailClosedSta
       },
       1s));
 
-  ASSERT_TRUE(spinUntil(
-      [&maps, &raw_layers, &inflated_layers, &costmaps, &filtered_points,
-        &filtered_maps]() {
-        return !maps.empty() && maps.back().traversability.empty() &&
-               !raw_layers.empty() && raw_layers.back().cells.empty() &&
-               !inflated_layers.empty() && inflated_layers.back().cells.empty() &&
-               !costmaps.empty() && std::all_of(
-          costmaps.back().data.begin(), costmaps.back().data.end(),
-          [](std::int8_t value) {return value == -1;}) &&
-               !filtered_points.empty() && filtered_points.back().width == 0U &&
-               !filtered_maps.empty() && filtered_maps.back().width == 0U;
-      },
-      1s));
+  spinFor(450ms);
+  ASSERT_FALSE(maps.empty());
+  EXPECT_FALSE(maps.back().traversability.empty());
+  EXPECT_EQ(maps.back().header.stamp.sec, ready_stamp.sec);
+  EXPECT_EQ(maps.back().header.stamp.nanosec, ready_stamp.nanosec);
+  ASSERT_FALSE(raw_layers.empty());
+  EXPECT_EQ(raw_layers.back().cells.size(), 1U);
+  ASSERT_FALSE(inflated_layers.empty());
+  EXPECT_FALSE(inflated_layers.back().cells.empty());
+  ASSERT_FALSE(costmaps.empty());
+  EXPECT_GT(
+    std::count(costmaps.back().data.begin(), costmaps.back().data.end(), 100),
+    0);
+  ASSERT_FALSE(filtered_points.empty());
+  EXPECT_EQ(filtered_points.back().width, 1U);
+  ASSERT_FALSE(filtered_maps.empty());
+  EXPECT_EQ(filtered_maps.back().width, 1U);
 
   executor_.remove_node(flat_mapper);
 }

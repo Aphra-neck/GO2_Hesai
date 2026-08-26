@@ -175,6 +175,52 @@ TEST(FlatObstacleLayer, BodyHeightChangeKeepsPreviouslyAnchoredWorldFloor)
   EXPECT_TRUE(snapshot.obstacle_points.empty());
 }
 
+TEST(FlatObstacleLayer, ReusesSupportedWorldGroundWhenMovingFrameConsensusDrops)
+{
+  FlatObstacleLayer layer(layerConfig());
+  const auto initial_floor = groundGrid();
+  layer.update(frame(initial_floor, 1.0, false));
+  ASSERT_TRUE(layer.update(frame(initial_floor, 1.1, true)).usable);
+
+  constexpr double moved_x = 0.20;
+  auto moving_points = groundGrid(moved_x);
+  for (int x_index = -14; x_index <= 14; ++x_index) {
+    const double x = moved_x + 0.20 * static_cast<double>(x_index);
+    for (int y_index = -14; y_index <= 14; ++y_index) {
+      if (std::abs(x_index) <= 8 && std::abs(y_index) <= 8) {
+        continue;
+      }
+      const double y = 0.20 * static_cast<double>(y_index);
+      if (std::hypot(x - moved_x, y) > 2.90) {
+        continue;
+      }
+      moving_points.push_back({
+        x, y, ((x_index + y_index) & 1) == 0 ? 0.12 : -0.12});
+    }
+  }
+
+  FlatObstacleLayer untrusted(layerConfig());
+  const auto untrusted_update = untrusted.update(
+    frame(moving_points, 1.0, false, moved_x));
+  ASSERT_EQ(untrusted_update.status, FlatObstacleLayerStatus::kGroundFitFailed);
+  ASSERT_EQ(untrusted_update.reason, "ground_inlier_ratio_below_limit");
+
+  const auto moving_update = layer.update(
+    frame(moving_points, 1.2, true, moved_x));
+
+  EXPECT_TRUE(moving_update.accepted);
+  EXPECT_TRUE(moving_update.usable) << moving_update.reason;
+  EXPECT_TRUE(moving_update.reused_trusted_ground_plane);
+  EXPECT_EQ(
+    moving_update.rejected_ground_fit_reason,
+    "ground_inlier_ratio_below_limit");
+  EXPECT_GE(
+    moving_update.ground_plane.inlier_points,
+    layerConfig().ground_fit.min_points);
+  EXPECT_NEAR(moving_update.ground_plane.intercept, 0.0, 1.0e-9);
+  EXPECT_TRUE(layer.snapshot().usable);
+}
+
 TEST(FlatObstacleLayer, BodyRiseCannotAcceptUnsupportedElevatedSurface)
 {
   FlatObstacleLayer layer(layerConfig());
@@ -196,6 +242,7 @@ TEST(FlatObstacleLayer, BodyRiseCannotAcceptUnsupportedElevatedSurface)
     EXPECT_FALSE(update.usable);
     EXPECT_EQ(update.status, FlatObstacleLayerStatus::kGroundFitFailed);
     EXPECT_EQ(update.reason, "ground_anchor_error_above_limit");
+    EXPECT_FALSE(update.reused_trusted_ground_plane);
     EXPECT_FALSE(layer.snapshot().usable);
   }
 }

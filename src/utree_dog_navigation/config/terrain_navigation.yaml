@@ -46,9 +46,10 @@ terrain_mapper:
     # Keep rebuild recovery aligned with body_lattice_planner.start_snap_radius.
     # Commissioning mode uses a broad recovery window on sparse near-field maps.
     confidence_rebuild.start_radius: 0.80
-    # flat_obstacle is an explicitly confirmed, standing-robot mode. It fits
-    # local ground in each synchronized frame and projects actual filtered
-    # Super-LIO obstacle points into the 2D planner.
+    # flat_obstacle initializes a trusted world ground while the robot is
+    # standing. During motion it may reuse that plane only while the current
+    # synchronized cloud still provides the configured point/span support.
+    # Actual filtered Super-LIO obstacle points are projected into the planner.
     flat_obstacle.min_height: 0.08
     flat_obstacle.max_height: 0.80
     # Keep vertical evidence separate so different-height returns cannot confirm

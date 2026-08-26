@@ -91,8 +91,10 @@ struct FlatObstacleLayerUpdate
   bool accepted{false};
   bool usable{false};
   bool epoch_reset{false};
+  bool reused_trusted_ground_plane{false};
   FlatObstacleLayerStatus status{FlatObstacleLayerStatus::kUninitialized};
   std::string reason;
+  std::string rejected_ground_fit_reason;
   std::size_t filtered_voxels{0U};
   std::size_t newly_confirmed_voxels{0U};
   std::size_t confirmed_voxels{0U};
@@ -163,6 +165,9 @@ private:
     const FlatObstacleFrame & frame, double cos_yaw, double sin_yaw,
     FlatGroundPlane & plane,
     std::string & reason) const;
+  bool trustedGroundPlaneSupported(
+    const FlatObstacleFrame & frame, double cos_yaw, double sin_yaw,
+    FlatGroundPlane & plane) const;
   bool pointPassesCommonFilters(
     const TerrainPoint & point, const FlatObstacleFrame & frame,
     double cos_yaw, double sin_yaw) const noexcept;
