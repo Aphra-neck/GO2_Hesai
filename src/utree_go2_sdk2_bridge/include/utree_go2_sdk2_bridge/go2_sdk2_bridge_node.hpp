@@ -77,8 +77,8 @@ private:
   double heading_alignment_enter_angle_{0.35};
   double heading_alignment_exit_angle_{0.12};
   double persistent_arc_switch_angle_{0.04};
-  double translation_speed_{0.50};
-  double rotation_speed_{0.75};
+  double translation_speed_{0.40};
+  double rotation_speed_{0.60};
   double max_vx_{0.6};
   double max_vy_{0.35};
   double max_yaw_rate_{0.8};
