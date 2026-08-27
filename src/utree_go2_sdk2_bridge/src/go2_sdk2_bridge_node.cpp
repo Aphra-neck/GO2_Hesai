@@ -51,8 +51,8 @@ Go2Sdk2BridgeNode::Go2Sdk2BridgeNode() : Node("go2_sdk2_bridge")
     "heading_alignment_exit_angle", 0.12);
   persistent_arc_switch_angle_ = declare_parameter(
     "persistent_arc_switch_angle", 0.04);
-  translation_speed_ = declare_parameter("translation_speed", 0.40);
-  rotation_speed_ = declare_parameter("rotation_speed", 0.60);
+  translation_speed_ = declare_parameter("translation_speed", 0.50);
+  rotation_speed_ = declare_parameter("rotation_speed", 0.75);
   max_vx_ = declare_parameter("max_vx", 0.6);
   max_vy_ = declare_parameter("max_vy", 0.35);
   max_yaw_rate_ = declare_parameter("max_yaw_rate", 0.8);

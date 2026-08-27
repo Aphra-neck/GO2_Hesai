@@ -13,7 +13,7 @@ separate:
    local surrogate direction. Intermediate same-position lattice yaw states
    are skipped, so a corner produces one continuous forward arc.
 5. Every translation follows Unitree's combined-velocity example with
-   Move(0.40, 0, +/-0.60). A small heading-error switch band retains the last
+   Move(0.50, 0, +/-0.75). A small heading-error switch band retains the last
    turn sign, so the command approximates a straight line without returning to
    a zero-yaw translating Move, which the observed Go2 acknowledged inconsistently.
 6. Entering the final 0.15 m position radius completes the route immediately;
