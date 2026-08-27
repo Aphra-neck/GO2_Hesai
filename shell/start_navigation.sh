@@ -225,6 +225,7 @@ echo " Body yaw offset: ${BODY_YAW_OFFSET} rad"
 echo " XT-16 offset: (${LIDAR_OFFSET_X}, ${LIDAR_OFFSET_Y}, ${LIDAR_OFFSET_Z}) m"
 echo " Navigation config: ${NAVIGATION_CONFIG}"
 echo " RViz config: ${NAVIGATION_RVIZ_CONFIG}"
+echo " External diagnostic upload: not part of the runtime pipeline"
 echo " Diagnostic filtered 3D obstacle map capture: ${MAP_CAPTURE}"
 if [[ "${MAP_CAPTURE}" == "true" ]]; then
   echo " Filtered map output root: ${MAP_CAPTURE_DIR}"
@@ -238,12 +239,6 @@ echo "======================================"
 echo "Checking Super-LIO inputs..."
 wait_for_topic /lio/odom nav_msgs/msg/Odometry 10
 wait_for_topic /lio/cloud_world sensor_msgs/msg/PointCloud2 10
-
-if [[ ! -x "${WORKSPACE_DIR}/tools/go2-log" ]]; then
-  echo "Diagnostics command is missing or not executable: ${WORKSPACE_DIR}/tools/go2-log" >&2
-  exit 1
-fi
-"${WORKSPACE_DIR}/tools/go2-log" start
 
 echo "Starting ${PLANNING_MODE} mapper and body lattice planner..."
 echo "Set a goal with RViz or publish geometry_msgs/msg/PoseStamped to /goal_pose."

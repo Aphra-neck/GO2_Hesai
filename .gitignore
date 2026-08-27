@@ -9,6 +9,11 @@ log/
 logs/
 .catkin_tools/
 
+# Local Codex verification products (never archive or commit)
+build_codex/
+install_codex/
+log_codex/
+
 # ROS runtime files
 .ros/
 *.bag
@@ -31,4 +36,5 @@ Thumbs.db
 # Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
 

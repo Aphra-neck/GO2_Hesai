@@ -161,7 +161,7 @@ if (( lowcmd_publishers > 0 )); then
   exit 1
 fi
 
-executor_pattern='/utree_go2_sdk2_bridge/(go2_sdk2_bridge_node|go2_sdk2_direct_bridge_node|go2_sdk2_simple_nav_node)'
+executor_pattern='/utree_go2_sdk2_bridge/go2_sdk2_bridge_node'
 if ! bridge_processes="$(checked_pgrep "${executor_pattern}")"; then
   echo "The SDK2 bridge process query failed; refusing to start another bridge." >&2
   exit 1
@@ -178,12 +178,6 @@ if ! timeout 10 ros2 topic echo --once --qos-profile sensor_data \
   exit 1
 fi
 
-if [[ ! -x "${WORKSPACE_DIR}/tools/go2-log" ]]; then
-  echo "Diagnostics command is missing or not executable: ${WORKSPACE_DIR}/tools/go2-log" >&2
-  exit 1
-fi
-"${WORKSPACE_DIR}/tools/go2-log" start
-
 echo "======================================"
 echo " Go2 SDK2 path executor (ROS 2)"
 echo " Network interface: ${NETWORK_INTERFACE}"
@@ -191,6 +185,7 @@ echo " ROS domain: ${ROS_DOMAIN_ID} (Unitree SDK domain: 0)"
 echo " ROS RMW: ${RMW_IMPLEMENTATION}"
 echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
+echo " External diagnostic upload: not part of the runtime pipeline"
 echo " Motion: disarmed until one explicit operator authorization"
 echo " Motion input: /body_path"
 echo " Obstacle checks: upstream body_lattice_planner"

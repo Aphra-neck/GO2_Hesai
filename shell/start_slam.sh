@@ -4,11 +4,9 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 LOG_DIR="${SLAM_LOG_DIR:-${HOME}/slam_logs}"
-DIAGNOSTIC_ROOT="${GO2_LOG_ROOT:-${HOME}/go2_logs}"
 NETWORK_INTERFACE="${GO2_NETWORK_INTERFACE:-enP8p1s0}"
 IMU_RATE="${GO2_IMU_RATE:-200.0}"
 LIO_DENSE_OUTPUT="${GO2_LIO_DENSE_OUTPUT:-false}"
-AUTO_FINALIZE_DIAGNOSTICS="${GO2_LOG_AUTO_FINALIZE:-true}"
 UNITREE_SDK_LIBRARY_DIR="${UNITREE_SDK_LIBRARY_DIR:-/usr/local/lib}"
 source "${SCRIPT_DIR}/ros2_environment.sh"
 
@@ -20,16 +18,6 @@ case "${LIO_DENSE_OUTPUT}" in
     ;;
 esac
 export GO2_LIO_DENSE_OUTPUT="${LIO_DENSE_OUTPUT}"
-
-case "${AUTO_FINALIZE_DIAGNOSTICS}" in
-  true|false) ;;
-  *)
-    echo \
-      "GO2_LOG_AUTO_FINALIZE must be true or false: ${AUTO_FINALIZE_DIAGNOSTICS}" \
-      >&2
-    exit 1
-    ;;
-esac
 
 if ! command -v setsid >/dev/null 2>&1; then
   echo "The setsid command is required to manage ROS 2 child processes." >&2
@@ -175,17 +163,9 @@ assert_not_running \
   "Super-LIO" \
   "${WORKSPACE_DIR}/install/super_lio/lib/super_lio/super_lio_node"
 
-if [[ ! -x "${WORKSPACE_DIR}/tools/go2-log" ]]; then
-  echo "Diagnostics command is missing or not executable: ${WORKSPACE_DIR}/tools/go2-log" >&2
-  exit 1
-fi
-
 declare -a CHILD_SESSION_PIDS=()
 declare -a CHILD_WAITER_PIDS=()
 LAST_STARTED_PID=""
-DIAGNOSTIC_SESSION_OWNED=false
-DIAGNOSTIC_SESSION_ID=""
-DIAGNOSTIC_START_RESULT_FILE=""
 
 cleanup_children() {
   if (( ${#CHILD_SESSION_PIDS[@]} > 0 )); then
@@ -222,116 +202,16 @@ cleanup_children() {
   fi
 }
 
-finalize_owned_diagnostics() {
-  [[ "${AUTO_FINALIZE_DIAGNOSTICS}" == true ]] || return 0
-  [[ "${DIAGNOSTIC_SESSION_OWNED}" == true ]] || return 0
-
-  echo "Finalizing diagnostic session: ${DIAGNOSTIC_SESSION_ID}"
-  local blockers=''
-  if ! blockers="$(
-      checked_pgrep \
-        'hesai_ros_driver_node|go2_imu_bridge_node|super_lio_node|terrain_mapper_node|body_lattice_planner_node|body_odom_adapter_node|go2_sdk2_bridge_node|go2_sdk2_direct_bridge_node|go2_sdk2_simple_nav_node|flat_obstacle_map_recorder.py|utree_go2_rl_controller|rl_controller_node'
-    )"; then
-    echo \
-      "Automatic diagnostic finalization skipped because the robot process query failed; active session retained: ${DIAGNOSTIC_SESSION_ID}" \
-      >&2
-    return 0
-  fi
-  if [[ -n "${blockers}" ]]; then
-    echo "${blockers}" >&2
-    echo \
-      "Automatic diagnostic finalization skipped because robot processes are still running; active session retained: ${DIAGNOSTIC_SESSION_ID}" \
-      >&2
-    return 0
-  fi
-
-  local lowcmd_publishers=''
-  if ! lowcmd_publishers="$(lowcmd_publisher_count)"; then
-    echo \
-      "Automatic diagnostic finalization skipped because the /lowcmd publisher check failed; active session retained: ${DIAGNOSTIC_SESSION_ID}" \
-      >&2
-    return 0
-  fi
-  if (( lowcmd_publishers > 0 )); then
-    echo "Publisher count: ${lowcmd_publishers}" >&2
-    echo \
-      "Automatic diagnostic finalization skipped because an active /lowcmd publisher was detected; active session retained: ${DIAGNOSTIC_SESSION_ID}" \
-      >&2
-    return 0
-  fi
-
-  if ! "${WORKSPACE_DIR}/tools/go2-log" stop "${DIAGNOSTIC_SESSION_ID}"; then
-    echo \
-      "Diagnostic stop failed; session retained for an explicit retry: ${DIAGNOSTIC_SESSION_ID}" \
-      >&2
-    return 0
-  fi
-
-  if ! "${WORKSPACE_DIR}/tools/go2-log" repair "${DIAGNOSTIC_SESSION_ID}"; then
-    echo \
-      "Diagnostic repair/validation failed; session retained: ${DIAGNOSTIC_SESSION_ID}" \
-      >&2
-    return 0
-  fi
-  if ! "${WORKSPACE_DIR}/tools/go2-log" upload "${DIAGNOSTIC_SESSION_ID}"; then
-    echo \
-      "Diagnostic upload failed; session retained: ${DIAGNOSTIC_SESSION_ID}" \
-      >&2
-    return 0
-  fi
-}
-
 cleanup() {
   local original_status="${1:-0}"
   trap - EXIT INT TERM
   set +e
-  [[ -z "${DIAGNOSTIC_START_RESULT_FILE}" ]] ||
-    rm -f -- "${DIAGNOSTIC_START_RESULT_FILE}"
   cleanup_children
-  finalize_owned_diagnostics
   exit "${original_status}"
 }
 trap 'cleanup "$?"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-
-DIAGNOSTIC_START_RESULT_FILE="$(
-  mktemp -- "${LOG_DIR}/.go2-log-start-result.XXXXXX"
-)"
-if ! "${WORKSPACE_DIR}/tools/go2-log" start \
-  --result-file "${DIAGNOSTIC_START_RESULT_FILE}"; then
-  rm -f -- "${DIAGNOSTIC_START_RESULT_FILE}"
-  DIAGNOSTIC_START_RESULT_FILE=""
-  exit 1
-fi
-start_result_format=''
-start_result_ownership=''
-start_result_session_id=''
-start_result_session_dir=''
-while IFS='=' read -r key value; do
-  case "${key}" in
-    format) start_result_format="${value}" ;;
-    ownership) start_result_ownership="${value}" ;;
-    session_id) start_result_session_id="${value}" ;;
-    session_dir) start_result_session_dir="${value}" ;;
-  esac
-done < "${DIAGNOSTIC_START_RESULT_FILE}"
-rm -f -- "${DIAGNOSTIC_START_RESULT_FILE}"
-DIAGNOSTIC_START_RESULT_FILE=""
-
-if [[ "${start_result_format}" != go2-log-start-v1 ||
-      ! "${start_result_ownership}" =~ ^(created|existing)$ ||
-      -z "${start_result_session_id}" ||
-      "${start_result_session_id}" == */* ||
-      "${start_result_session_dir}" != \
-        "${DIAGNOSTIC_ROOT}/sessions/${start_result_session_id}" ]]; then
-  echo "go2-log returned an invalid machine-readable start result." >&2
-  exit 1
-fi
-if [[ "${start_result_ownership}" == created ]]; then
-  DIAGNOSTIC_SESSION_OWNED=true
-  DIAGNOSTIC_SESSION_ID="${start_result_session_id}"
-fi
 
 start_background() {
   local name="$1"
@@ -411,7 +291,7 @@ echo " Fast DDS profile: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
 echo " ROS localhost only: ${ROS_LOCALHOST_ONLY}"
 echo " Unitree DDS libraries: ${UNITREE_SDK_LIBRARY_DIR}"
 echo " LIO dense cloud output: ${LIO_DENSE_OUTPUT}"
-echo " Diagnostic auto-finalize on exit: ${AUTO_FINALIZE_DIAGNOSTICS}"
+echo " External diagnostic upload: not part of the runtime pipeline"
 echo "======================================"
 
 echo "[1/3] Starting Hesai LiDAR driver..."
@@ -432,7 +312,6 @@ echo "/imu/data is active."
 
 echo "[3/3] Starting Super-LIO..."
 echo "Logs: ${LOG_DIR}"
-echo "Diagnostics: ${DIAGNOSTIC_ROOT}/sessions"
 echo "Check pose: ros2 topic echo /lio/odom"
 
 ros2 launch super_lio hesai.py \

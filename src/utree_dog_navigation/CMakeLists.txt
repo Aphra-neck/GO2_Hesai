@@ -115,7 +115,19 @@ install(CODE [[
 ]])
 
 install(DIRECTORY config launch rviz
-  DESTINATION share/${PROJECT_NAME})
+  DESTINATION share/${PROJECT_NAME}
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN "*.py[co]" EXCLUDE)
+
+# Python launch caches are generated locally and must not survive incremental
+# installs or become part of a deployable workspace.
+install(CODE [[
+  set(_navigation_launch_pycache
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/utree_dog_navigation/launch/__pycache__")
+  if(IS_DIRECTORY "${_navigation_launch_pycache}")
+    file(REMOVE_RECURSE "${_navigation_launch_pycache}")
+  endif()
+]])
 
 install(PROGRAMS
   scripts/flat_obstacle_map_recorder.py

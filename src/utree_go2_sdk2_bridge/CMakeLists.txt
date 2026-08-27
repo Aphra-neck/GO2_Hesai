@@ -23,7 +23,6 @@ find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(unitree_sdk2 REQUIRED)
-find_package(Threads REQUIRED)
 
 # Some SDK2 releases omit the CycloneDDS C++ include directory from the
 # exported target even though the SportClient headers include generated DDS
@@ -40,17 +39,6 @@ add_library(control_safety STATIC src/control_safety.cpp)
 target_include_directories(control_safety PUBLIC include)
 ament_target_dependencies(control_safety geometry_msgs)
 
-add_library(sdk_command_worker STATIC src/sdk_command_worker.cpp)
-target_include_directories(sdk_command_worker PUBLIC include)
-target_link_libraries(sdk_command_worker Threads::Threads)
-
-add_library(simple_navigation_geometry STATIC src/simple_navigation_geometry.cpp)
-target_include_directories(simple_navigation_geometry PUBLIC include)
-
-add_library(simple_navigation_controller STATIC src/simple_navigation_controller.cpp)
-target_include_directories(simple_navigation_controller PUBLIC include)
-target_link_libraries(simple_navigation_controller simple_navigation_geometry)
-
 add_executable(go2_sdk2_bridge_node
   src/go2_sdk2_bridge_node.cpp
   src/go2_sdk2_bridge_main.cpp)
@@ -60,27 +48,11 @@ target_link_libraries(go2_sdk2_bridge_node control_safety unitree_sdk2)
 ament_target_dependencies(go2_sdk2_bridge_node
   geometry_msgs nav_msgs rclcpp rcl_interfaces std_srvs tf2 tf2_geometry_msgs)
 
-add_executable(go2_sdk2_direct_bridge_node
-  src/simple_goal_executor_node.cpp
-  src/simple_goal_executor_main.cpp)
-target_include_directories(go2_sdk2_direct_bridge_node PRIVATE include)
-target_include_directories(go2_sdk2_direct_bridge_node PRIVATE ${UNITREE_DDSCXX_INCLUDE_DIR})
-target_link_libraries(go2_sdk2_direct_bridge_node simple_navigation_controller unitree_sdk2)
-ament_target_dependencies(go2_sdk2_direct_bridge_node
-  geometry_msgs nav_msgs rclcpp std_srvs)
-
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
-  ament_add_gtest(test_simple_navigation_geometry test/test_simple_navigation_geometry.cpp)
-  target_link_libraries(test_simple_navigation_geometry simple_navigation_geometry)
-  ament_add_gtest(test_simple_navigation_controller test/test_simple_navigation_controller.cpp)
-  target_link_libraries(test_simple_navigation_controller simple_navigation_controller)
   ament_add_gtest(test_control_safety test/test_control_safety.cpp)
   target_link_libraries(test_control_safety control_safety)
-  ament_add_gtest(test_sdk_command_worker test/test_sdk_command_worker.cpp)
-  target_include_directories(test_sdk_command_worker PRIVATE include)
-  target_link_libraries(test_sdk_command_worker sdk_command_worker)
   ament_add_pytest_test(
     test_go2_sdk2_bridge_launch
     test/test_go2_sdk2_bridge_launch.py)
@@ -91,11 +63,31 @@ endif()
 
 install(TARGETS go2_sdk2_bridge_node
   DESTINATION lib/${PROJECT_NAME})
-install(TARGETS go2_sdk2_direct_bridge_node
-  DESTINATION lib/${PROJECT_NAME})
-install(TARGETS simple_navigation_geometry simple_navigation_controller
-  ARCHIVE DESTINATION lib)
 install(DIRECTORY config launch
-  DESTINATION share/${PROJECT_NAME})
+  DESTINATION share/${PROJECT_NAME}
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN "*.py[co]" EXCLUDE)
+
+# Exact cleanup for artifacts installed by the retired obstacle-unaware direct
+# bridge. Incremental colcon installs do not remove files whose source target
+# disappeared, so remove only the known package-local leftovers.
+install(CODE [[
+  set(_retired_sdk2_bridge_artifacts
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/utree_go2_sdk2_bridge/go2_sdk2_direct_bridge_node"
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libsimple_navigation_geometry.a"
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/libsimple_navigation_controller.a"
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/utree_go2_sdk2_bridge/config/go2_sdk2_direct_bridge.yaml"
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/utree_go2_sdk2_bridge/launch/go2_sdk2_direct_bridge.launch.py")
+  foreach(_artifact IN LISTS _retired_sdk2_bridge_artifacts)
+    if(EXISTS "${_artifact}" OR IS_SYMLINK "${_artifact}")
+      file(REMOVE "${_artifact}")
+    endif()
+  endforeach()
+  set(_retired_sdk2_bridge_pycache
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/utree_go2_sdk2_bridge/launch/__pycache__")
+  if(IS_DIRECTORY "${_retired_sdk2_bridge_pycache}")
+    file(REMOVE_RECURSE "${_retired_sdk2_bridge_pycache}")
+  endif()
+]])
 
 ament_package()

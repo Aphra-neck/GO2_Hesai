@@ -16,7 +16,6 @@ trace_file="${FIXTURE_ROOT}/ros2-calls.txt"
 mkdir -p -- \
   "${fake_bin}" \
   "${workspace}/shell" \
-  "${workspace}/tools" \
   "${workspace}/src/utree_dog_navigation/config" \
   "${workspace}/src/utree_dog_navigation/rviz/renamed"
 
@@ -63,17 +62,10 @@ cat > "${fake_bin}/pgrep" <<'SH'
 exit 1
 SH
 
-cat > "${workspace}/tools/go2-log" <<'SH'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-[[ "$*" == start ]]
-SH
-
 chmod +x \
   "${fake_bin}/ros2" \
   "${fake_bin}/timeout" \
-  "${fake_bin}/pgrep" \
-  "${workspace}/tools/go2-log"
+  "${fake_bin}/pgrep"
 
 cat > "${workspace}/src/utree_dog_navigation/config/terrain_navigation.yaml" <<'YAML'
 body_lattice_planner:
@@ -125,6 +117,8 @@ grep -Fq ' Verified flat start: false' <<< "${default_flat_output}"
 grep -Fq ' Planning mode: flat_obstacle' <<< "${default_flat_output}"
 grep -Fq ' Flat ground confirmed: true' <<< "${default_flat_output}"
 grep -Fq ' Legacy terrain enabled: false' <<< "${default_flat_output}"
+grep -Fq ' External diagnostic upload: not part of the runtime pipeline' \
+  <<< "${default_flat_output}"
 grep -Fq 'verified_flat_start:=false' "${trace_file}"
 grep -Fq 'planning_mode:=flat_obstacle' "${trace_file}"
 grep -Fq 'enable_legacy_terrain:=false' "${trace_file}"
@@ -384,4 +378,4 @@ for invalid in TRUE False 1 yes; do
   test ! -s "${trace_file}"
 done
 
-echo "PASS: navigation startup locks flat-obstacle defaults and RViz pairing"
+echo "PASS: navigation is independent of external diagnostics and locks flat-obstacle defaults and RViz pairing"

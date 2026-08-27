@@ -18,7 +18,6 @@ mkdir -p -- \
   "${fake_bin}" \
   "${unitree_lib}" \
   "${workspace}/shell" \
-  "${workspace}/tools" \
   "${workspace}/src/utree_go2_sdk2_bridge/config"
 
 cp -- "${REPO_ROOT}/shell/start_sdk2_bridge.sh" \
@@ -81,26 +80,14 @@ SH
 
 cat > "${fake_bin}/pgrep" <<'SH'
 #!/usr/bin/env bash
-if [[ "${FAKE_DIRECT_BRIDGE_RUNNING:-false}" == true &&
-      "$*" == *"go2_sdk2_direct_bridge_node"* ]]; then
-  echo '4243 /opt/go2/go2_sdk2_direct_bridge_node'
-  exit 0
-fi
 exit 1
-SH
-
-cat > "${workspace}/tools/go2-log" <<'SH'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-[[ "$*" == start ]]
 SH
 
 chmod +x \
   "${fake_bin}/ros2" \
   "${fake_bin}/timeout" \
   "${fake_bin}/ip" \
-  "${fake_bin}/pgrep" \
-  "${workspace}/tools/go2-log"
+  "${fake_bin}/pgrep"
 touch "${unitree_lib}/libddsc.so.0" "${unitree_lib}/libddscxx.so.0"
 
 common_environment=(
@@ -122,6 +109,8 @@ grep -Fq ' yaw=0.8 rad/s [YAML:' <<< "${default_output}"
 grep -Fq ' Control: direct SportClient::Move refresh at 200.0 Hz' <<< "${default_output}"
 grep -Fq ' Fixed translation speed: 0.40 m/s [YAML:' <<< "${default_output}"
 grep -Fq ' Arc turn: Move(0.40,0,+/-0.60) [YAML:' <<< "${default_output}"
+grep -Fq ' External diagnostic upload: not part of the runtime pipeline' \
+  <<< "${default_output}"
 [[ "${default_output}" != *'Motion-response watchdog'* ]]
 grep -Fq 'config:='"${workspace}"'/src/utree_go2_sdk2_bridge/config/go2_sdk2_bridge.yaml' \
   "${trace_file}"
@@ -142,14 +131,4 @@ grep -Fq 'max_vy:=0.7' "${trace_file}"
 test "$(grep -c 'max_vx:=' "${trace_file}" || true)" -eq 0
 test "$(grep -c 'max_yaw_rate:=' "${trace_file}" || true)" -eq 0
 
-set +e
-direct_bridge_output="$(
-  env "${common_environment[@]}" FAKE_DIRECT_BRIDGE_RUNNING=true \
-    "${workspace}/shell/start_sdk2_bridge.sh" 2>&1
-)"
-direct_bridge_status=$?
-set -e
-test "${direct_bridge_status}" -ne 0
-[[ "${direct_bridge_output}" == *"An SDK2 motion bridge is already running"* ]]
-
-echo "PASS: SDK2 startup uses YAML defaults and forwards only explicit velocity overrides"
+echo "PASS: SDK2 startup is independent of external diagnostics, uses YAML defaults, and forwards only explicit velocity overrides"
