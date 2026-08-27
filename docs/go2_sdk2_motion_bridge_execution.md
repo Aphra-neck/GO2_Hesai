@@ -13,9 +13,9 @@ separate:
    local surrogate direction. Intermediate same-position lattice yaw states
    are skipped, so a corner produces one continuous forward arc.
 5. Every translation follows Unitree's combined-velocity example with
-   Move(0.20, 0, +/-0.30). A small heading-error switch band retains the last
+   Move(0.30, 0, +/-0.45). A small heading-error switch band retains the last
    turn sign, so the command approximates a straight line without returning to
-   Move(0.20, 0, 0), which the observed Go2 acknowledged inconsistently.
+   a zero-yaw translating Move, which the observed Go2 acknowledged inconsistently.
 6. Entering the final 0.15 m position radius completes the route immediately;
    final lattice yaw is not chased with a forward arc. The bridge then sends
    Move(0, 0, 0) while remaining armed until a new /goal_pose generation.
