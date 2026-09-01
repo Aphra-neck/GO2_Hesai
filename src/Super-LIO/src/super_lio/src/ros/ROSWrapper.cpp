@@ -1,142 +1,238 @@
 
 #include "ros/ROSWrapper.h"
-#include "super_lio/CloudPose.h"
-#include "super_lio/CloudPose2.h"
+#include "geometry_msgs/msg/pose_with_covariance_stamped.hpp"
 
-#include <geometry_msgs/PoseWithCovarianceStamped.h>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <stdexcept>
+
 
 using namespace BASIC;
 
 namespace LI2Sup{
 
-void LoadParamFromRos(ros::NodeHandle& nh){
-  nh.getParam("/lio/map/save_map", g_save_map);
-  LOG(INFO) << GREEN << " ---> [Param] map/save_map: " << (g_save_map ? "true" : "false") << RESET;
-  nh.getParam("/lio/map/if_filter", g_if_filter);
-  nh.getParam("/lio/map/save_map_dir", g_save_map_dir);
+namespace {
+
+std::int64_t steadyNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::int64_t systemNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+double elapsedMs(std::int64_t start_ns, std::int64_t end_ns)
+{
+  if (start_ns <= 0 || end_ns < start_ns) {
+    return -1.0;
+  }
+  return static_cast<double>(end_ns - start_ns) * 1e-6;
+}
+
+void keepMaximum(double& current, double candidate)
+{
+  if (std::isfinite(candidate) && candidate >= 0.0 && candidate > current) {
+    current = candidate;
+  }
+}
+
+}  // namespace
+
+void LoadParamFromRos(rclcpp::Node& node)
+{
+  node.declare_parameter<bool>("lio.map.save_map", false);
+  node.get_parameter("lio.map.save_map", g_save_map);
+
+  LOG(INFO) << GREEN << " ---> [Param] map/save_map: "
+            << (g_save_map ? "true" : "false") << RESET;
+
+  node.declare_parameter<bool>("lio.eva.timer", false);
+  node.get_parameter("lio.eva.timer", g_time_eva);
+
+  node.declare_parameter<bool>("lio.map.if_filter", false);
+  node.get_parameter("lio.map.if_filter", g_if_filter);
+
+  node.declare_parameter<std::string>("lio.map.save_map_dir", "");
+  node.get_parameter("lio.map.save_map_dir", g_save_map_dir);
   g_save_map_dir = g_root_dir + g_save_map_dir;
-  nh.getParam("/lio/map/map_name", g_map_name);
-  nh.getParam("/lio/map/ds_size", g_map_ds_size);
-  nh.getParam("/lio/map/save_interval", g_pcd_save_interval);
 
-  nh.getParam("/lio/eva/timer", g_time_eva);
-  
-  // ROS Topic input
-  nh.getParam("/lio/ros/lidar_topic",  g_lidar_topic);
-  nh.getParam("/lio/ros/imu_topic",    g_imu_topic);
+  node.declare_parameter<std::string>("lio.map.map_name", "default");
+  node.get_parameter("lio.map.map_name", g_map_name);
 
-  // sensor cfg
-  nh.getParam("/lio/sensor/lidar_type", g_lidar_type);
+  node.declare_parameter<double>("lio.map.ds_size", 0.5);
+  node.get_parameter("lio.map.ds_size", g_map_ds_size);
+
+  node.declare_parameter<int>("lio.map.save_interval", 1);
+  node.get_parameter("lio.map.save_interval", g_pcd_save_interval);
+
+  node.declare_parameter<std::string>("lio.ros.lidar_topic", "/lidar");
+  node.get_parameter("lio.ros.lidar_topic", g_lidar_topic);
+
+  node.declare_parameter<std::string>("lio.ros.imu_topic", "/imu");
+  node.get_parameter("lio.ros.imu_topic", g_imu_topic);
+
+  node.declare_parameter<int>("lio.sensor.lidar_type", 0);
+  node.get_parameter("lio.sensor.lidar_type", g_lidar_type);
+
   double temp_range_dis;
-  nh.getParam("/lio/sensor/blind", temp_range_dis);
+  node.declare_parameter<double>("lio.sensor.blind", 0.0);
+  node.get_parameter("lio.sensor.blind", temp_range_dis);
   g_blind2 = temp_range_dis * temp_range_dis;
-  nh.getParam("/lio/sensor/maxrange", temp_range_dis);
+
+  node.declare_parameter<double>("lio.sensor.maxrange", 100.0);
+  node.get_parameter("lio.sensor.maxrange", temp_range_dis);
   g_maxrange2 = temp_range_dis * temp_range_dis;
-  nh.getParam("/lio/sensor/filter_rate", g_filter_rate);
-  nh.getParam("/lio/sensor/enable_downsample", g_enable_downsample);
-  nh.getParam("/lio/sensor/voxel_fliter_size", g_voxel_fliter_size);
 
-  nh.getParam("/lio/sensor/gravity_norm", g_gravity_norm);
-  nh.getParam("/lio/sensor/imu_type", g_imu_type);
-  nh.getParam("/lio/sensor/imu_na",   g_imu_na);
-  nh.getParam("/lio/sensor/imu_ng",   g_imu_ng);
-  nh.getParam("/lio/sensor/imu_nba",  g_imu_nba);
-  nh.getParam("/lio/sensor/imu_nbg",  g_imu_nbg);
+  node.declare_parameter<int>("lio.sensor.filter_rate", 1);
+  node.get_parameter("lio.sensor.filter_rate", g_filter_rate);
 
-  // extrinsic
-  std::vector<scalar> extrinsic_lidar_imu, extrinsic_odom_robo;
-  nh.getParam("/lio/extrinsic/lidar_imu", extrinsic_lidar_imu);      // 3 + 9
-  V3 __t = V3(extrinsic_lidar_imu[0], 
-              extrinsic_lidar_imu[1], 
-              extrinsic_lidar_imu[2]);
-  M3 __R = M3(extrinsic_lidar_imu.data() + 3);
-  g_lidar_imu = SE3(__R, __t);  // lidar in imu frame·
-  nh.getParam("/lio/extrinsic/odom_robo", extrinsic_odom_robo);     // 3 + 3 x,y,z,r,p,y
-  __t = V3(extrinsic_odom_robo[0], 
-           extrinsic_odom_robo[1], 
+  node.declare_parameter<bool>("lio.sensor.enable_downsample", false);
+  node.get_parameter("lio.sensor.enable_downsample", g_enable_downsample);
+
+  node.declare_parameter<double>("lio.sensor.voxel_fliter_size", 0.2);
+  node.get_parameter("lio.sensor.voxel_fliter_size", g_voxel_fliter_size);
+
+  node.declare_parameter<double>("lio.sensor.gravity_norm", 9.81);
+  node.get_parameter("lio.sensor.gravity_norm", g_gravity_norm);
+
+  node.declare_parameter<int>("lio.sensor.imu_type", 0);
+  node.get_parameter("lio.sensor.imu_type", g_imu_type);
+
+  node.declare_parameter<double>("lio.sensor.imu_na", 0.0);
+  node.get_parameter("lio.sensor.imu_na", g_imu_na);
+
+  node.declare_parameter<double>("lio.sensor.imu_ng", 0.0);
+  node.get_parameter("lio.sensor.imu_ng", g_imu_ng);
+
+  node.declare_parameter<double>("lio.sensor.imu_nba", 0.0);
+  node.get_parameter("lio.sensor.imu_nba", g_imu_nba);
+
+  node.declare_parameter<double>("lio.sensor.imu_nbg", 0.0);
+  node.get_parameter("lio.sensor.imu_nbg", g_imu_nbg);
+
+  // ================= extrinsic =================
+  std::vector<double> extrinsic_lidar_imu;
+  node.declare_parameter<std::vector<double>>(
+      "lio.extrinsic.lidar_imu", std::vector<double>(12, 0.0));
+  node.get_parameter("lio.extrinsic.lidar_imu", extrinsic_lidar_imu);
+
+  V3 __t(extrinsic_lidar_imu[0],
+         extrinsic_lidar_imu[1],
+         extrinsic_lidar_imu[2]);
+  std::vector<scalar> r_data(9);
+  for (int i = 0; i < 9; ++i) {
+    r_data[i] = static_cast<scalar>(extrinsic_lidar_imu[3 + i]);
+  }
+  M3 __R(r_data.data());
+  g_lidar_imu = SE3(__R, __t);
+
+  std::vector<double> extrinsic_odom_robo;
+  node.declare_parameter<std::vector<double>>(
+      "lio.extrinsic.odom_robo", std::vector<double>(6, 0.0));
+  node.get_parameter("lio.extrinsic.odom_robo", extrinsic_odom_robo);
+
+  __t = V3(extrinsic_odom_robo[0],
+           extrinsic_odom_robo[1],
            extrinsic_odom_robo[2]);
-  auto temp_R = Eigen::AngleAxisd(extrinsic_odom_robo[5]/180 * M_PI, Eigen::Vector3d::UnitZ()) *
-                Eigen::AngleAxisd(extrinsic_odom_robo[4]/180 * M_PI, Eigen::Vector3d::UnitY()) *
-                Eigen::AngleAxisd(extrinsic_odom_robo[3]/180 * M_PI, Eigen::Vector3d::UnitX());
+
+  auto temp_R =
+      Eigen::AngleAxisd(extrinsic_odom_robo[5] * M_PI / 180.0,
+                          Eigen::Vector3d::UnitZ()) *
+      Eigen::AngleAxisd(extrinsic_odom_robo[4] * M_PI / 180.0,
+                          Eigen::Vector3d::UnitY()) *
+      Eigen::AngleAxisd(extrinsic_odom_robo[3] * M_PI / 180.0,
+                          Eigen::Vector3d::UnitX());
+
   g_odom_robo.R_ = temp_R.cast<scalar>();
+  g_odom_robo.R_ = g_odom_robo.R_.transpose().eval();
+  g_odom_robo = SE3(g_odom_robo.R_, __t);
 
-  /// ATTENTION:
-  /// The transpose is intentionally applied here and represents the inverse of R.
-  /// Misinterpreting this will lead to incorrect transformations.
-  M3 _R = g_odom_robo.R_.transpose();
-  g_odom_robo.R_  = _R;
-  g_odom_robo = SE3(_R, __t);  // lidar in robot frame
-
-  auto temp_R_yaw = Eigen::AngleAxisd(extrinsic_odom_robo[5]/180 * M_PI, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  auto temp_R_yaw =
+      Eigen::AngleAxisd(extrinsic_odom_robo[5] * M_PI / 180.0,
+                        Eigen::Vector3d::UnitZ())
+          .toRotationMatrix();
   g_lidar_robo_yaw = temp_R_yaw.cast<scalar>();
 
-  // hash_map
-  int hash_capacity;
-  nh.getParam("/lio/hash_map/hash_capacity", hash_capacity);
-  g_ivox_capacity = hash_capacity;
-  nh.getParam("/lio/hash_map/vox_resolution", g_ivox_resolution);
-  
+  // ================= hash map =================
+  node.declare_parameter<int>("lio.hash_map.hash_capacity", 1000000);
+  node.get_parameter("lio.hash_map.hash_capacity", g_ivox_capacity);
+
+  node.declare_parameter<double>("lio.hash_map.vox_resolution", 0.5);
+  node.get_parameter("lio.hash_map.vox_resolution", g_ivox_resolution);
+
   // kf
-  nh.getParam("/lio/kf/kf_type", g_kf_type);
-  nh.getParam("/lio/kf/kf_max_iterations", g_kf_max_iterations);
-  nh.getParam("/lio/kf/kf_align_gravity", g_kf_align_gravity);
-  nh.getParam("/lio/kf/kf_quit_eps", g_kf_quit_eps);
+  node.declare_parameter<int>("lio.kf.kf_type", 0);
+  node.get_parameter("lio.kf.kf_type", g_kf_type);
+
+  node.declare_parameter<int>("lio.kf.kf_max_iterations", 0);
+  node.get_parameter("lio.kf.kf_max_iterations", g_kf_max_iterations);
+
+  node.declare_parameter<bool>("lio.kf.kf_align_gravity", false);
+  node.get_parameter("lio.kf.kf_align_gravity", g_kf_align_gravity);
+
+  node.declare_parameter<double>("lio.kf.kf_quit_eps", 0.0);
+  node.get_parameter("lio.kf.kf_quit_eps", g_kf_quit_eps);
 
   // submaps
-  nh.getParam("/lio/submap/submap_resolution", g_submap_resolution);
-  nh.getParam("/lio/submap/submap_capacity", g_submap_capacity);
+  node.declare_parameter<double>("lio.submap.submap_resolution", 0.0);
+  node.get_parameter("lio.submap.submap_resolution", g_submap_resolution);
+
+  node.declare_parameter<int>("lio.submap.submap_capacity", 0);
+  node.get_parameter("lio.submap.submap_capacity", g_submap_capacity);
 
   // visual
-  nh.getParam("/lio/output/robot",  g_2_robot);
-  nh.getParam("/lio/output/planner", g_planner_enable);
-  nh.getParam("/lio/output/plan_env_world",  g_2_plan_env_world);
-  nh.getParam("/lio/output/plan_env_body",  g_2_plan_env_body);
-  nh.getParam("/lio/output/ml_map",         g_2_ml_map);
-  nh.getParam("/lio/output/map",    g_visual_map);
-  nh.getParam("/lio/output/dense",  g_visual_dense);
-  nh.getParam("/lio/output/pub_step", g_pub_step);
+  node.declare_parameter<bool>("lio.output.robot", false);
+  node.get_parameter("lio.output.robot", g_2_robot);
 
-  g_update_map = false;
-  nh.getParam("/lio/relocation/update_map", g_update_map);
-  std::vector<float> init_pose;
-  nh.getParam("/lio/relocation/init_pose", init_pose);
-  if(init_pose.size() == 6){
-    g_init_px    = init_pose[0];
-    g_init_py    = init_pose[1];
-    g_init_pz    = init_pose[2];
-    g_init_roll  = init_pose[3];
-    g_init_pitch = init_pose[4];
-    g_init_yaw   = init_pose[5];
-  }else{
-    g_init_px = 0.0f;
-    g_init_py = 0.0f;
-    g_init_pz = 0.0f;
-    g_init_roll = 0.0f;
-    g_init_pitch = 0.0f;
-    g_init_yaw = 0.0f;
-  }
-  
-}
+  node.declare_parameter<bool>("lio.output.planner", false);
+  node.get_parameter("lio.output.planner", g_planner_enable);
 
-std::tuple<float, float, float> getColorFromVelocity(float velocity, float max_velocity = 2.0f) {
-  float ratio = std::clamp(velocity / max_velocity, 0.0f, 1.0f);
-  float r, g, b;
-  if (ratio < 0.5f) {
-    float t = ratio / 0.5f;
-    r = 0.0f;
-    g = t;
-    b = 1.0f;
-  } else {
-    float t = (ratio - 0.5f) / 0.5f;
-    r = t;
-    g = 1.0f - t;
-    b = 1.0f - t;
-  }
-  return {r, g, b};
+  node.declare_parameter<bool>("lio.output.plan_env_world", false);
+  node.get_parameter("lio.output.plan_env_world", g_2_plan_env_world);
+
+  node.declare_parameter<bool>("lio.output.plan_env_body", false);
+  node.get_parameter("lio.output.plan_env_body", g_2_plan_env_body);
+
+  node.declare_parameter<bool>("lio.output.ml_map", false);
+  node.get_parameter("lio.output.ml_map", g_2_ml_map);
+
+  node.declare_parameter<bool>("lio.output.map", false);
+  node.get_parameter("lio.output.map", g_visual_map);
+
+  node.declare_parameter<bool>("lio.output.dense", false);
+  node.get_parameter("lio.output.dense", g_visual_dense);
+
+  node.declare_parameter<int>("lio.output.pub_step", 0);
+  node.get_parameter("lio.output.pub_step", g_pub_step);
+
+  // ================= relocation =================
+  node.declare_parameter<bool>("lio.relocation.update_map", false);
+  node.get_parameter("lio.relocation.update_map", g_update_map);
+
+  std::vector<double> init_pose;
+  node.declare_parameter<std::vector<double>>(
+      "lio.relocation.init_pose", std::vector<double>(6, 0.0));
+  node.get_parameter("lio.relocation.init_pose", init_pose);
+
+  g_init_px    = init_pose[0];
+  g_init_py    = init_pose[1];
+  g_init_pz    = init_pose[2];
+  g_init_roll  = init_pose[3];
+  g_init_pitch = init_pose[4];
+  g_init_yaw   = init_pose[5];
+
+  LOG(INFO) << GREEN << " ---> [Params]: Load from ROS2 parameter server."
+            << RESET;
 }
 
 
-void livox2pcl(const livox_ros_driver::CustomMsg::ConstPtr& msg, CloudPtr& point_cloud){
+#ifdef SUPER_LIO_HAS_LIVOX
+void livox2pcl(const livox_ros_driver2::msg::CustomMsg::SharedPtr& msg, CloudPtr& point_cloud){
   point_cloud->clear();
   CloudPtr cloud_full(new PointCloudType());
   int plsize = msg->point_num;
@@ -149,7 +245,7 @@ void livox2pcl(const livox_ros_driver::CustomMsg::ConstPtr& msg, CloudPtr& point
   std::for_each(std::execution::par_unseq, index.begin(), index.end(), [&](const uint &i) {
     if((msg->points[i].tag & 0x30) == 0x10 || (msg->points[i].tag & 0x30) == 0x00)
     {
-      // if (i % g_filter_rate == 0) 
+      // if (i % g_filter_rate == 0)
       {
         cloud_full->at(i).x = msg->points[i].x;
         cloud_full->at(i).y = msg->points[i].y;
@@ -160,7 +256,7 @@ void livox2pcl(const livox_ros_driver::CustomMsg::ConstPtr& msg, CloudPtr& point
             (abs(cloud_full->at(i).y - cloud_full->at(i - 1).y) > 1e-7) ||
             (abs(cloud_full->at(i).z - cloud_full->at(i - 1).z) > 1e-7))
         {
-          double normal_dis = cloud_full->at(i).x * cloud_full->at(i).x + 
+          double normal_dis = cloud_full->at(i).x * cloud_full->at(i).x +
                               cloud_full->at(i).y * cloud_full->at(i).y +
                               cloud_full->at(i).z * cloud_full->at(i).z;
           if(normal_dis > g_blind2 and normal_dis < g_maxrange2){
@@ -177,68 +273,12 @@ void livox2pcl(const livox_ros_driver::CustomMsg::ConstPtr& msg, CloudPtr& point
     }
   }
 }
+#endif
 
 
 std::string lidarTypeToString(int type) {
   if (type <= 0 || type >= static_cast<int>(LID_TYPE_NAMES.size())) return "UNKNOWN";
   return LID_TYPE_NAMES[type];
-}
-
-ROSWrapper::ROSWrapper(){
-  ros::SubscribeOptions ops;
-  ops.transport_hints = ros::TransportHints().tcpNoDelay();
-  
-  if(g_lidar_type == LID_TYPE::LIVOX){
-    ops.init<livox_ros_driver::CustomMsg>(
-      g_lidar_topic, 1000, 
-      boost::bind(&ROSWrapper::livoxHandler, this, _1));
-  }else{
-    ops.init<sensor_msgs::PointCloud2>(
-      g_lidar_topic, 1000,
-      boost::bind(&ROSWrapper::stdMsgHandler, this, _1));
-  }
-
-  LOG(INFO) << GREEN << " ---> Using Lidar type: " << lidarTypeToString(g_lidar_type) << RESET;
-
-  nh_.setCallbackQueue(&self_queue_);
-
-  subLidar_ = nh_.subscribe(ops);
-  subIMU_   = nh_.subscribe<sensor_msgs::Imu>(g_imu_topic, 10000,    // 100Hz x 10s
-               &ROSWrapper::imuHandler, this, ros::TransportHints().tcpNoDelay());
-
-  /// output
-  pub_odom_      = nh_.advertise<nav_msgs::Odometry>("/lio/odom", 100);  /// imu frame -> lidar freq
-  pub_path_      = nh_.advertise<nav_msgs::Path>("/lio/path", 1);
-  pub_path_robot_ = nh_.advertise<sensor_msgs::PointCloud2>("/lio/path_robot", 1);
-  
-  msg_path_point_.header.frame_id = "world";
-  msg2uav_.header.frame_id = "world";
-  path_.header.frame_id = "world";
-}
-
-
-void ROSWrapper::livoxHandler(const livox_ros_driver::CustomMsg::ConstPtr& msg){
-  if(msg->point_num < 10) return;
-  LidarData lidar_data;
-  std::size_t ptsize = msg->point_num;
-  lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
-  lidar_data.pc->reserve(ptsize / g_filter_rate + 1);
-
-  double offset_time = 0.0;
-  for(std::size_t _i = 0; _i < ptsize; _i += g_filter_rate){
-    auto& pt = msg->points[_i];
-    auto tag = pt.tag & 0x30;
-    if (tag == 0x10 || tag == 0x00){
-      auto dis = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
-      if(dis > g_blind2 && dis < g_maxrange2){
-        offset_time = pt.offset_time * 1e-9;
-        lidar_data.pc->emplace_back(pt.x, pt.y, pt.z, pt.reflectivity, offset_time);
-      }
-    }
-  }
-  lidar_data.start_time = msg->header.stamp.toSec();
-  lidar_data.end_time   = lidar_data.start_time + offset_time;
-  lidar_buffer_.push_back(lidar_data);
 }
 
 
@@ -251,98 +291,247 @@ inline bool validPoint(double x, double y, double z)
   return (d2 > g_blind2 && d2 < g_maxrange2);
 }
 
-void ROSWrapper::stdMsgHandler(const sensor_msgs::PointCloud2::ConstPtr& msg){
-  if(msg->data.size() < 10) return;
-  
-  LidarData lidar_data;
-  lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
 
-  double offset_time = 0.0;
-  double dis = 0.0;
-
-  switch (g_lidar_type) {
-
-  case LID_TYPE::HESAI16:
-  {
-    pcl::PointCloud<hesai_ros::Point> pl_orig;
-    pcl::fromROSMsg(*msg, pl_orig);
-    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
-    const double time_begin = pl_orig.points[0].timestamp;
-    lidar_data.start_time = time_begin;
-    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate)
-    {
-      auto& pt = pl_orig.points[i];
-      if (!validPoint(pt.x, pt.y, pt.z)) continue;
-      offset_time = pt.timestamp - time_begin;
-      lidar_data.pc->emplace_back(
-          pt.x, pt.y, pt.z, pt.intensity, offset_time);
-    }
-    lidar_data.end_time = time_begin + offset_time;
-    break;
-  }
-  case LID_TYPE::VEL_NCLT:
-  {
-    pcl::PointCloud<NCLT::Point> pl_orig;
-    pcl::fromROSMsg(*msg, pl_orig);
-    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
-    lidar_data.start_time = msg->header.stamp.toSec();
-    
-    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate){
-      auto& pt = pl_orig.points[i];
-      if (!validPoint(pt.x, pt.y, pt.z)) continue;
-      offset_time = pt.time * 1e-6;
-      lidar_data.pc->emplace_back(
-          pt.x, pt.y, pt.z, 1.0, offset_time);
-    }
-    lidar_data.end_time = lidar_data.start_time + offset_time;
-    break;
-  }
-  case LID_TYPE::VELO16:
-  case LID_TYPE::VELO32:
-  {
-    pcl::PointCloud<velodyne_ros::Point> pl_orig;
-    pcl::fromROSMsg(*msg, pl_orig);
-    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
-    lidar_data.start_time = msg->header.stamp.toSec();
-
-    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate){
-      auto& pt = pl_orig.points[i];
-      if (!validPoint(pt.x, pt.y, pt.z)) continue;
-      lidar_data.pc->emplace_back(
-          pt.x, pt.y, pt.z, pt.intensity, pt.time);
-    }
-    lidar_data.end_time = lidar_data.start_time + lidar_data.pc->points.back().offset_time;
-    break;
-  }
-  case OUSTER:
-  {
-    pcl::PointCloud<ouster_ros::Point> pl_orig;
-    pcl::fromROSMsg(*msg, pl_orig);
-    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
-    lidar_data.start_time = msg->header.stamp.toSec();
-
-    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate){
-      auto& pt = pl_orig.points[i];
-      if (!validPoint(pt.x, pt.y, pt.z)) continue;
-      offset_time = pt.t * 1e-9;
-      lidar_data.pc->emplace_back(
-          pt.x, pt.y, pt.z, pt.intensity, offset_time);
-    }
-    lidar_data.end_time = lidar_data.start_time + offset_time;
-    break;
-  }
-  default:
-    return;
-  }
-  
-  lidar_buffer_.push_back(lidar_data);
+inline double stampToSec(const builtin_interfaces::msg::Time& t)
+{
+  return static_cast<double>(t.sec) +
+         static_cast<double>(t.nanosec) * 1e-9;
 }
 
 
+inline builtin_interfaces::msg::Time toRosTime(double t_sec)
+{
+  builtin_interfaces::msg::Time t;
+  t.sec = static_cast<int32_t>(std::floor(t_sec));
+  t.nanosec = static_cast<uint32_t>((t_sec - t.sec) * 1e9);
+  return t;
+}
 
-void ROSWrapper::imuHandler(const sensor_msgs::Imu::ConstPtr& msg){
+
+ROSWrapper::ROSWrapper(const rclcpp::NodeOptions& options)
+: rclcpp::Node("super_lio", options)
+{
+  LoadParamFromRos(*this);
+  LOG(INFO) << GREEN << " ---> Using Lidar type: "
+            << lidarTypeToString(g_lidar_type) << RESET;
+
+  msg2uav_.header.frame_id = "world";
+  path_.header.frame_id = "world";
+
+  setupIO();
+}
+
+
+void ROSWrapper::setupIO(){
+  //// input ======================================
+  cb_sensor_ = this->create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  rclcpp::SubscriptionOptions sub_opt;
+  sub_opt.callback_group = cb_sensor_;
+
+  auto imu_qos = rclcpp::QoS(rclcpp::KeepLast(500))
+                 .best_effort()
+                 .durability_volatile();
+
+  auto lidar_qos = rclcpp::QoS(rclcpp::KeepLast(20))
+                   .best_effort()
+                   .durability_volatile();
+
+  sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(
+      g_imu_topic,
+      imu_qos,
+      std::bind(
+        &ROSWrapper::imuHandler, this,
+        std::placeholders::_1, std::placeholders::_2),
+      sub_opt);
+
+  if (g_lidar_type == LID_TYPE::LIVOX) {
+#ifdef SUPER_LIO_HAS_LIVOX
+    sub_lidar_ =
+        this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
+            g_lidar_topic,
+            lidar_qos,
+            std::bind(
+              &ROSWrapper::livoxHandler, this,
+              std::placeholders::_1, std::placeholders::_2),
+            sub_opt);
+#else
+    throw std::runtime_error(
+      "Livox input requested, but Super-LIO was built without SUPER_LIO_WITH_LIVOX");
+#endif
+  } else {
+    sub_lidar_std_ =
+        this->create_subscription<sensor_msgs::msg::PointCloud2>(
+            g_lidar_topic,
+            lidar_qos,
+            std::bind(
+              &ROSWrapper::stdMsgHandler, this,
+              std::placeholders::_1, std::placeholders::_2),
+            sub_opt);
+  }
+
+  /// output ======================================
+  pub_odom_ = this->create_publisher<nav_msgs::msg::Odometry>(
+      "/lio/odom", 100);
+
+  pub_imu_odom_ = this->create_publisher<nav_msgs::msg::Odometry>(
+      "/lio/imu/odom", 10);
+
+  pub_robo_odom_ = this->create_publisher<nav_msgs::msg::Odometry>(
+      "/lio/robo/odom", 10);
+
+  pub_path_ = this->create_publisher<nav_msgs::msg::Path>(
+      "/lio/path", 10);
+
+  auto cloud_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+                   .best_effort()
+                   .durability_volatile();
+  pub_cloud_world_ =
+    this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/lio/cloud_world", cloud_qos);
+
+  tf_broadcaster_ =
+      std::make_shared<tf2_ros::TransformBroadcaster>(this);
+}
+
+
+void ROSWrapper::beginInputCallback(
+  InputCallbackTiming& timing,
+  const rclcpp::MessageInfo& message_info,
+  std::int64_t callback_steady_ns)
+{
+  const auto& rmw_info = message_info.get_rmw_message_info();
+  const std::int64_t received_ns = rmw_info.received_timestamp;
+  if (received_ns > 0) {
+    keepMaximum(
+      timing.rmw_gap_ms,
+      elapsedMs(timing.last_rmw_received_ns, received_ns));
+    keepMaximum(
+      timing.dispatch_delay_ms,
+      elapsedMs(received_ns, systemNowNs()));
+    timing.last_rmw_received_ns = received_ns;
+  }
+
+  keepMaximum(
+    timing.callback_gap_ms,
+    elapsedMs(timing.last_callback_steady_ns, callback_steady_ns));
+  timing.last_callback_steady_ns = callback_steady_ns;
+}
+
+
+void ROSWrapper::finishInputCallback(
+  InputCallbackTiming& timing, std::int64_t callback_steady_ns)
+{
+  keepMaximum(timing.callback_ms, elapsedMs(callback_steady_ns, steadyNowNs()));
+}
+
+
+RuntimeTimingSample ROSWrapper::takeRuntimeTimingSample()
+{
+  RuntimeTimingSample sample;
+  sample.lidar_rmw_gap_ms = lidar_callback_timing_.rmw_gap_ms;
+  sample.lidar_callback_gap_ms = lidar_callback_timing_.callback_gap_ms;
+  sample.lidar_dispatch_delay_ms = lidar_callback_timing_.dispatch_delay_ms;
+  sample.lidar_callback_ms = lidar_callback_timing_.callback_ms;
+  sample.imu_rmw_gap_ms = imu_callback_timing_.rmw_gap_ms;
+  sample.imu_callback_gap_ms = imu_callback_timing_.callback_gap_ms;
+  sample.imu_dispatch_delay_ms = imu_callback_timing_.dispatch_delay_ms;
+  sample.imu_callback_ms = imu_callback_timing_.callback_ms;
+  sample.lidar_source_stamp_sec = lidar_callback_timing_.source_stamp_sec;
+  if (sample.lidar_source_stamp_sec > 0.0) {
+    sample.lidar_source_age_ms =
+      static_cast<double>(systemNowNs()) * 1e-6 -
+      sample.lidar_source_stamp_sec * 1e3;
+  }
+  sample.lidar_queue_depth = lidar_buffer_.size();
+  sample.imu_queue_depth = imu_buffer_.size();
+
+  lidar_callback_timing_.rmw_gap_ms = -1.0;
+  lidar_callback_timing_.callback_gap_ms = -1.0;
+  lidar_callback_timing_.dispatch_delay_ms = -1.0;
+  lidar_callback_timing_.callback_ms = -1.0;
+  imu_callback_timing_.rmw_gap_ms = -1.0;
+  imu_callback_timing_.callback_gap_ms = -1.0;
+  imu_callback_timing_.dispatch_delay_ms = -1.0;
+  imu_callback_timing_.callback_ms = -1.0;
+  return sample;
+}
+
+
+void ROSWrapper::setSyncWait(SyncWaitReason reason)
+{
+  if (reason == SyncWaitReason::Ready) {
+    sync_wait_reason_ = reason;
+    sync_wait_start_ns_ = 0;
+    return;
+  }
+
+  if (sync_wait_start_ns_ == 0 || sync_wait_reason_ != reason) {
+    sync_wait_reason_ = reason;
+    sync_wait_start_ns_ = steadyNowNs();
+  }
+}
+
+
+void ROSWrapper::populateSyncTiming(RuntimeTimingSample& sample) const
+{
+  sample.sync_reason = sync_wait_reason_;
+  sample.sync_wait_ms = sync_wait_start_ns_ > 0 ?
+    elapsedMs(sync_wait_start_ns_, steadyNowNs()) : -1.0;
+}
+
+
+void ROSWrapper::reportRuntimeTiming(
+  const RuntimeTimingSample& sample, std::int64_t steady_now_ns)
+{
+  const auto report = runtime_timing_.observe(sample, steady_now_ns);
+  if (!report) {
+    return;
+  }
+
+  const RuntimeTimingSample& worst = report->worst_sample;
+  const std::string_view sync_reason = syncWaitReasonName(worst.sync_reason);
+  RCLCPP_WARN(
+    get_logger(),
+    "[super_lio_timing] cause=%.*s max=%.1fms samples=%llu anomalies=%llu "
+    "frame=%llu src_age=%.1fms points=%zu/%zu imu=%zu queue=%zu/%zu "
+    "sync=%.*s wait=%.1fms input={lrg:%.1f,lcg:%.1f,ldis:%.1f,lcb:%.1f,"
+    "irg:%.1f,icg:%.1f,idis:%.1f,icb:%.1f} "
+    "stage={timer:%.1f,und:%.1f,ds:%.1f,"
+    "obs:%.1f,map:%.1f,odom:%.1f,xform:%.1f,ros:%.1f,pub:%.1f,total:%.1f}",
+    static_cast<int>(report->dominant_cause.size()), report->dominant_cause.data(),
+    report->dominant_ms,
+    static_cast<unsigned long long>(report->sample_count),
+    static_cast<unsigned long long>(report->anomaly_count),
+    static_cast<unsigned long long>(worst.frame_sequence),
+    worst.lidar_source_age_ms,
+    worst.raw_point_count, worst.downsampled_point_count,
+    worst.imu_measurement_count,
+    worst.lidar_queue_depth, worst.imu_queue_depth,
+    static_cast<int>(sync_reason.size()), sync_reason.data(),
+    worst.sync_wait_ms,
+    worst.lidar_rmw_gap_ms, worst.lidar_callback_gap_ms,
+    worst.lidar_dispatch_delay_ms, worst.lidar_callback_ms,
+    worst.imu_rmw_gap_ms, worst.imu_callback_gap_ms,
+    worst.imu_dispatch_delay_ms,
+    worst.imu_callback_ms,
+    worst.process_timer_gap_ms, worst.undistort_ms,
+    worst.downsample_ms, worst.observe_ms, worst.update_map_ms,
+    worst.odom_publish_ms, worst.cloud_transform_ms,
+    worst.cloud_to_ros_ms, worst.cloud_publish_ms, worst.frame_total_ms);
+}
+
+
+void ROSWrapper::imuHandler(
+  const sensor_msgs::msg::Imu::SharedPtr msg,
+  const rclcpp::MessageInfo& message_info)
+{
+  const std::int64_t callback_steady_ns = steadyNowNs();
+  beginInputCallback(imu_callback_timing_, message_info, callback_steady_ns);
   IMUData data;
-  data.secs = msg->header.stamp.toSec();
+  data.secs = stampToSec(msg->header.stamp);
+  imu_callback_timing_.source_stamp_sec = data.secs;
   data.acc  = V3(msg->linear_acceleration.x,
                  msg->linear_acceleration.y,
                  msg->linear_acceleration.z);
@@ -356,18 +545,16 @@ void ROSWrapper::imuHandler(const sensor_msgs::Imu::ConstPtr& msg){
     imu_buffer_.push_back(data);
     last_timestamp_imu_ = data.secs;
     // eskf_->Reset();   // todo:
+    finishInputCallback(imu_callback_timing_, callback_steady_ns);
     return;
   }
 
   imu_buffer_.push_back(data);
   last_timestamp_imu_ = data.secs;
 
-  static ros::Publisher pub_imu_odom  = nh_.advertise<nav_msgs::Odometry>("/lio/imu/odom", 10);    /// imu frame -> imu freq
-  static ros::Publisher pub_robo_odom = nh_.advertise<nav_msgs::Odometry>("/lio/robo/odom", 10);   /// robot frame -> imu freq
-  
   DynamicState imu_state, robo_state;
   if(eskf_->Predict(data, imu_state, robo_state)){
-    nav_msgs::Odometry odom_imu, odom_robo;
+    nav_msgs::msg::Odometry odom_imu, odom_robo;
 
     {
       odom_imu.pose.pose.position.x = imu_state.p(0);
@@ -409,243 +596,371 @@ void ROSWrapper::imuHandler(const sensor_msgs::Imu::ConstPtr& msg){
     odom_robo.header.stamp = msg->header.stamp;
     odom_imu.header.frame_id = "world";
     odom_robo.header.frame_id = "world";
-    pub_imu_odom.publish(odom_imu);
-    pub_robo_odom.publish(odom_robo);
+    pub_imu_odom_->publish(odom_imu);
+    pub_robo_odom_->publish(odom_robo);
   }
+  finishInputCallback(imu_callback_timing_, callback_steady_ns);
 }
 
 
-bool ROSWrapper::sync_measure(MeasureGroup& meas){
-  if (lidar_buffer_.empty() || imu_buffer_.empty()) {
-    return false;
-  }else{
+#ifdef SUPER_LIO_HAS_LIVOX
+void ROSWrapper::livoxHandler(
+  const livox_ros_driver2::msg::CustomMsg::SharedPtr msg,
+  const rclcpp::MessageInfo& message_info)
+{
+  const std::int64_t callback_steady_ns = steadyNowNs();
+  beginInputCallback(lidar_callback_timing_, message_info, callback_steady_ns);
+  if(msg->point_num < 10) {
+    finishInputCallback(lidar_callback_timing_, callback_steady_ns);
+    return;
+  }
+  LidarData lidar_data;
+  std::size_t ptsize = msg->point_num;
+  lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
+  lidar_data.pc->reserve(ptsize / g_filter_rate + 1);
+
+  double offset_time = 0.0;
+  for(std::size_t _i = 0; _i < ptsize; _i += g_filter_rate){
+    auto& pt = msg->points[_i];
+    auto tag = pt.tag & 0x30;
+    if (tag == 0x10 || tag == 0x00){
+      auto dis = pt.x * pt.x + pt.y * pt.y + pt.z * pt.z;
+      if(dis > g_blind2 && dis < g_maxrange2){
+        offset_time = pt.offset_time * 1e-9;
+        lidar_data.pc->emplace_back(pt.x, pt.y, pt.z, pt.reflectivity, offset_time);
+      }
+    }
+  }
+  lidar_data.start_time = stampToSec(msg->header.stamp);
+  lidar_data.end_time   = lidar_data.start_time + offset_time;
+  lidar_callback_timing_.source_stamp_sec = lidar_data.start_time;
+  lidar_buffer_.push_back(lidar_data);
+  finishInputCallback(lidar_callback_timing_, callback_steady_ns);
+}
+#endif
+
+
+void ROSWrapper::stdMsgHandler(
+  const sensor_msgs::msg::PointCloud2::SharedPtr msg,
+  const rclcpp::MessageInfo& message_info)
+{
+  const std::int64_t callback_steady_ns = steadyNowNs();
+  beginInputCallback(lidar_callback_timing_, message_info, callback_steady_ns);
+  if(msg->data.size() < 10) {
+    finishInputCallback(lidar_callback_timing_, callback_steady_ns);
+    return;
   }
 
-  /*** push a lidar scan ***/
+  LidarData lidar_data;
+  lidar_data.pc.reset(new pcl::PointCloud<LI2Sup::PointXTZIT>());
+
+  double offset_time = 0.0;
+  double dis = 0.0;
+
+  switch (g_lidar_type) {
+
+  case LID_TYPE::HESAI16:
+  {
+    pcl::PointCloud<hesai_ros::Point> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
+    const double time_begin = pl_orig.points[0].timestamp;
+    lidar_data.start_time = time_begin;
+    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate)
+    {
+      auto& pt = pl_orig.points[i];
+      if (!validPoint(pt.x, pt.y, pt.z)) continue;
+      offset_time = pt.timestamp - time_begin;
+      lidar_data.pc->emplace_back(
+          pt.x, pt.y, pt.z, pt.intensity, offset_time);
+    }
+    lidar_data.end_time = time_begin + offset_time;
+    break;
+  }
+  case LID_TYPE::VEL_NCLT:
+  {
+    pcl::PointCloud<NCLT::Point> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
+    lidar_data.start_time = stampToSec(msg->header.stamp);
+
+    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate){
+      auto& pt = pl_orig.points[i];
+      if (!validPoint(pt.x, pt.y, pt.z)) continue;
+      offset_time = pt.time * 1e-6;
+      lidar_data.pc->emplace_back(
+          pt.x, pt.y, pt.z, 1.0, offset_time);
+    }
+    lidar_data.end_time = lidar_data.start_time + offset_time;
+    break;
+  }
+  case LID_TYPE::VELO16:
+  case LID_TYPE::VELO32:
+  {
+    pcl::PointCloud<velodyne_ros::Point> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
+    lidar_data.start_time = stampToSec(msg->header.stamp);
+
+    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate){
+      auto& pt = pl_orig.points[i];
+      if (!validPoint(pt.x, pt.y, pt.z)) continue;
+      lidar_data.pc->emplace_back(
+          pt.x, pt.y, pt.z, pt.intensity, pt.time);
+    }
+    lidar_data.end_time = lidar_data.start_time + lidar_data.pc->points.back().offset_time;
+    break;
+  }
+  case OUSTER:
+  {
+    pcl::PointCloud<ouster_ros::Point> pl_orig;
+    pcl::fromROSMsg(*msg, pl_orig);
+    lidar_data.pc->reserve(pl_orig.size() / g_filter_rate + 1);
+    lidar_data.start_time = stampToSec(msg->header.stamp);
+
+    for(std::size_t i = 0; i < pl_orig.size(); i += g_filter_rate){
+      auto& pt = pl_orig.points[i];
+      if (!validPoint(pt.x, pt.y, pt.z)) continue;
+      offset_time = pt.t * 1e-9;
+      lidar_data.pc->emplace_back(
+          pt.x, pt.y, pt.z, pt.intensity, offset_time);
+    }
+    lidar_data.end_time = lidar_data.start_time + offset_time;
+    break;
+  }
+  default:
+    finishInputCallback(lidar_callback_timing_, callback_steady_ns);
+    return;
+  }
+
+  lidar_callback_timing_.source_stamp_sec = lidar_data.start_time;
+  lidar_buffer_.push_back(lidar_data);
+  finishInputCallback(lidar_callback_timing_, callback_steady_ns);
+}
+
+
+bool ROSWrapper::sync_measure(
+  MeasureGroup& meas, RuntimeTimingSample& timing_sample)
+{
+  if (lidar_buffer_.empty()) {
+    setSyncWait(SyncWaitReason::NoLidar);
+    populateSyncTiming(timing_sample);
+    return false;
+  }
+
   if (!lidar_pushed_) {
     meas.lidar = lidar_buffer_.front();
     lidar_pushed_ = true;
   }
 
-  if(last_timestamp_lidar_ > meas.lidar.end_time){
+  meas.imu.clear();
+  const MeasurementSyncResult sync_result = measurement_synchronizer_.evaluate(
+    meas.lidar.end_time, imu_buffer_,
+    [](const IMUData& imu) { return imu.secs; });
+
+  if (sync_result.action == MeasurementSyncAction::WaitForImu) {
+    setSyncWait(
+      imu_buffer_.empty() ? SyncWaitReason::NoImu : SyncWaitReason::ImuBehind);
+    populateSyncTiming(timing_sample);
+    return false;
+  }
+
+  if (sync_result.action == MeasurementSyncAction::DropNonmonotonicLidar) {
     lidar_buffer_.pop_front();
     lidar_pushed_ = false;
+    setSyncWait(SyncWaitReason::NonmonotonicLidar);
+    populateSyncTiming(timing_sample);
     return false;
   }
 
-  if (last_timestamp_imu_ < meas.lidar.end_time) {
-    return false;
-  }
-
-  /*** push imu_ data, and pop from imu_ buffer ***/
-  double imu_time = imu_buffer_.front().secs;
-  meas.imu.clear();
-  while ((!imu_buffer_.empty()) && (imu_time < meas.lidar.end_time)) {
-    imu_time = imu_buffer_.front().secs;
-    if (imu_time > meas.lidar.end_time) break;
-    meas.imu.push_back(imu_buffer_.front());
+  for (std::size_t index = 0;
+    index < sync_result.consume_imu_count; ++index)
+  {
+    if (index >= sync_result.first_measurement_imu_index) {
+      meas.imu.push_back(imu_buffer_.front());
+    }
     imu_buffer_.pop_front();
   }
 
-  last_timestamp_lidar_ = meas.lidar.end_time;
   lidar_buffer_.pop_front();
   lidar_pushed_ = false;
+
+  if (sync_result.action == MeasurementSyncAction::DropWithoutStateAdvance) {
+    meas.imu.clear();
+    LOG_EVERY_N(WARNING, 10)
+      << "[super_lio_sync] Dropped lidar frame without a new IMU sample in "
+      << "its closed scan interval: lidar_end=" << meas.lidar.end_time
+      << " latest_imu=" << last_timestamp_imu_
+      << " (logging every 10 drops)";
+    setSyncWait(SyncWaitReason::Ready);
+    populateSyncTiming(timing_sample);
+    return false;
+  }
+
+  setSyncWait(SyncWaitReason::Ready);
+  populateSyncTiming(timing_sample);
+  timing_sample.lidar_source_stamp_sec = meas.lidar.start_time;
+  timing_sample.lidar_source_age_ms =
+    static_cast<double>(systemNowNs()) * 1e-6 -
+    meas.lidar.start_time * 1e3;
+  timing_sample.raw_point_count = meas.lidar.pc->size();
+  timing_sample.imu_measurement_count = meas.imu.size();
   return true;
 }
 
 
-void ROSWrapper::pub_odom(const NavState& state){
-  nav_msgs::Odometry odom;
-  odom.header.frame_id = "world";
-  odom.header.stamp = ros::Time().fromSec(state.timestamp);
-  odom.pose.pose.position.x = state.p[0];
-  odom.pose.pose.position.y = state.p[1];
-  odom.pose.pose.position.z = state.p[2];
+bool ROSWrapper::prepareStateOutput(
+  const NavState& state, PreparedStatePublication& prepared)
+{
+  prepared = prepareStatePublication(state);
+  if (!prepared.valid()) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Skipped invalid Super-LIO output frame: reason=%s "
+      "raw_q_norm_squared=%.9f rotation_det=%.9f "
+      "rotation_orthogonality_error=%.9f",
+      statePublicationStatusName(prepared.status),
+      static_cast<double>(prepared.raw_quaternion_norm_squared),
+      static_cast<double>(prepared.rotation_determinant),
+      static_cast<double>(prepared.rotation_orthogonality_error));
+    return false;
+  }
+  return true;
+}
 
-  V4 temp_q = state.R.coeffs();
-  odom.pose.pose.orientation.x = temp_q[0];
-  odom.pose.pose.orientation.y = temp_q[1];
-  odom.pose.pose.orientation.z = temp_q[2];
-  odom.pose.pose.orientation.w = temp_q[3];
 
-  odom.twist.twist.linear.x = state.v[0];
-  odom.twist.twist.linear.y = state.v[1];
-  odom.twist.twist.linear.z = state.v[2];
+void ROSWrapper::pub_odom(const PreparedStatePublication& prepared)
+{
 
-  pub_odom_.publish(odom);    // imu frame -> lidar frequency
+  nav_msgs::msg::Odometry odom;
+  geometry_msgs::msg::TransformStamped tf_msg;
+  populateStateMessages(prepared, odom, tf_msg);
 
-  V3 robo_position = state.R.R_ * ( - g_odom_robo.R_ * g_odom_robo.t_) + state.p;
+  pub_odom_->publish(odom);    // imu frame -> lidar frequency
+
+  V3 imu_position;
+  imu_position <<
+    static_cast<scalar>(prepared.pose.position.x),
+    static_cast<scalar>(prepared.pose.position.y),
+    static_cast<scalar>(prepared.pose.position.z);
+  V3 robo_position =
+    prepared.rotation * (-g_odom_robo.R_ * g_odom_robo.t_) + imu_position;
 
   if(g_2_robot){
-    static ros::Publisher pub_msg2uav_ = nh_.advertise<geometry_msgs::PoseStamped>("/mavros/vision_pose/pose", 10);
-    M3 robo_rotation = state.R.R_ * g_odom_robo.R_;
+    static auto pub_msg2uav_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+        "/mavros/vision_pose/pose", 10);
+    M3 robo_rotation = prepared.rotation * g_odom_robo.R_;
     msg2uav_.header.stamp = odom.header.stamp;
     msg2uav_.pose.position.x = robo_position[0];
     msg2uav_.pose.position.y = robo_position[1];
     msg2uav_.pose.position.z = robo_position[2];
     Quat robo_quat(robo_rotation);
+    robo_quat.normalize();
     msg2uav_.pose.orientation.w = robo_quat.w();
     msg2uav_.pose.orientation.x = robo_quat.x();
     msg2uav_.pose.orientation.y = robo_quat.y();
     msg2uav_.pose.orientation.z = robo_quat.z();
-    pub_msg2uav_.publish(msg2uav_);
+    pub_msg2uav_->publish(msg2uav_);
   }
 
-  // if(1)
   if((last_path_point_ - robo_position).norm() > 0.1)
   {
-    /// nav_msgs::Path
     path_.header.stamp = odom.header.stamp;
-    geometry_msgs::PoseStamped point;
+    geometry_msgs::msg::PoseStamped point;
     point.pose = odom.pose.pose;
     path_.poses.push_back(point);
-    pub_path_.publish(path_);
-
-    /// sensor_msgs::PointCloud2
-    // pcl::PointXYZRGB point_robot;
-    // point_robot.x = robo_position[0];
-    // point_robot.y = robo_position[1];
-    // point_robot.z = robo_position[2];
-    // auto [r, g, b] = getColorFromVelocity(state.v.norm());
-    // point_robot.r = static_cast<uint8_t>(r * 255);
-    // point_robot.g = static_cast<uint8_t>(g * 255);
-    // point_robot.b = static_cast<uint8_t>(b * 255);
-    // point_robot.a = 255;
-    // pcl::PointCloud<pcl::PointXYZRGB> path_point_;
-    // path_point_.push_back(point_robot);
-    // pcl::toROSMsg(path_point_, msg_path_point_);
-    // msg_path_point_.header.stamp = odom.header.stamp;
-    // msg_path_point_.header.frame_id = "world";
-    // pub_path_robot_.publish(msg_path_point_);
-
+    pub_path_->publish(path_);
     last_path_point_ = robo_position;
   }
 
-  // tf::Transform transform;
-  // tf::Quaternion q;
-  // transform.setOrigin(tf::Vector3(state.p[0], state.p[1], state.p[2]));
-  // q.setX(temp_q[0]);
-  // q.setY(temp_q[1]);
-  // q.setZ(temp_q[2]);
-  // q.setW(temp_q[3]);
-  // transform.setRotation(q);
-  // br_.sendTransform(tf::StampedTransform(transform, odom.header.stamp, "world", "body"));
+  tf_broadcaster_->sendTransform(tf_msg);
 
-  // // Visual: for the best field of view in rviz.
-  // q.setX(0);
-  // q.setY(0);
-  // q.setZ(0);
-  // q.setW(1);
-  // transform.setRotation(q);
-  // br_.sendTransform(tf::StampedTransform(transform, odom.header.stamp, "world", "god"));
+  // tf_msg.child_frame_id = "god";
+  // tf_msg.transform.rotation.x = 0.0;
+  // tf_msg.transform.rotation.y = 0.0;
+  // tf_msg.transform.rotation.z = 0.0;
+  // tf_msg.transform.rotation.w = 1.0;
+  // tf_broadcaster_->sendTransform(tf_msg);
 }
 
 
-
-void ROSWrapper::pub_cloud_world(const CloudPtr& pc,double time){
-  static ros::Publisher pub_cloud_world_ = nh_.advertise<sensor_msgs::PointCloud2>
-                                            ("/lio/cloud_world", 10);
-  sensor_msgs::PointCloud2 cloud;
+ROSWrapper::CloudPublishTiming ROSWrapper::pub_cloud_world(
+  const CloudPtr& pc, const PreparedStatePublication& prepared)
+{
+  CloudPublishTiming timing;
+  const std::int64_t to_ros_start_ns = steadyNowNs();
+  sensor_msgs::msg::PointCloud2 cloud;
   pcl::toROSMsg(*pc, cloud);
-  cloud.header.frame_id = "world";
-  cloud.header.stamp = ros::Time().fromSec(time);
-  pub_cloud_world_.publish(cloud);
+  const std::int64_t publish_start_ns = steadyNowNs();
+  timing.to_ros_ms = elapsedMs(to_ros_start_ns, publish_start_ns);
+  populateWorldPointCloudHeader(prepared, cloud);
+  pub_cloud_world_->publish(cloud);
+  timing.publish_ms = elapsedMs(publish_start_ns, steadyNowNs());
+  return timing;
 }
 
 
 void ROSWrapper::pub_cloud2planner(const CloudPtr& pc, double time){
-  static ros::Publisher pub_cloud2robot_ = nh_.advertise<sensor_msgs::PointCloud2>
-                                            ("/lio/robo/cloud_world", 10);
-  sensor_msgs::PointCloud2 cloud;
+  static auto pub_cloud2robot_ =
+    this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/lio/robo/cloud_world", 10);
+  sensor_msgs::msg::PointCloud2 cloud;
   pcl::toROSMsg(*pc, cloud);
   cloud.header.frame_id = "world";
-  cloud.header.stamp = ros::Time().fromSec(time);
-  pub_cloud2robot_.publish(cloud);
+  cloud.header.stamp = toRosTime(time);
+  pub_cloud2robot_->publish(cloud);
 }
 
 
-void ROSWrapper::pub_cloud_body_pose(const CloudPtr& pc, 
+void ROSWrapper::pub_cloud_body_pose(const CloudPtr& pc,
   const NavState& state)
 {
-  static ros::Publisher pub_output2robot_ = nh_.advertise<super_lio::CloudPose>
-                                            ("/lio/body/cloud_pose", 10);
-  super_lio::CloudPose cloud_pose;
+  PreparedStatePublication prepared;
+  if (!prepareStateOutput(state, prepared)) {
+    return;
+  }
+  static auto pub_cloud_body_pose_ =
+    this->create_publisher<super_lio::msg::CloudPose>(
+        "/lio/body/cloud_pose", 10);
+  super_lio::msg::CloudPose cloud_pose;
   pcl::toROSMsg(*pc, cloud_pose.cloud);
-  cloud_pose.cloud.header.stamp = ros::Time().fromSec(state.timestamp);  
-  cloud_pose.pose.position.x = state.p[0];
-  cloud_pose.pose.position.y = state.p[1];
-  cloud_pose.pose.position.z = state.p[2];
-  V4 temp_q = state.R.coeffs();
-  cloud_pose.pose.orientation.x = temp_q[0];
-  cloud_pose.pose.orientation.y = temp_q[1];
-  cloud_pose.pose.orientation.z = temp_q[2];
-  cloud_pose.pose.orientation.w = temp_q[3];
+  cloud_pose.cloud.header.stamp = prepared.stamp;
+  cloud_pose.pose = prepared.pose;
 
-  pub_output2robot_.publish(cloud_pose);
+  pub_cloud_body_pose_->publish(cloud_pose);
 }
 
 
-void ROSWrapper::pub_cloud_world_pose(const CloudPtr& pc, 
+void ROSWrapper::pub_cloud_world_pose(const CloudPtr& pc,
    const NavState& state)
 {
-  static ros::Publisher pub_output2robot_ = nh_.advertise<super_lio::CloudPose>
-                                            ("/lio/world/cloud_pose", 10);
-  super_lio::CloudPose cloud_pose;
-  pcl::toROSMsg(*pc, cloud_pose.cloud);
-  cloud_pose.cloud.header.stamp = ros::Time().fromSec(state.timestamp);  
-  cloud_pose.pose.position.x = state.p[0];
-  cloud_pose.pose.position.y = state.p[1];
-  cloud_pose.pose.position.z = state.p[2];
-  V4 temp_q = state.R.coeffs();
-  cloud_pose.pose.orientation.x = temp_q[0];
-  cloud_pose.pose.orientation.y = temp_q[1];
-  cloud_pose.pose.orientation.z = temp_q[2];
-  cloud_pose.pose.orientation.w = temp_q[3];
-  
-  pub_output2robot_.publish(cloud_pose);
-}
-
-
-void ROSWrapper::pub_cloud_body_pose( 
-      const BASIC::VV3& pc_body,
-      const NavState& state)
-{
-  static ros::Publisher pub_msg_ = nh_.advertise<super_lio::CloudPose2>
-                                            ("/lio/dense/cloud_pose", 10);
-
-  super_lio::CloudPose2 cloud_pose;
-  cloud_pose.header.stamp = ros::Time().fromSec(state.timestamp);
-
-  cloud_pose.pose.reserve(12);
-  cloud_pose.pose.push_back(state.p[0]);
-  cloud_pose.pose.push_back(state.p[1]);
-  cloud_pose.pose.push_back(state.p[2]);
-
-  for (int r = 0; r < 3; ++r)
-    for (int c = 0; c < 3; ++c)
-      cloud_pose.pose.push_back(state.R.R_(r, c));
-
-  cloud_pose.cloud_lidar.reserve(pc_body.size() * 3);
-  for (const auto& pt : pc_body) {
-    cloud_pose.cloud_lidar.push_back(pt[0]);
-    cloud_pose.cloud_lidar.push_back(pt[1]);
-    cloud_pose.cloud_lidar.push_back(pt[2]);
+  PreparedStatePublication prepared;
+  if (!prepareStateOutput(state, prepared)) {
+    return;
   }
-
-  pub_msg_.publish(cloud_pose);
+  static auto pub_cloud_world_pose_ =
+    this->create_publisher<super_lio::msg::CloudPose>(
+        "/lio/world/cloud_pose", 10);
+  super_lio::msg::CloudPose cloud_pose;
+  pcl::toROSMsg(*pc, cloud_pose.cloud);
+  cloud_pose.cloud.header.stamp = prepared.stamp;
+  cloud_pose.pose = prepared.pose;
+  pub_cloud_world_pose_->publish(cloud_pose);
 }
 
 
-void ROSWrapper::pub_processing_time(double time, double current_time, double mean_time, double std_time)
+void ROSWrapper::pub_processing_time(double time,
+  double current_time, double mean_time, double std_time)
 {
-  static ros::Publisher pub_process_time_ = nh_.advertise<geometry_msgs::PoseStamped>
-                                            ("/lio/processing_time", 10);
-  geometry_msgs::PoseStamped msg;
-  msg.header.stamp = ros::Time().fromSec(time);
+  static auto pub_processing_time_ =
+    this->create_publisher<geometry_msgs::msg::PoseStamped>(
+        "/lio/processing_time", 10);
+  geometry_msgs::msg::PoseStamped msg;
+  msg.header.stamp = toRosTime(time);
   msg.pose.position.x = current_time;
   msg.pose.position.y = mean_time;
   msg.pose.position.z = std_time;
-  pub_process_time_.publish(msg);
+  pub_processing_time_->publish(msg);
 }
 
 
@@ -653,53 +968,58 @@ void ROSWrapper::set_global_map(const BASIC::CloudPtr& global_map){
   pcl::toROSMsg(*global_map, global_map_msg_);
   global_map_msg_.header.frame_id = "world";
 
-  static ros::Publisher global_map_pub =
-    nh_.advertise<sensor_msgs::PointCloud2>("/lio/global_map", 1, true);
+  static auto global_map_pub =
+    this->create_publisher<sensor_msgs::msg::PointCloud2>(
+          "/lio/global_map", 10);
 
-  static ros::Timer global_map_timer =
-    nh_.createTimer(
-      ros::Duration(1.0),
-      [this](const ros::TimerEvent&) {
+  static auto global_map_timer =
+    this->create_wall_timer(
+      std::chrono::seconds(1),
+      [this]() {
         static int count = -1;
         static int publish_interval = 1;
+
         count++;
         if (count % publish_interval != 0) {
           return;
         }
+
         count = 0;
         publish_interval++;
-        if(publish_interval > 10) publish_interval = 10;
-        global_map_msg_.header.stamp = ros::Time::now();
-        global_map_pub.publish(global_map_msg_);
+        if (publish_interval > 10) {
+          publish_interval = 10;
+        }
+        global_map_msg_.header.stamp = this->now();
+        global_map_pub->publish(global_map_msg_);
       });
 }
 
+
 void ROSWrapper::set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_guess, bool flg_finish_init)
 {
-  static ros::Subscriber init_pose_sub =
-    nh_.subscribe<geometry_msgs::PoseWithCovarianceStamped>(
-      "/initialpose", 1,
-      [this, &init_pose, &flg_get_init_guess]
-      (const geometry_msgs::PoseWithCovarianceStampedConstPtr& msg)
-      {
-        V3 init_translation;
-        init_translation << 
-            msg->pose.pose.position.x,
-            msg->pose.pose.position.y,
-            0.2;
+  static auto init_pose_sub =
+    this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+        "/initialpose", 1,
+        [this, &init_pose, &flg_get_init_guess](
+          const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
+        {
+          V3 init_translation;
+          init_translation << msg->pose.pose.position.x,
+                              msg->pose.pose.position.y,
+                              0.2;
 
-        double x = msg->pose.pose.orientation.x;
-        double y = msg->pose.pose.orientation.y;
-        double z = msg->pose.pose.orientation.z;
-        double w = msg->pose.pose.orientation.w;
+          double x = msg->pose.pose.orientation.x;
+          double y = msg->pose.pose.orientation.y;
+          double z = msg->pose.pose.orientation.z;
+          double w = msg->pose.pose.orientation.w;
 
-        Quat init_rotation(w, x, y, z);
+          Quat init_rotation(w, x, y, z);
 
-        init_pose = SE3(SO3(init_rotation.toRotationMatrix()), init_translation);
+          init_pose = BASIC::SE3(SO3(init_rotation.toRotationMatrix()), init_translation);
 
-        flg_get_init_guess = true;
-        
-        LOG(INFO) << YELLOW
+          flg_get_init_guess = true;
+
+          LOG(INFO) << YELLOW
                   << " ---> GET Initial guess: "
                   << init_translation.transpose()
                   << " yaw: "
@@ -707,13 +1027,12 @@ void ROSWrapper::set_initial_data(BASIC::SE3& init_pose, bool& flg_get_init_gues
                           .eulerAngles(0, 1, 2)
                           .transpose()
                   << RESET;
-      });
+        });
 
   if (flg_finish_init) {
-    init_pose_sub = ros::Subscriber();
+    init_pose_sub.reset();
   }
 }
-
 
 
 } // namespace END.

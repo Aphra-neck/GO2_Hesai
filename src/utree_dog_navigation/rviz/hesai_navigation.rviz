@@ -1,0 +1,101 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+Visualization Manager:
+  Class: ""
+  Global Options:
+    Background Color: 38; 38; 38
+    Fixed Frame: world
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Ground Grid
+      Enabled: true
+      Cell Size: 0.5
+      Plane: XY
+      Plane Cell Count: 40
+      Color: 100; 100; 100
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Super-LIO World Cloud
+      Enabled: false
+      Topic:
+        Value: /lio/cloud_world
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Decay Time: 10
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: AxisColor
+      Axis: Z
+      Min Color: 40; 90; 220
+      Max Color: 240; 80; 40
+      Use Fixed Frame: true
+    - Class: rviz_default_plugins/Odometry
+      Name: Go2 Body Odometry
+      Enabled: true
+      Topic:
+        Value: /lio/body_odom
+        Reliability Policy: Best Effort
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 10
+      Shape:
+        Axes Length: 0.3
+        Axes Radius: 0.03
+    - Class: rviz_default_plugins/Map
+      Name: Terrain Costmap
+      Enabled: true
+      Topic:
+        Value: /terrain_costmap
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Depth: 1
+      Alpha: 0.65
+      Color Scheme: costmap
+    - Class: rviz_default_plugins/Path
+      Name: Planned Body Path
+      Enabled: true
+      Topic:
+        Value: /body_path
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Depth: 1
+      Line Style: Lines
+      Line Width: 0.04
+      Color: 0; 255; 80
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetGoal
+      Topic: /goal_pose
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 8
+      Pitch: 0.65
+      Yaw: 0.8
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+Window Geometry:
+  Width: 1500
+  Height: 900

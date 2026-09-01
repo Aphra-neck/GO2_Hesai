@@ -1,4 +1,4 @@
-# Catkin build products
+# ROS build products (catkin and colcon)
 build/
 devel/
 install/
@@ -9,6 +9,19 @@ log/
 logs/
 .catkin_tools/
 
+# Local Codex verification products (never archive or commit)
+build_codex/
+install_codex/
+log_codex/
+
+# Developer-owned optional diagnostics (never commit runtime sessions)
+.local_diagnostics/
+diagnostics/
+*.mcap
+*.db3
+*.pcap
+*.pcapng
+
 # ROS runtime files
 .ros/
 *.bag
@@ -16,6 +29,8 @@ logs/
 
 # Generated maps and point clouds
 *.pcd
+*.pcd.tmp
+go2_map_exports/
 map/
 
 # Editor and OS noise
@@ -29,4 +44,5 @@ Thumbs.db
 # Python cache
 __pycache__/
 *.pyc
+.pytest_cache/
 

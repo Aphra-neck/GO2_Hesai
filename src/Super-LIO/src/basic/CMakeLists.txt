@@ -1,66 +1,75 @@
 cmake_minimum_required(VERSION 3.16)
-project(basic LANGUAGES CXX)
+project(basic VERSION 2.0 LANGUAGES CXX C)
 
+option(SUPER_LIO_ENABLE_LTO "Enable link-time optimization" OFF)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1 CACHE STRING "Suppress developer warnings" FORCE)
+
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_BUILD_TYPE "Release")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -pthread -fexceptions")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -Wall -fPIC")
+
+if(SUPER_LIO_ENABLE_LTO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_ERROR)
+  if(NOT LTO_SUPPORTED)
+    message(FATAL_ERROR "LTO requested but unavailable: ${LTO_ERROR}")
+  endif()
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(Glog REQUIRED)
+find_package(Eigen3 REQUIRED NO_MODULE)
+find_package(PCL REQUIRED)
 
 
-find_package(catkin REQUIRED COMPONENTS
-  roscpp
-  rospy
-)
+file(GLOB_RECURSE BASIC_SOURCES "src/*.cpp")
+file(GLOB_RECURSE BASIC_HEADERS "include/*.h" "include/*.hpp")
 
-find_package(Eigen3 REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common io)
-
-
-include_directories(
-  ${catkin_INCLUDE_DIRS}
-  ${EIGEN3_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
-  include
-)
-
-
-catkin_package(
-  CATKIN_DEPENDS roscpp rospy
-  DEPENDS EIGEN3 PCL
-  INCLUDE_DIRS include
-  LIBRARIES basic
-)
-
-
-file(GLOB_RECURSE BASIC_SOURCES 
-  "src/*.cpp"
-)
-
-file(GLOB_RECURSE BASIC_HEADERS 
-  "include/*.h"
-  "include/*.hpp"
-)
-
-
-add_library(basic
+add_library(${PROJECT_NAME} SHARED
   ${BASIC_SOURCES}
   ${BASIC_HEADERS}
 )
 
-
-target_include_directories(basic PUBLIC
-  include
-  ${catkin_INCLUDE_DIRS}
-  ${EIGEN3_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
+ament_target_dependencies(${PROJECT_NAME}
+  rclcpp
 )
 
-target_link_libraries(basic PUBLIC
-  ${catkin_LIBRARIES}
-  ${EIGEN3_LIBRARIES}
+target_include_directories(${PROJECT_NAME}
+  PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${EIGEN3_INCLUDE_DIRS}
+  ${PCL_INCLUDE_DIRS}
+  ${Glog_INCLUDE_DIRS}
+)
+
+target_link_libraries(${PROJECT_NAME}
+  Eigen3::Eigen
   ${PCL_LIBRARIES}
   gflags
   glog
+  pthread
 )
+
+install(
+  TARGETS ${PROJECT_NAME}
+  EXPORT export_${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+install(DIRECTORY include/ DESTINATION include)
+
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_dependencies(rclcpp Eigen3 PCL)
+ament_export_include_directories(include)
+ament_export_libraries(${PROJECT_NAME})
+
+ament_package()

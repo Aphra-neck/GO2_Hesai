@@ -1,0 +1,1100 @@
+#include "utree_dog_navigation/terrain_mapper_node.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <limits>
+#include <stdexcept>
+#include <unordered_set>
+#include <utility>
+
+#include "geometry_msgs/msg/point.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
+
+namespace utree_dog_navigation
+{
+namespace
+{
+constexpr double kQuaternionNormEpsilon = 1.0e-12;
+constexpr std::size_t kFlatOdomHistoryLimit = 32U;
+constexpr std::size_t kPendingFlatCloudLimit = 8U;
+constexpr std::chrono::milliseconds kPendingFlatCloudMaxWait{250};
+constexpr double kFlatPoseJumpTranslation = 1.0;
+constexpr double kFlatPoseJumpAngle = 0.7853981633974483;
+
+struct VisualizationVoxelKey
+{
+  std::int64_t x;
+  std::int64_t y;
+  std::int64_t z;
+
+  bool operator==(const VisualizationVoxelKey & other) const noexcept
+  {
+    return x == other.x && y == other.y && z == other.z;
+  }
+};
+
+struct VisualizationVoxelKeyHash
+{
+  std::size_t operator()(const VisualizationVoxelKey & key) const noexcept
+  {
+    std::size_t result = std::hash<std::int64_t>{}(key.x);
+    result ^= std::hash<std::int64_t>{}(key.y) + 0x9e3779b9U + (result << 6U) + (result >> 2U);
+    result ^= std::hash<std::int64_t>{}(key.z) + 0x9e3779b9U + (result << 6U) + (result >> 2U);
+    return result;
+  }
+};
+
+struct Quaternion
+{
+  double x;
+  double y;
+  double z;
+  double w;
+};
+
+Quaternion multiply(const Quaternion & left, const Quaternion & right) noexcept
+{
+  return {
+    left.w * right.x + left.x * right.w + left.y * right.z - left.z * right.y,
+    left.w * right.y - left.x * right.z + left.y * right.w + left.z * right.x,
+    left.w * right.z + left.x * right.y - left.y * right.x + left.z * right.w,
+    left.w * right.w - left.x * right.x - left.y * right.y - left.z * right.z};
+}
+
+TerrainPoint rotate(const Quaternion & orientation, const TerrainPoint & point) noexcept
+{
+  const TerrainPoint twice_cross{
+    2.0 * (orientation.y * point.z - orientation.z * point.y),
+    2.0 * (orientation.z * point.x - orientation.x * point.z),
+    2.0 * (orientation.x * point.y - orientation.y * point.x)};
+  return {
+    point.x + orientation.w * twice_cross.x +
+    orientation.y * twice_cross.z - orientation.z * twice_cross.y,
+    point.y + orientation.w * twice_cross.y +
+    orientation.z * twice_cross.x - orientation.x * twice_cross.z,
+    point.z + orientation.w * twice_cross.z +
+    orientation.x * twice_cross.y - orientation.y * twice_cross.x};
+}
+
+bool validRosTimestamp(const builtin_interfaces::msg::Time & stamp) noexcept
+{
+  return stamp.sec >= 0 && stamp.nanosec < 1000000000U &&
+         (stamp.sec != 0 || stamp.nanosec != 0U);
+}
+
+bool sameTimestamp(
+  const builtin_interfaces::msg::Time & left,
+  const builtin_interfaces::msg::Time & right) noexcept
+{
+  return left.sec == right.sec && left.nanosec == right.nanosec;
+}
+
+int compareTimestamp(
+  const builtin_interfaces::msg::Time & left,
+  const builtin_interfaces::msg::Time & right) noexcept
+{
+  if (left.sec != right.sec) {
+    return left.sec < right.sec ? -1 : 1;
+  }
+  if (left.nanosec == right.nanosec) {
+    return 0;
+  }
+  return left.nanosec < right.nanosec ? -1 : 1;
+}
+
+double timestampSeconds(const builtin_interfaces::msg::Time & stamp) noexcept
+{
+  return static_cast<double>(stamp.sec) +
+         static_cast<double>(stamp.nanosec) * 1.0e-9;
+}
+}  // namespace
+
+TerrainMapperNode::TerrainMapperNode(const rclcpp::NodeOptions & options)
+: Node("terrain_mapper", options)
+{
+  map_frame_ = declare_parameter("map_frame", "world");
+  body_frame_ = declare_parameter("body_frame", "base_link");
+  cloud_topic_ = declare_parameter("cloud_topic", "/lio/cloud_world");
+  odom_topic_ = declare_parameter("odom_topic", "/lio/body_odom");
+  planning_mode_ = declare_parameter("planning_mode", "flat_obstacle");
+  const bool enable_legacy_terrain = declare_parameter("enable_legacy_terrain", false);
+  const bool flat_ground_confirmed = declare_parameter("flat_ground_confirmed", false);
+  if (planning_mode_ != "terrain" && planning_mode_ != "flat_obstacle") {
+    throw std::invalid_argument("planning_mode must be 'terrain' or 'flat_obstacle'");
+  }
+  if (planning_mode_ == "terrain" && !enable_legacy_terrain) {
+    throw std::invalid_argument(
+            "terrain mode requires enable_legacy_terrain=true");
+  }
+  if (planning_mode_ != "terrain" && enable_legacy_terrain) {
+    throw std::invalid_argument(
+            "enable_legacy_terrain=true requires planning_mode='terrain'");
+  }
+  flat_obstacle_mode_ = planning_mode_ == "flat_obstacle";
+  if (flat_obstacle_mode_ && !flat_ground_confirmed) {
+    throw std::invalid_argument(
+            "flat_obstacle mode requires flat_ground_confirmed=true after the robot is standing");
+  }
+  TerrainMapConfig config;
+  config.resolution = declare_parameter("resolution", 0.20);
+  config.size_x = declare_parameter("size_x", 40.0);
+  config.size_y = declare_parameter("size_y", 40.0);
+  config.origin_x = declare_parameter("origin_x", -20.0);
+  config.origin_y = declare_parameter("origin_y", -20.0);
+  config.min_points_per_cell = declare_parameter("min_points_per_cell", 3);
+  config.max_slope = declare_parameter("max_slope", 0.65);
+  config.max_roughness = declare_parameter("max_roughness", 0.08);
+  config.max_step_height = declare_parameter("max_step_height", 0.24);
+  config.obstacle_height = declare_parameter("obstacle_height", 0.18);
+  config.integration_window = declare_parameter("integration_window", 1.5);
+  config.min_observed_frames = declare_parameter("min_observed_frames", 4);
+  config.height_bin_resolution = declare_parameter("height_bin_resolution", 0.015);
+  config.confidence_frames = declare_parameter("confidence_frames", 8.0);
+  min_range_ = declare_parameter("min_range", 0.35);
+  max_range_ = declare_parameter("max_range", 12.0);
+  min_z_relative_ = declare_parameter("min_z_relative", -1.5);
+  max_z_relative_ = declare_parameter("max_z_relative", 1.5);
+  self_length_ = declare_parameter("self_filter.length", 0.9);
+  self_width_ = declare_parameter("self_filter.width", 0.55);
+  self_height_ = declare_parameter("self_filter.height", 0.7);
+  integration_window_ = config.integration_window;
+  min_observed_frames_ = config.min_observed_frames;
+  confidence_rebuild_start_radius_ =
+    declare_parameter("confidence_rebuild.start_radius", 0.80);
+  if (!std::isfinite(integration_window_) || integration_window_ <= 0.0) {
+    throw std::invalid_argument("integration_window must be finite and greater than zero");
+  }
+  if (min_observed_frames_ < 1 ||
+    min_observed_frames_ > static_cast<int>(std::numeric_limits<std::uint16_t>::max()))
+  {
+    throw std::invalid_argument("min_observed_frames must be in [1, 65535]");
+  }
+  if (!std::isfinite(confidence_rebuild_start_radius_) ||
+    confidence_rebuild_start_radius_ <= 0.0)
+  {
+    throw std::invalid_argument(
+            "confidence_rebuild.start_radius must be finite and greater than zero");
+  }
+  publish_rate_ = declare_parameter("publish_rate", 2.0);
+  cloud_stale_warning_age_ = declare_parameter("cloud_stale_warning_age", 1.0);
+  if (!std::isfinite(cloud_stale_warning_age_) ||
+    cloud_stale_warning_age_ < 0.001 || cloud_stale_warning_age_ > 60.0)
+  {
+    throw std::invalid_argument(
+            "cloud_stale_warning_age must be finite and in [0.001, 60] seconds");
+  }
+  FlatObstacleLayerConfig flat_config;
+  flat_config.resolution = config.resolution;
+  flat_config.size_x = config.size_x;
+  flat_config.size_y = config.size_y;
+  flat_config.origin_x = config.origin_x;
+  flat_config.origin_y = config.origin_y;
+  flat_config.min_range = min_range_;
+  flat_config.max_range = max_range_;
+  flat_config.self_length = self_length_;
+  flat_config.self_width = self_width_;
+  flat_config.self_height = self_height_;
+  flat_config.min_height = declare_parameter("flat_obstacle.min_height", 0.08);
+  flat_config.max_height = declare_parameter("flat_obstacle.max_height", 0.80);
+  flat_config.voxel_resolution_z =
+    declare_parameter("flat_obstacle.voxel_resolution_z", 0.10);
+  flat_config.obstacle_clearance =
+    declare_parameter("flat_obstacle.obstacle_clearance", 0.00);
+  const int hit_confirmation_frames =
+    declare_parameter("flat_obstacle.hit_confirmation_frames", 2);
+  flat_config.hit_confirmation_window =
+    declare_parameter("flat_obstacle.hit_confirmation_window", 0.35);
+  const int clear_confirmation_frames =
+    declare_parameter("flat_obstacle.clear_confirmation_frames", 2);
+  flat_config.clear_confirmation_window =
+    declare_parameter("flat_obstacle.clear_confirmation_window", 0.35);
+  const int ground_fit_min_points =
+    declare_parameter("flat_obstacle.ground_fit.min_points", 24);
+  flat_config.ground_fit.max_range =
+    declare_parameter("flat_obstacle.ground_fit.max_range", 3.0);
+  flat_config.ground_fit.seed_height_tolerance =
+    declare_parameter("flat_obstacle.ground_fit.seed_height_tolerance", 0.20);
+  flat_config.ground_fit.cell_size =
+    declare_parameter("flat_obstacle.ground_fit.cell_size", 0.20);
+  flat_config.ground_fit.min_span =
+    declare_parameter("flat_obstacle.ground_fit.min_span", 0.80);
+  flat_config.ground_fit.inlier_distance =
+    declare_parameter("flat_obstacle.ground_fit.inlier_distance", 0.04);
+  flat_config.ground_fit.min_inlier_ratio =
+    declare_parameter("flat_obstacle.ground_fit.min_inlier_ratio", 0.55);
+  flat_config.ground_fit.max_rmse =
+    declare_parameter("flat_obstacle.ground_fit.max_rmse", 0.04);
+  flat_config.ground_fit.max_tilt =
+    declare_parameter("flat_obstacle.ground_fit.max_tilt", 0.20);
+  flat_config.ground_fit.max_anchor_error =
+    declare_parameter("flat_obstacle.ground_fit.max_anchor_error", 0.06);
+  flat_config.ground_fit.max_body_clearance_change =
+    declare_parameter("flat_obstacle.ground_fit.max_body_clearance_change", 0.02);
+  if (hit_confirmation_frames < 2 || clear_confirmation_frames < 1 ||
+    ground_fit_min_points < 3)
+  {
+    throw std::invalid_argument(
+            "flat obstacle hit confirmation must use at least two distinct frames; "
+            "clear confirmation and ground fit minimum must be valid");
+  }
+  flat_config.hit_confirmation_frames =
+    static_cast<std::size_t>(hit_confirmation_frames);
+  flat_config.clear_confirmation_frames =
+    static_cast<std::size_t>(clear_confirmation_frames);
+  flat_config.ground_fit.min_points = static_cast<std::size_t>(ground_fit_min_points);
+  flat_config.nominal_body_height =
+    declare_parameter("flat_obstacle.nominal_body_height", 0.34);
+  flat_max_odom_age_ = declare_parameter("flat_obstacle.max_odom_age", 0.5);
+  body_yaw_offset_ = declare_parameter("body_yaw_offset", -1.5707963267948966);
+  lidar_offset_x_ = declare_parameter("flat_obstacle.lidar_offset.x", 0.171);
+  lidar_offset_y_ = declare_parameter("flat_obstacle.lidar_offset.y", 0.0);
+  lidar_offset_z_ = declare_parameter("flat_obstacle.lidar_offset.z", 0.0908);
+  visualization_voxel_size_ =
+    declare_parameter("flat_obstacle.visualization.voxel_size", 0.30);
+  const int visualization_max_points =
+    declare_parameter("flat_obstacle.visualization.max_points", 5000);
+  if (!std::isfinite(flat_config.nominal_body_height) ||
+    flat_config.nominal_body_height <= 0.0 || flat_config.nominal_body_height > 2.0)
+  {
+    throw std::invalid_argument(
+            "flat_obstacle.nominal_body_height must be finite and in (0, 2] metres");
+  }
+  if (!std::isfinite(flat_max_odom_age_) || flat_max_odom_age_ < 0.001 ||
+    flat_max_odom_age_ > 60.0)
+  {
+    throw std::invalid_argument(
+            "flat_obstacle.max_odom_age must be finite and in [0.001, 60] seconds");
+  }
+  if (!std::isfinite(body_yaw_offset_) || std::abs(body_yaw_offset_) > 3.141592653589793 ||
+    !std::isfinite(lidar_offset_x_) || !std::isfinite(lidar_offset_y_) ||
+    !std::isfinite(lidar_offset_z_) ||
+    !std::isfinite(visualization_voxel_size_) || visualization_voxel_size_ <= 0.0 ||
+    visualization_max_points < 1)
+  {
+    throw std::invalid_argument("flat obstacle sensor or visualization configuration is invalid");
+  }
+  visualization_max_points_ = static_cast<std::size_t>(visualization_max_points);
+  if (flat_obstacle_mode_) {
+    flat_obstacle_layer_ = std::make_unique<FlatObstacleLayer>(flat_config);
+  } else {
+    map_builder_ = std::make_unique<TerrainMapBuilder>(config);
+  }
+
+  const auto map_qos = rclcpp::QoS(1).reliable().transient_local();
+  terrain_pub_ = create_publisher<utree_dog_msgs::msg::TerrainGrid>("terrain_map", map_qos);
+  cost_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>("terrain_costmap", map_qos);
+  if (flat_obstacle_mode_) {
+    flat_raw_pub_ = create_publisher<nav_msgs::msg::GridCells>("flat_obstacle_raw", map_qos);
+    flat_inflated_pub_ =
+      create_publisher<nav_msgs::msg::GridCells>("flat_obstacle_inflated", map_qos);
+    flat_filtered_points_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "flat_obstacle_filtered_points",
+      rclcpp::QoS(1).best_effort().durability_volatile());
+    flat_filtered_map_3d_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      "flat_obstacle_filtered_map_3d",
+      rclcpp::QoS(8).reliable().durability_volatile());
+  }
+  cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+    cloud_topic_, rclcpp::SensorDataQoS(),
+    std::bind(&TerrainMapperNode::cloudCallback, this, std::placeholders::_1));
+  odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+    odom_topic_, rclcpp::SensorDataQoS(),
+    std::bind(&TerrainMapperNode::odomCallback, this, std::placeholders::_1));
+  const auto period = std::chrono::duration<double>(1.0 / std::max(0.1, publish_rate_));
+  timer_ = create_wall_timer(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(period),
+    std::bind(&TerrainMapperNode::publishMap, this));
+
+  RCLCPP_INFO(
+    get_logger(), "%s map: %.1f x %.1f m, %.3f m/cell, %zu x %zu cells",
+    flat_obstacle_mode_ ? "Flat obstacle" : "Terrain",
+    config.size_x, config.size_y, config.resolution,
+    flat_obstacle_mode_ ? flat_obstacle_layer_->snapshot().width : map_builder_->width(),
+    flat_obstacle_mode_ ? flat_obstacle_layer_->snapshot().height : map_builder_->height());
+}
+
+void TerrainMapperNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+  const auto & orientation = msg->pose.pose.orientation;
+  const auto & position = msg->pose.pose.position;
+  const double norm_squared =
+    orientation.x * orientation.x + orientation.y * orientation.y +
+    orientation.z * orientation.z + orientation.w * orientation.w;
+  if (!std::isfinite(norm_squared) || norm_squared <= kQuaternionNormEpsilon ||
+    !std::isfinite(orientation.x) || !std::isfinite(orientation.y) ||
+    !std::isfinite(orientation.z) || !std::isfinite(orientation.w))
+  {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Rejected odometry with a non-finite or zero-norm orientation");
+    return;
+  }
+  if (flat_obstacle_mode_) {
+    if (!std::isfinite(position.x) || !std::isfinite(position.y) ||
+      !std::isfinite(position.z) || msg->header.frame_id != map_frame_ ||
+      msg->child_frame_id != body_frame_ || !validRosTimestamp(msg->header.stamp))
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Rejected flat-ground lock odometry with invalid position, frame, or timestamp");
+      return;
+    }
+    const rclcpp::Time current_time = now();
+    const rclcpp::Time odom_time(msg->header.stamp, current_time.get_clock_type());
+    const double odom_age = (current_time - odom_time).seconds();
+    if (!std::isfinite(odom_age) || odom_age > flat_max_odom_age_ || odom_age < -0.2) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Rejected flat-ground lock odometry with age %.3f s; accepted range is [-0.200, %.3f] s",
+        odom_age, flat_max_odom_age_);
+      return;
+    }
+  }
+
+  const double inverse_norm = 1.0 / std::sqrt(norm_squared);
+  const double x = orientation.x * inverse_norm;
+  const double y = orientation.y * inverse_norm;
+  const double z = orientation.z * inverse_norm;
+  const double w = orientation.w * inverse_norm;
+  robot_x_ = msg->pose.pose.position.x;
+  robot_y_ = msg->pose.pose.position.y;
+  robot_z_ = msg->pose.pose.position.z;
+  robot_yaw_ = std::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z));
+  have_odom_ = true;
+  if (flat_obstacle_mode_) {
+    FlatBodyPose pose;
+    pose.stamp = msg->header.stamp;
+    pose.x = position.x;
+    pose.y = position.y;
+    pose.z = position.z;
+    pose.yaw = robot_yaw_;
+    pose.qx = x;
+    pose.qy = y;
+    pose.qz = z;
+    pose.qw = w;
+    double pose_translation = 0.0;
+    double pose_angle = 0.0;
+    if (!flatPoseContinuous(pose, pose_translation, pose_angle)) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Flat obstacle body pose jumped by %.3f m / %.3f rad; invalidating the old map epoch",
+        pose_translation, pose_angle);
+      invalidateFlatEpoch(pose);
+    }
+    cacheFlatPose(pose);
+    processPendingFlatClouds(pose);
+  }
+}
+
+void TerrainMapperNode::cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
+{
+  // Super-LIO already publishes world-frame points. Reject mismatched frames instead of
+  // silently applying a stale or unavailable transform.
+  if (msg->header.frame_id != map_frame_) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Point cloud frame '%s' differs from map_frame '%s'; no TF is applied",
+      msg->header.frame_id.c_str(), map_frame_.c_str());
+    return;
+  }
+  if (!validRosTimestamp(msg->header.stamp)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Rejected point cloud with invalid timestamp sec=%d nanosec=%u",
+      msg->header.stamp.sec, msg->header.stamp.nanosec);
+    return;
+  }
+  const auto received_at = std::chrono::steady_clock::now();
+  if (flat_obstacle_mode_) {
+    const rclcpp::Time current_time = now();
+    const rclcpp::Time cloud_time(msg->header.stamp, current_time.get_clock_type());
+    const double header_age = (current_time - cloud_time).seconds();
+    if (!std::isfinite(header_age) || header_age > cloud_stale_warning_age_ ||
+      header_age < -0.2)
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Freezing flat obstacle layer for stale cloud: header_age=%.3f s, threshold=%.3f s",
+        header_age, cloud_stale_warning_age_);
+      return;
+    }
+    prunePendingFlatClouds(received_at);
+    const FlatBodyPose * pose = findFlatPose(msg->header.stamp);
+    if (pose == nullptr) {
+      queueFlatCloud(msg, received_at);
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Queued flat obstacle cloud until body odometry with the exact source timestamp arrives");
+      return;
+    }
+    processCloud(msg, pose, received_at);
+    return;
+  }
+
+  if (!have_odom_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 3000, "Waiting for odometry");
+    return;
+  }
+  processCloud(msg, nullptr, received_at);
+}
+
+void TerrainMapperNode::processCloud(
+  const sensor_msgs::msg::PointCloud2::SharedPtr & msg,
+  const FlatBodyPose * flat_pose,
+  std::chrono::steady_clock::time_point received_at)
+{
+  FlatBodyPose matched_flat_pose;
+  if (flat_obstacle_mode_) {
+    if (flat_pose == nullptr) {
+      return;
+    }
+    matched_flat_pose = *flat_pose;
+    flat_pose = &matched_flat_pose;
+    const rclcpp::Time current_time = now();
+    const rclcpp::Time cloud_time(msg->header.stamp, current_time.get_clock_type());
+    const double header_age = (current_time - cloud_time).seconds();
+    if (!std::isfinite(header_age) || header_age > cloud_stale_warning_age_ ||
+      header_age < -0.2)
+    {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Dropped queued flat obstacle cloud before processing: header_age=%.3f s, "
+        "threshold=%.3f s",
+        header_age, cloud_stale_warning_age_);
+      return;
+    }
+  }
+
+  const double stamp_seconds = timestampSeconds(msg->header.stamp);
+  int source_stamp_order = 1;
+  if (last_cloud_received_ != std::chrono::steady_clock::time_point{} &&
+    validRosTimestamp(last_cloud_stamp_))
+  {
+    const double previous_stamp_seconds = timestampSeconds(last_cloud_stamp_);
+    last_cloud_source_delta_ = stamp_seconds - previous_stamp_seconds;
+    last_cloud_receive_gap_ =
+      std::chrono::duration<double>(received_at - last_cloud_received_).count();
+    have_cloud_interval_ = true;
+    source_stamp_order = compareTimestamp(msg->header.stamp, last_cloud_stamp_);
+    if (!std::isfinite(last_cloud_source_delta_) || source_stamp_order == 0) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Rejected nonmonotonic terrain source cloud timestamp: source_delta=%.3f s, "
+        "receive_gap=%.3f s",
+        last_cloud_source_delta_, last_cloud_receive_gap_);
+      return;
+    }
+    if (source_stamp_order < 0 && !flat_obstacle_mode_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Rejected nonmonotonic terrain source cloud timestamp: source_delta=%.3f s, "
+        "receive_gap=%.3f s",
+        last_cloud_source_delta_, last_cloud_receive_gap_);
+      return;
+    }
+    if (source_stamp_order < 0) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Flat obstacle source clock moved backward by %.3f s; starting a new map epoch",
+        -last_cloud_source_delta_);
+      invalidateFlatEpoch(*flat_pose);
+    }
+    const bool exceeds_integration_window =
+      source_stamp_order > 0 && last_cloud_source_delta_ > integration_window_;
+    if (exceeds_integration_window) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Terrain source cloud timestamp discontinuity: source_delta=%.3f s, "
+        "receive_gap=%.3f s, integration_window=%.3f s",
+        last_cloud_source_delta_, last_cloud_receive_gap_, integration_window_);
+    }
+  }
+
+  const double pose_x = flat_pose == nullptr ? robot_x_ : flat_pose->x;
+  const double pose_y = flat_pose == nullptr ? robot_y_ : flat_pose->y;
+  const double pose_z = flat_pose == nullptr ? robot_z_ : flat_pose->z;
+  const double pose_yaw = flat_pose == nullptr ? robot_yaw_ : flat_pose->yaw;
+  sensor_msgs::PointCloud2ConstIterator<float> x(*msg, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> y(*msg, "y");
+  sensor_msgs::PointCloud2ConstIterator<float> z(*msg, "z");
+  std::vector<TerrainPoint> accepted_points;
+  accepted_points.reserve(msg->width * msg->height / 2);
+  const double cos_yaw = std::cos(pose_yaw);
+  const double sin_yaw = std::sin(pose_yaw);
+  for (; x != x.end(); ++x, ++y, ++z) {
+    if (!std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z)) {continue;}
+    if (flat_obstacle_mode_) {
+      accepted_points.push_back({*x, *y, *z});
+      continue;
+    }
+    const double dx = *x - pose_x;
+    const double dy = *y - pose_y;
+    const double dz = *z - pose_z;
+    const double range = std::hypot(dx, dy);
+    if (range < min_range_ || range > max_range_ ||
+      dz < min_z_relative_ || dz > max_z_relative_) {continue;}
+    const double body_x = cos_yaw * dx + sin_yaw * dy;
+    const double body_y = -sin_yaw * dx + cos_yaw * dy;
+    if (std::abs(body_x) < self_length_ * 0.5 &&
+      std::abs(body_y) < self_width_ * 0.5 &&
+      std::abs(dz) < self_height_ * 0.5) {continue;}
+    accepted_points.push_back({*x, *y, *z});
+  }
+  bool flat_timing_continuous = false;
+  if (flat_obstacle_mode_ && have_cloud_interval_) {
+    flat_timing_continuous =
+      source_stamp_order > 0 && last_cloud_source_delta_ <= cloud_stale_warning_age_ &&
+      last_cloud_source_delta_ <= integration_window_ && last_cloud_receive_gap_ >= 0.0 &&
+      last_cloud_receive_gap_ <= cloud_stale_warning_age_;
+  }
+  if (flat_obstacle_mode_) {
+    double pose_translation = 0.0;
+    double pose_angle = 0.0;
+    const bool pose_continuous =
+      flatPoseContinuous(*flat_pose, pose_translation, pose_angle);
+    FlatObstacleFrame frame;
+    frame.points = std::move(accepted_points);
+    frame.body_position = {flat_pose->x, flat_pose->y, flat_pose->z};
+    frame.body_yaw = flat_pose->yaw;
+    frame.sensor_origin = flatSensorOrigin(*flat_pose);
+    frame.stamp_seconds = stamp_seconds;
+    frame.timing_continuous = flat_timing_continuous && pose_continuous;
+    const auto update = flat_obstacle_layer_->update(frame);
+    if (!update.accepted) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Rejected flat obstacle layer update: status=%s reason=%s",
+        toString(update.status), update.reason.c_str());
+      return;
+    }
+    if (!update.usable) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Flat obstacle layer is fail-closed: status=%s reason=%s, "
+        "ground_candidates=%zu, ground_inliers=%zu, ground_rmse=%.4f, "
+        "ground_slope=(%.4f, %.4f)",
+        toString(update.status), update.reason.c_str(),
+        update.ground_plane.candidate_points, update.ground_plane.inlier_points,
+        update.ground_plane.rmse, update.ground_plane.slope_x,
+        update.ground_plane.slope_y);
+    }
+    if (update.reused_trusted_ground_plane) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Reused the validated world ground plane after the moving-frame fit was rejected: "
+        "reason=%s, support_cells=%zu, support_rmse=%.4f",
+        update.rejected_ground_fit_reason.c_str(),
+        update.ground_plane.inlier_points, update.ground_plane.rmse);
+    }
+    last_processed_flat_pose_ = *flat_pose;
+    have_processed_flat_pose_ = true;
+    last_in_map_cell_count_ = update.filtered_voxels;
+    last_accepted_point_count_ = frame.points.size();
+  } else {
+    last_in_map_cell_count_ = map_builder_->integrateFrame(accepted_points, stamp_seconds);
+    last_accepted_point_count_ = accepted_points.size();
+  }
+  last_cloud_stamp_ = msg->header.stamp;
+  last_cloud_received_ = received_at;
+}
+
+void TerrainMapperNode::cacheFlatPose(const FlatBodyPose & pose)
+{
+  const auto existing = std::find_if(
+    flat_odom_history_.begin(), flat_odom_history_.end(),
+    [&pose](const FlatBodyPose & candidate) {
+      return sameTimestamp(candidate.stamp, pose.stamp);
+    });
+  if (existing != flat_odom_history_.end()) {
+    *existing = pose;
+    return;
+  }
+  flat_odom_history_.push_back(pose);
+  while (flat_odom_history_.size() > kFlatOdomHistoryLimit) {
+    flat_odom_history_.pop_front();
+  }
+}
+
+const TerrainMapperNode::FlatBodyPose * TerrainMapperNode::findFlatPose(
+  const builtin_interfaces::msg::Time & stamp) const
+{
+  const auto found = std::find_if(
+    flat_odom_history_.rbegin(), flat_odom_history_.rend(),
+    [&stamp](const FlatBodyPose & pose) {return sameTimestamp(pose.stamp, stamp);});
+  return found == flat_odom_history_.rend() ? nullptr : &*found;
+}
+
+void TerrainMapperNode::queueFlatCloud(
+  const sensor_msgs::msg::PointCloud2::SharedPtr & msg,
+  std::chrono::steady_clock::time_point received_at)
+{
+  const auto duplicate = std::find_if(
+    pending_flat_clouds_.begin(), pending_flat_clouds_.end(),
+    [&msg](const PendingFlatCloud & pending) {
+      return sameTimestamp(pending.message->header.stamp, msg->header.stamp);
+    });
+  if (duplicate != pending_flat_clouds_.end()) {
+    return;
+  }
+  if (pending_flat_clouds_.size() >= kPendingFlatCloudLimit) {
+    pending_flat_clouds_.pop_front();
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Dropped oldest unmatched flat obstacle cloud because the bounded queue is full");
+  }
+  pending_flat_clouds_.push_back({msg, received_at});
+}
+
+void TerrainMapperNode::processPendingFlatClouds(const FlatBodyPose & pose)
+{
+  const auto current_time = std::chrono::steady_clock::now();
+  prunePendingFlatClouds(current_time);
+  for (auto pending = pending_flat_clouds_.begin(); pending != pending_flat_clouds_.end();) {
+    if (!sameTimestamp(pending->message->header.stamp, pose.stamp)) {
+      ++pending;
+      continue;
+    }
+    PendingFlatCloud matched = std::move(*pending);
+    pending = pending_flat_clouds_.erase(pending);
+    processCloud(matched.message, &pose, matched.received_at);
+    return;
+  }
+}
+
+void TerrainMapperNode::prunePendingFlatClouds(
+  std::chrono::steady_clock::time_point current_time)
+{
+  std::size_t dropped = 0U;
+  while (!pending_flat_clouds_.empty() &&
+    current_time - pending_flat_clouds_.front().received_at > kPendingFlatCloudMaxWait)
+  {
+    pending_flat_clouds_.pop_front();
+    ++dropped;
+  }
+  if (dropped != 0U) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Dropped %zu flat obstacle cloud(s) without exact-timestamp body odometry; "
+      "kept the last validated map epoch",
+      dropped);
+  }
+}
+
+bool TerrainMapperNode::flatPoseContinuous(
+  const FlatBodyPose & pose, double & translation, double & angle) const
+{
+  translation = 0.0;
+  angle = 0.0;
+  if (!have_processed_flat_pose_) {
+    return true;
+  }
+  translation = std::hypot(
+    std::hypot(
+      pose.x - last_processed_flat_pose_.x,
+      pose.y - last_processed_flat_pose_.y),
+    pose.z - last_processed_flat_pose_.z);
+  const double quaternion_dot = std::abs(
+    pose.qx * last_processed_flat_pose_.qx +
+    pose.qy * last_processed_flat_pose_.qy +
+    pose.qz * last_processed_flat_pose_.qz +
+    pose.qw * last_processed_flat_pose_.qw);
+  angle = 2.0 * std::acos(std::clamp(quaternion_dot, 0.0, 1.0));
+  return translation <= kFlatPoseJumpTranslation && angle <= kFlatPoseJumpAngle;
+}
+
+void TerrainMapperNode::invalidateFlatEpoch(const FlatBodyPose & pose)
+{
+  flat_obstacle_layer_->resetEpoch();
+  flat_odom_history_.clear();
+  pending_flat_clouds_.clear();
+  have_processed_flat_pose_ = false;
+  have_cloud_interval_ = false;
+  last_cloud_received_ = std::chrono::steady_clock::time_point{};
+  last_cloud_stamp_ = builtin_interfaces::msg::Time{};
+  last_accepted_point_count_ = 0U;
+  last_in_map_cell_count_ = 0U;
+  have_published_valid_flat_state_ = false;
+  last_published_valid_flat_stamp_ = builtin_interfaces::msg::Time{};
+
+  publishUnusableFlatState(pose.stamp);
+  RCLCPP_WARN(
+    get_logger(),
+    "Reset flat obstacle layer; waiting for a new exact-stamp cloud/odom pair");
+}
+
+void TerrainMapperNode::publishUnusableFlatState(
+  const builtin_interfaces::msg::Time & stamp,
+  bool publish_current_filtered_points)
+{
+  const auto snapshot = flat_obstacle_layer_->snapshot();
+  utree_dog_msgs::msg::TerrainGrid invalid_map;
+  invalid_map.header.stamp = stamp;
+  invalid_map.header.frame_id = map_frame_;
+  terrain_pub_->publish(invalid_map);
+  const std::vector<std::uint8_t> empty_mask;
+  flat_raw_pub_->publish(makeFlatCells(empty_mask, snapshot, stamp, 0.02));
+  flat_inflated_pub_->publish(makeFlatCells(empty_mask, snapshot, stamp, 0.01));
+  cost_pub_->publish(makeUnknownFlatCostmap(snapshot, stamp));
+  if (publish_current_filtered_points) {
+    flat_filtered_points_pub_->publish(makePointCloud(
+        snapshot.filtered_points, stamp, true));
+  } else {
+    flat_filtered_points_pub_->publish(makePointCloud({}, stamp, true));
+  }
+  flat_filtered_map_3d_pub_->publish(makePointCloud({}, stamp, false));
+}
+
+void TerrainMapperNode::publishMap()
+{
+  if (flat_obstacle_mode_) {
+    prunePendingFlatClouds(std::chrono::steady_clock::now());
+  }
+  const rclcpp::Time current_time = now();
+  bool source_is_fresh = true;
+  if (last_cloud_received_ == std::chrono::steady_clock::time_point{}) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Terrain map has not received an accepted world-frame point cloud");
+    return;
+  } else if (!validRosTimestamp(last_cloud_stamp_)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Terrain source cloud state has an invalid timestamp sec=%d nanosec=%u",
+      last_cloud_stamp_.sec, last_cloud_stamp_.nanosec);
+    return;
+  } else {
+    const rclcpp::Time cloud_time(last_cloud_stamp_, current_time.get_clock_type());
+    const double header_age = (current_time - cloud_time).seconds();
+    const double receive_gap = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - last_cloud_received_).count();
+    if (!std::isfinite(header_age) || !std::isfinite(receive_gap) ||
+      header_age > cloud_stale_warning_age_ || receive_gap > cloud_stale_warning_age_ ||
+      header_age < -0.2)
+    {
+      source_is_fresh = false;
+      const char * classification = "invalid_timing";
+      if (receive_gap > cloud_stale_warning_age_) {
+        classification = "accepted_cloud_callbacks_stopped";
+      } else if (header_age > cloud_stale_warning_age_) {
+        classification = "stale_source_stamp_or_cloud_backlog";
+      } else if (header_age < -0.2) {
+        classification = "source_stamp_from_future";
+      }
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Terrain source cloud timing is invalid: classification=%s, header_age=%.3f s, "
+        "receive_gap=%.3f s, warning threshold=%.3f s",
+        classification, header_age, receive_gap, cloud_stale_warning_age_);
+    }
+  }
+  if (flat_obstacle_mode_ && !source_is_fresh) {
+    if (have_published_valid_flat_state_) {
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 3000,
+        "Holding the last validated flat-obstacle publications at source stamp "
+        "%d.%09u while current cloud timing is invalid; the planner freshness "
+        "watchdog remains authoritative",
+        last_published_valid_flat_stamp_.sec,
+        last_published_valid_flat_stamp_.nanosec);
+    } else {
+      publishUnusableFlatState(last_cloud_stamp_);
+    }
+    return;
+  }
+  if (flat_obstacle_mode_) {
+    const auto snapshot = flat_obstacle_layer_->snapshot();
+    if (!snapshot.usable) {
+      if (have_published_valid_flat_state_) {
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 3000,
+          "Holding the last validated flat-obstacle publications at source stamp "
+          "%d.%09u while the current layer is unusable: status=%s reason=%s",
+          last_published_valid_flat_stamp_.sec,
+          last_published_valid_flat_stamp_.nanosec,
+          toString(snapshot.status), snapshot.reason.c_str());
+      } else {
+        publishUnusableFlatState(
+          last_cloud_stamp_, snapshot.status == FlatObstacleLayerStatus::kWarmingUp);
+      }
+      return;
+    }
+    have_published_valid_flat_state_ = true;
+    last_published_valid_flat_stamp_ = last_cloud_stamp_;
+    const auto terrain = makeFlatTerrain(snapshot, last_cloud_stamp_);
+    terrain_pub_->publish(terrain);
+    cost_pub_->publish(makeCostmap(terrain, &snapshot.inflated_obstacles));
+    flat_inflated_pub_->publish(makeFlatCells(
+        snapshot.inflated_obstacles, snapshot, last_cloud_stamp_, 0.01));
+    flat_raw_pub_->publish(makeFlatCells(
+        snapshot.raw_obstacles, snapshot, last_cloud_stamp_, 0.02));
+    if (flat_filtered_points_pub_->get_subscription_count() > 0U) {
+      flat_filtered_points_pub_->publish(makePointCloud(
+          snapshot.filtered_points, last_cloud_stamp_, true));
+    }
+    if (flat_filtered_map_3d_pub_->get_subscription_count() > 0U) {
+      flat_filtered_map_3d_pub_->publish(makePointCloud(
+          snapshot.obstacle_points, last_cloud_stamp_, false));
+    }
+    return;
+  }
+  const auto terrain = map_builder_->build(last_cloud_stamp_, map_frame_);
+  std::size_t observed_cells = 0;
+  std::size_t observation_ready_cells = 0;
+  std::size_t start_observation_ready_cells = 0;
+  std::size_t feature_ready_cells = 0;
+  std::size_t start_feature_ready_cells = 0;
+  std::uint16_t maximum_observation_count = 0U;
+  const auto minimum_observation_count = static_cast<std::size_t>(min_observed_frames_);
+  const auto layer_known = [&terrain](float value) {
+      return std::isfinite(value) && value != terrain.unknown_value;
+    };
+  for (std::size_t index = 0; index < terrain.observation_count.size(); ++index) {
+    const auto count = terrain.observation_count[index];
+    const std::size_t grid_x = index % terrain.width;
+    const std::size_t grid_y = index / terrain.width;
+    const double world_x =
+      terrain.origin_x + (static_cast<double>(grid_x) + 0.5) * terrain.resolution;
+    const double world_y =
+      terrain.origin_y + (static_cast<double>(grid_y) + 0.5) * terrain.resolution;
+    const bool in_start_radius =
+      std::hypot(world_x - robot_x_, world_y - robot_y_) <=
+      confidence_rebuild_start_radius_;
+    if (count > 0U) {++observed_cells;}
+    if (static_cast<std::size_t>(count) >= minimum_observation_count) {
+      ++observation_ready_cells;
+      if (in_start_radius) {++start_observation_ready_cells;}
+    }
+    if (layer_known(terrain.elevation[index]) && layer_known(terrain.slope[index]) &&
+      layer_known(terrain.roughness[index]) && layer_known(terrain.traversability[index]))
+    {
+      // Known unsafe terrain also ends the hold so new obstacles are published immediately.
+      ++feature_ready_cells;
+      if (in_start_radius) {++start_feature_ready_cells;}
+    }
+    maximum_observation_count = std::max(maximum_observation_count, count);
+  }
+  const bool current_scan_contributed = last_in_map_cell_count_ > 0U;
+  if (last_published_start_feature_ready_ && current_scan_contributed &&
+    start_feature_ready_cells == 0U)
+  {
+    confidence_rebuild_active_ = true;
+    ++suppressed_confidence_rebuild_maps_;
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 3000,
+      "Suppressing confidence-rebuild terrain map: observed_cells=%zu, "
+      "observation_ready_cells=%zu, start_observation_ready_cells=%zu, "
+      "feature_ready_cells=%zu, "
+      "start_feature_ready_cells=%zu, max_observation_count=%u, "
+      "min_observed_frames=%d, accepted_points=%zu, in_map_cells=%zu, "
+      "source_delta=%.3f s, receive_gap=%.3f s, suppressed_maps=%zu; "
+      "the last published map keeps its original source timestamp",
+      observed_cells, observation_ready_cells, start_observation_ready_cells,
+      feature_ready_cells, start_feature_ready_cells,
+      static_cast<unsigned int>(maximum_observation_count), min_observed_frames_,
+      last_accepted_point_count_, last_in_map_cell_count_,
+      have_cloud_interval_ ? last_cloud_source_delta_ : 0.0,
+      have_cloud_interval_ ? last_cloud_receive_gap_ : 0.0,
+      suppressed_confidence_rebuild_maps_);
+    return;
+  }
+  if (confidence_rebuild_active_) {
+    RCLCPP_INFO(
+      get_logger(),
+      "Terrain confidence rebuild ended: observed_cells=%zu, observation_ready_cells=%zu, "
+      "start_observation_ready_cells=%zu, feature_ready_cells=%zu, "
+      "start_feature_ready_cells=%zu, in_map_cells=%zu, suppressed_maps=%zu",
+      observed_cells, observation_ready_cells, start_observation_ready_cells,
+      feature_ready_cells, start_feature_ready_cells, last_in_map_cell_count_,
+      suppressed_confidence_rebuild_maps_);
+    confidence_rebuild_active_ = false;
+    suppressed_confidence_rebuild_maps_ = 0U;
+  }
+  last_published_start_feature_ready_ = start_feature_ready_cells > 0U;
+  terrain_pub_->publish(terrain);
+  cost_pub_->publish(makeCostmap(terrain));
+}
+
+utree_dog_msgs::msg::TerrainGrid TerrainMapperNode::makeFlatTerrain(
+  const FlatObstacleLayerSnapshot & snapshot,
+  const builtin_interfaces::msg::Time & stamp) const
+{
+  utree_dog_msgs::msg::TerrainGrid terrain;
+  terrain.header.stamp = stamp;
+  terrain.header.frame_id = map_frame_;
+  terrain.resolution = static_cast<float>(snapshot.resolution);
+  terrain.width = static_cast<std::uint32_t>(snapshot.width);
+  terrain.height = static_cast<std::uint32_t>(snapshot.height);
+  terrain.origin_x = static_cast<float>(snapshot.origin_x);
+  terrain.origin_y = static_cast<float>(snapshot.origin_y);
+  terrain.unknown_value = TerrainMapBuilder::kUnknown;
+  const std::size_t cell_count = snapshot.width * snapshot.height;
+  terrain.elevation.resize(cell_count);
+  terrain.variance.assign(cell_count, 0.0F);
+  terrain.slope.assign(cell_count, 0.0F);
+  terrain.roughness.assign(cell_count, 0.0F);
+  terrain.traversability.assign(cell_count, 1.0F);
+  terrain.observation_count.assign(cell_count, 1U);
+  terrain.confidence.assign(cell_count, 1.0F);
+  terrain.age.assign(cell_count, 0.0F);
+  for (std::size_t index = 0U; index < cell_count; ++index) {
+    const double x = snapshot.origin_x +
+      (static_cast<double>(index % snapshot.width) + 0.5) * snapshot.resolution;
+    const double y = snapshot.origin_y +
+      (static_cast<double>(index / snapshot.width) + 0.5) * snapshot.resolution;
+    terrain.elevation[index] = static_cast<float>(snapshot.ground_plane.heightAt(x, y));
+    if (snapshot.raw_obstacles[index] != 0U) {
+      terrain.traversability[index] = 0.0F;
+    }
+  }
+  return terrain;
+}
+
+nav_msgs::msg::OccupancyGrid TerrainMapperNode::makeCostmap(
+  const utree_dog_msgs::msg::TerrainGrid & terrain,
+  const std::vector<std::uint8_t> * inflated_obstacles) const
+{
+  nav_msgs::msg::OccupancyGrid result;
+  result.header = terrain.header;
+  result.info.resolution = terrain.resolution;
+  result.info.width = terrain.width;
+  result.info.height = terrain.height;
+  result.info.origin.position.x = terrain.origin_x;
+  result.info.origin.position.y = terrain.origin_y;
+  result.info.origin.orientation.w = 1.0;
+  if (flat_obstacle_mode_) {
+    if (inflated_obstacles == nullptr) {
+      throw std::invalid_argument("flat obstacle costmap requires an inflated mask");
+    }
+    result.data.resize(inflated_obstacles->size(), 0);
+    std::transform(
+      inflated_obstacles->begin(), inflated_obstacles->end(), result.data.begin(),
+      [](std::uint8_t occupied) {
+        return static_cast<std::int8_t>(occupied != 0U ? 100 : 0);
+      });
+    return result;
+  }
+  result.data.resize(terrain.traversability.size(), -1);
+  for (std::size_t i = 0; i < terrain.traversability.size(); ++i) {
+    if (terrain.traversability[i] != terrain.unknown_value) {
+      result.data[i] = static_cast<std::int8_t>(std::lround(
+        100.0 * (1.0 - std::clamp(terrain.traversability[i], 0.0F, 1.0F))));
+    }
+  }
+  return result;
+}
+
+nav_msgs::msg::GridCells TerrainMapperNode::makeFlatCells(
+  const std::vector<std::uint8_t> & mask,
+  const FlatObstacleLayerSnapshot & snapshot,
+  const builtin_interfaces::msg::Time & stamp, double z_offset) const
+{
+  nav_msgs::msg::GridCells result;
+  result.header.stamp = stamp;
+  result.header.frame_id = map_frame_;
+  result.cell_width = snapshot.resolution;
+  result.cell_height = snapshot.resolution;
+  result.cells.reserve(static_cast<std::size_t>(std::count_if(
+      mask.begin(), mask.end(), [](std::uint8_t value) {return value != 0U;})));
+  for (std::size_t index = 0; index < mask.size(); ++index) {
+    if (mask[index] == 0U) {
+      continue;
+    }
+    geometry_msgs::msg::Point point;
+    point.x = snapshot.origin_x +
+      (static_cast<double>(index % snapshot.width) + 0.5) * snapshot.resolution;
+    point.y = snapshot.origin_y +
+      (static_cast<double>(index / snapshot.width) + 0.5) * snapshot.resolution;
+    point.z = snapshot.ground_plane.heightAt(point.x, point.y) + z_offset;
+    result.cells.push_back(point);
+  }
+  return result;
+}
+
+nav_msgs::msg::OccupancyGrid TerrainMapperNode::makeUnknownFlatCostmap(
+  const FlatObstacleLayerSnapshot & snapshot,
+  const builtin_interfaces::msg::Time & stamp) const
+{
+  nav_msgs::msg::OccupancyGrid result;
+  result.header.stamp = stamp;
+  result.header.frame_id = map_frame_;
+  result.info.resolution = snapshot.resolution;
+  result.info.width = static_cast<std::uint32_t>(snapshot.width);
+  result.info.height = static_cast<std::uint32_t>(snapshot.height);
+  result.info.origin.position.x = snapshot.origin_x;
+  result.info.origin.position.y = snapshot.origin_y;
+  result.info.origin.orientation.w = 1.0;
+  result.data.assign(
+    snapshot.width * snapshot.height,
+    static_cast<std::int8_t>(-1));
+  return result;
+}
+
+sensor_msgs::msg::PointCloud2 TerrainMapperNode::makePointCloud(
+  const std::vector<TerrainPoint> & points,
+  const builtin_interfaces::msg::Time & stamp, bool downsample) const
+{
+  std::vector<const TerrainPoint *> selected;
+  if (downsample) {
+    double leaf_size = visualization_voxel_size_;
+    do {
+      selected.clear();
+      std::unordered_set<VisualizationVoxelKey, VisualizationVoxelKeyHash> occupied_leaves;
+      occupied_leaves.reserve(points.size());
+      for (const auto & point : points) {
+        const VisualizationVoxelKey key{
+          static_cast<std::int64_t>(std::floor(point.x / leaf_size)),
+          static_cast<std::int64_t>(std::floor(point.y / leaf_size)),
+          static_cast<std::int64_t>(std::floor(point.z / leaf_size))};
+        if (occupied_leaves.insert(key).second) {
+          selected.push_back(&point);
+        }
+      }
+      if (selected.size() <= visualization_max_points_) {
+        break;
+      }
+      leaf_size *= 2.0;
+    } while (std::isfinite(leaf_size));
+  } else {
+    selected.reserve(points.size());
+    for (const auto & point : points) {
+      selected.push_back(&point);
+    }
+  }
+
+  sensor_msgs::msg::PointCloud2 result;
+  result.header.stamp = stamp;
+  result.header.frame_id = map_frame_;
+  sensor_msgs::PointCloud2Modifier modifier(result);
+  modifier.setPointCloud2FieldsByString(1, "xyz");
+  modifier.resize(selected.size());
+  sensor_msgs::PointCloud2Iterator<float> x(result, "x");
+  sensor_msgs::PointCloud2Iterator<float> y(result, "y");
+  sensor_msgs::PointCloud2Iterator<float> z(result, "z");
+  for (const TerrainPoint * point : selected) {
+    *x = static_cast<float>(point->x);
+    *y = static_cast<float>(point->y);
+    *z = static_cast<float>(point->z);
+    ++x;
+    ++y;
+    ++z;
+  }
+  result.is_dense = true;
+  return result;
+}
+
+TerrainPoint TerrainMapperNode::flatSensorOrigin(const FlatBodyPose & pose) const
+{
+  const Quaternion world_from_body{pose.qx, pose.qy, pose.qz, pose.qw};
+  const double half_inverse_offset = -0.5 * body_yaw_offset_;
+  const Quaternion body_from_imu{
+    0.0, 0.0, std::sin(half_inverse_offset), std::cos(half_inverse_offset)};
+  const Quaternion world_from_imu = multiply(world_from_body, body_from_imu);
+  const TerrainPoint offset = rotate(
+    world_from_imu, {lidar_offset_x_, lidar_offset_y_, lidar_offset_z_});
+  return {pose.x + offset.x, pose.y + offset.y, pose.z + offset.z};
+}
+
+}  // namespace utree_dog_navigation

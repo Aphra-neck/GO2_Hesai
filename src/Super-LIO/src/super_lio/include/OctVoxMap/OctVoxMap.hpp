@@ -45,13 +45,13 @@ public:
   inline void try_insert(float dist2, const Point& pt) {
     const bool not_full = (count < K);
     const bool should_insert = not_full || (dist2 < max_dist2_);
-    
+
     if (should_insert) {
       const uint8_t insert_idx = not_full ? count : worst_;
-      
+
       dist2_[insert_idx] = dist2;
       points_[insert_idx] = pt;
-      
+
       if (not_full) {
         count++;
         if (dist2 > max_dist2_) {
@@ -67,16 +67,16 @@ public:
 private:
   inline void update_worst_unrolled() {
     float d0 = dist2_[0], d1 = dist2_[1], d2 = dist2_[2], d3 = dist2_[3], d4 = dist2_[4];
-    
+
     uint8_t idx01 = d0 > d1 ? 0 : 1;
     float max01 = d0 > d1 ? d0 : d1;
-    
+
     uint8_t idx23 = d2 > d3 ? 2 : 3;
     float max23 = d2 > d3 ? d2 : d3;
-    
+
     uint8_t idx0123 = max01 > max23 ? idx01 : idx23;
     float max0123 = max01 > max23 ? max01 : max23;
-    
+
     worst_ = max0123 > d4 ? idx0123 : 4;
     max_dist2_ = max0123 > d4 ? max0123 : d4;
   }
@@ -140,7 +140,7 @@ public:
   using OctVoxType = OctVox<Point>;
 
   struct Options {
-    float resolution      = 0.5;   
+    float resolution      = 0.5;
     std::size_t capacity  = 1000000;
 
     Options(float __resolution, std::size_t __capacity) {
@@ -149,7 +149,7 @@ public:
     }
   };
 
-  
+
 
   OctVoxMap() {
     flat_search_ptrs_.reserve(flat_search_order_offsets.size());
@@ -159,16 +159,16 @@ public:
     }
     group_idx_max_ = flat_search_order_offsets.size() - 1;
   }
-  
+
   ~OctVoxMap() {
     grids_.clear();
     data_.clear();
   }
-  
+
   OctVoxMap(Options options){
     SetOptions(options);
-    // std::cout << " ---> OctVoxMap init. Resolution: " << resolution_ 
-    //           << " Capacity: " << capacity_ << std::endl;
+    std::cout << " ---> OctVoxMap init. Resolution: " << resolution_
+              << " Capacity: " << capacity_ << std::endl;
     flat_search_ptrs_.reserve(flat_search_order_offsets.size());
     for(std::size_t i = 0; i < flat_search_order_offsets.size(); i++){
       uint16_t start = flat_search_order_offsets[i];
@@ -230,12 +230,12 @@ private:
 
   const KEY nearby_grids_[19] = {
     KEY(0, 0, 0),
-    KEY(-1, -1, 0), KEY(-1, 0, 0), KEY(-1, 1, 0), 
-    KEY(0, -1, 0), KEY(0, 1, 0), 
-    KEY(1, -1, 0), KEY(1, 0, 0), KEY(1, 1, 0), 
-    KEY(0, 0, -1), KEY(1, 0, -1), KEY(-1, 0, -1), 
-    KEY(0, 1, -1), KEY(0, -1, -1), 
-    KEY(0, 0, 1), KEY(1, 0, 1), KEY(-1, 0, 1), 
+    KEY(-1, -1, 0), KEY(-1, 0, 0), KEY(-1, 1, 0),
+    KEY(0, -1, 0), KEY(0, 1, 0),
+    KEY(1, -1, 0), KEY(1, 0, 0), KEY(1, 1, 0),
+    KEY(0, 0, -1), KEY(1, 0, -1), KEY(-1, 0, -1),
+    KEY(0, 1, -1), KEY(0, -1, -1),
+    KEY(0, 0, 1), KEY(1, 0, 1), KEY(-1, 0, 1),
     KEY(0, 1, 1), KEY(0, -1, 1)
   };
 
@@ -268,7 +268,7 @@ void OctVoxMap<Point, Scalar>::insert(const Points& cloud_world){
     if(reset_map_count_ > 0){
       std::cout << "OctVoxMap::insert skip: reset_map_count_ = " << reset_map_count_ << std::endl;
       return;
-    } 
+    }
     reset_map_ = false;
   }
 
@@ -290,7 +290,7 @@ void OctVoxMap<Point, Scalar>::insert(const Points& cloud_world){
         std::forward_as_tuple(key),
         std::forward_as_tuple(pt, local_idx));
       grids_.insert(std::make_pair(key, data_.begin()));
-      
+
       if (data_.size() >= capacity_) {
         grids_.erase(data_.back().first);
         data_.pop_back();
@@ -316,11 +316,11 @@ void OctVoxMap<Point, Scalar>::getTopK(const Point& point, KNNHeapType& top_K) c
   const int dz = fine_key[2] & 1;
   const int local_idx = (dz << 2) | (dy << 1) | dx;
   const KEY mirror_axis = KEY(1 - (dx << 1), 1 - (dy << 1), 1 - (dz << 1));
-  
+
   const int pre_voxel_ptr_size = 8;
   OctVoxType* top_voxels_2_search[pre_voxel_ptr_size];
   std::fill_n(top_voxels_2_search, pre_voxel_ptr_size, nullptr);
-  
+
   for(uint8_t i = 0; i < pre_voxel_ptr_size; ++i)
   {
     KEY delta_key = mirror_axis.cwiseProduct(HKNN_neighbor_voxel[i]);
@@ -339,7 +339,7 @@ void OctVoxMap<Point, Scalar>::getTopK(const Point& point, KNNHeapType& top_K) c
     while(group_it < group_end){
       const uint8_t neighbor_idx = *group_it++;
       uint8_t data_size = *group_it++;
-      
+
       if(neighbor_idx < pre_voxel_ptr_size)
       {
         OctVoxType* voxel_ptr = top_voxels_2_search[neighbor_idx];
@@ -432,7 +432,7 @@ void OctVoxMap<Point, Scalar>::getMap(std::vector<float>& output) const{
 template<typename Point, typename Scalar>
 void OctVoxMap<Point, Scalar>::resetMap(const std::vector<float>& input){
   if (input.empty()) return;
-  
+
   clear();
   size_t num_points = input.size() / 3;
 
@@ -464,9 +464,9 @@ void OctVoxMap<Point, Scalar>::saveMap() const {
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
   size_t total_points = data_.size() * 8;
-  
+
   cloud->points.reserve(total_points);
-  
+
   for (const auto& voxel_pair : data_) {
     const OctVoxType& voxel = voxel_pair.second;
     for(uint8_t i = 0; i < 8; ++i) {
@@ -479,15 +479,15 @@ void OctVoxMap<Point, Scalar>::saveMap() const {
       cloud->points.push_back(pcl_point);
     }
   }
-  
+
   cloud->width = cloud->points.size();
   cloud->height = 1;
   cloud->is_dense = true;
-  
+
   int result = pcl::io::savePCDFileBinary(filename, *cloud);
-  
+
   if (result == 0) {
-    std::cout << "Successfully saved " << cloud->points.size() 
+    std::cout << "Successfully saved " << cloud->points.size()
               << " points to " << filename << " (binary format)" << std::endl;
   } else {
     std::cerr << "Error saving point cloud to " << filename << std::endl;
@@ -505,7 +505,7 @@ void OctVoxMap<Point, Scalar>::clear() {
 
 template<typename Point, typename Scalar>
 void OctVoxMap<Point, Scalar>::printInfo() const {
-    std::cout << " ---> OctVoxMap info. Size: " << data_.size() 
+    std::cout << " ---> OctVoxMap info. Size: " << data_.size()
               << " Capacity: " << capacity_ << std::endl;
 }
 

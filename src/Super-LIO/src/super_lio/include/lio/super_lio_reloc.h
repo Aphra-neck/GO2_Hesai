@@ -29,7 +29,7 @@ private:
   bool kf_init() override;
   bool map_init() override;
   void UpdateMap() override;
-  void Output() override;
+  void Output(const PreparedStatePublication& prepared) override;
 
 private:
   BASIC::CloudPtr init_obs_data_;

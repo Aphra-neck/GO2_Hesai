@@ -4,6 +4,7 @@
 #define SUPER_LIO_H_
 
 #include <queue>
+#include <cstdint>
 #include <vector>
 #include <iostream>
 #include <cassert>
@@ -47,8 +48,8 @@ protected:
   void DownSample();
   void Observe();
   virtual void UpdateMap();
-  virtual void Output();
-  void caceData();
+  virtual void Output(const PreparedStatePublication& prepared);
+  void caceData(const PreparedStatePublication& prepared);
   void ProcessCaceMap();
 
   using StateFn = void (SuperLIO::*)();
@@ -79,6 +80,10 @@ protected:
   std::vector<std::pair<BASIC::M6, BASIC::V6>> H_R_;
   std::vector<std::array<double, 4>> abcd_vec_;
   int pcd_index_ = -1;
+
+  RuntimeTimingSample runtime_timing_sample_;
+  std::uint64_t runtime_frame_sequence_ = 0;
+  std::int64_t last_process_end_ns_ = 0;
 
   Timer time_record_;
 };

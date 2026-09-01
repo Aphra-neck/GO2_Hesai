@@ -7,12 +7,12 @@ lidar:
         device_ip_address: 192.168.123.20              # host_ip_address. If empty(""), the source ip of the udp point cloud is used
         udp_port: 2368                                # UDP destination port
         ptc_port: 9347                                # PTC port of lidar
-        multicast_ip_address: 255.255.255.255
+        multicast_ip_address: ""
 
         use_ptc_connected: true                       # Set to false when ptc connection is not used
         host_ptc_port: 0                              # PTC source port, 0 means auto
-        correction_file_path: "Your correction file path"   # The path of correction file
-        firetimes_path: "Your firetime file path"           # The path of firetimes file
+        correction_file_path: ""                            # Empty: read correction data from the lidar
+        firetimes_path: ""                                  # Optional local firetime correction file
 
         recv_point_cloud_timeout: -1                  # The timeout of receiving point cloud
         ptc_connect_timeout: -1                       # The timeout of ptc connection
@@ -52,7 +52,7 @@ lidar:
       use_timestamp_type: 1                 # 0 use point cloud timestamp; 1 use receive timestamp
       frame_start_azimuth: 0                # Frame azimuth for Pandar128, range from 1 to 359, set it less than 0 if you do not want to use it      
       # parser thread num
-      thread_num: 4
+      thread_num: 2
       # transform param
       transform_flag: false
       x: 0
@@ -64,7 +64,7 @@ lidar:
       # fov config, [fov_start, fov_end] range [1, 359], [-1, -1]means use default
       fov_start: -1
       fov_end:  -1
-      channel_fov_filter_path: "Your channel fov filter file path"  # The path of channel_fov_filter file, like channel 0 filter [10, 20] and [30,40]
+      channel_fov_filter_path: ""  # Optional per-channel FOV filter file
       multi_fov_filter_ranges: "" # compare to channel_fov_filter_path, multi_fov_filter_ranges for all channels. example config "[20,30];[40,200]"
       # other config
       enable_packet_loss_tool: true         # enable the udp packet loss detection tool

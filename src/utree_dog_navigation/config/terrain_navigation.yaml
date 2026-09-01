@@ -1,0 +1,147 @@
+body_odom_adapter:
+  ros__parameters:
+    input_odom_topic: /lio/odom
+    output_odom_topic: /lio/body_odom
+    world_frame: world
+    body_frame: base_link
+    # Go2 forward is clockwise 90 degrees from the raw Super-LIO IMU x-axis.
+    yaw_offset: -1.5707963267948966
+
+terrain_mapper:
+  ros__parameters:
+    # Operational default. Startup still requires flat_ground_confirmed=true.
+    planning_mode: flat_obstacle
+    enable_legacy_terrain: false
+    flat_ground_confirmed: false
+    map_frame: world
+    body_frame: base_link
+    cloud_topic: /lio/cloud_world
+    odom_topic: /lio/body_odom
+    resolution: 0.20
+    size_x: 40.0
+    size_y: 40.0
+    origin_x: -20.0
+    origin_y: -20.0
+    min_range: 0.35
+    max_range: 12.0
+    min_z_relative: -1.5
+    max_z_relative: 1.5
+    self_filter.length: 0.90
+    self_filter.width: 0.55
+    self_filter.height: 0.70
+    # Frame confidence is counted across scans; a sparse scan may contribute one point.
+    min_points_per_cell: 1
+    max_slope: 0.65
+    max_roughness: 0.08
+    max_step_height: 0.24
+    obstacle_height: 0.18
+    # XT-16 stair returns can be sparse. Fuse registered scans only within this window.
+    integration_window: 1.5
+    min_observed_frames: 4
+    height_bin_resolution: 0.015
+    confidence_frames: 8.0
+    publish_rate: 2.0
+    # Diagnostic only: warn when cloud delivery or its source stamp stops advancing.
+    cloud_stale_warning_age: 1.0
+    # Keep rebuild recovery aligned with body_lattice_planner.start_snap_radius.
+    # Commissioning mode uses a broad recovery window on sparse near-field maps.
+    confidence_rebuild.start_radius: 0.80
+    # flat_obstacle initializes a trusted world ground while the robot is
+    # standing. During motion it may reuse that plane only while the current
+    # synchronized cloud still provides the configured point/span support.
+    # Actual filtered Super-LIO obstacle points are projected into the planner.
+    flat_obstacle.min_height: 0.08
+    flat_obstacle.max_height: 0.80
+    # Keep vertical evidence separate so different-height returns cannot confirm
+    # or clear each other before the confirmed 3D voxels are projected to 2D.
+    flat_obstacle.voxel_resolution_z: 0.10
+    flat_obstacle.hit_confirmation_frames: 2
+    flat_obstacle.hit_confirmation_window: 0.35
+    flat_obstacle.clear_confirmation_frames: 2
+    flat_obstacle.clear_confirmation_window: 0.35
+    # Do not add a second grid-cell margin at the 0.20 m map resolution.
+    flat_obstacle.obstacle_clearance: 0.00
+    # Stationary XT-16 calibration: body z minus observed floor z.
+    flat_obstacle.nominal_body_height: 0.34
+    flat_obstacle.max_odom_age: 0.5
+    flat_obstacle.ground_fit.max_range: 3.0
+    flat_obstacle.ground_fit.seed_height_tolerance: 0.20
+    flat_obstacle.ground_fit.max_anchor_error: 0.06
+    # Only applies when accepting a coherent world-height shift through the body anchor.
+    flat_obstacle.ground_fit.max_body_clearance_change: 0.02
+    flat_obstacle.ground_fit.cell_size: 0.20
+    flat_obstacle.ground_fit.min_points: 24
+    flat_obstacle.ground_fit.min_span: 0.80
+    flat_obstacle.ground_fit.inlier_distance: 0.04
+    flat_obstacle.ground_fit.min_inlier_ratio: 0.55
+    flat_obstacle.ground_fit.max_rmse: 0.04
+    flat_obstacle.ground_fit.max_tilt: 0.20
+    # Filtered obstacle point visualization is independently downsampled and
+    # never feeds planning.
+    flat_obstacle.visualization.voxel_size: 0.30
+    flat_obstacle.visualization.max_points: 5000
+
+body_lattice_planner:
+  ros__parameters:
+    # Operational default. Startup still requires flat_ground_confirmed=true.
+    planning_mode: flat_obstacle
+    enable_legacy_terrain: false
+    flat_ground_confirmed: false
+    terrain_map_topic: terrain_map
+    odom_topic: /lio/body_odom
+    goal_topic: /goal_pose
+    path_topic: body_path
+    map_frame: world
+    body_frame: base_link
+    # Reject planning inputs whose sensor timestamps no longer advance. The
+    # watchdog clears a previously published transient-local path on timeout.
+    max_map_age: 1.0
+    max_odom_age: 0.5
+    # Goal headers must be fresh when received. At 0.20 m/s, 30 seconds was
+    # observed expiring valid routes before completion, so retain an accepted
+    # commissioning goal for two minutes while map/odometry watchdogs remain
+    # authoritative.
+    max_goal_age: 2.0
+    goal_retention_timeout: 120.0
+    timestamp_future_tolerance: 0.2
+    input_watchdog_rate: 10.0
+    yaw_bins: 16
+    motion_step: 0.20
+    nominal_body_height: 0.42
+    min_traversability: 0.18
+    max_step_height: 0.24
+    max_slope: 0.65
+    stair_height_threshold: 0.08
+    terrain_cost_weight: 4.0
+    slope_cost_weight: 1.5
+    height_cost_weight: 2.0
+    yaw_change_cost: 0.15
+    reverse_cost_factor: 1.15
+    lateral_cost_factor: 1.25
+    max_expansions: 250000
+    # XT-16 has an unobserved near-field ring around the body. Keep this
+    # Broad commissioning recovery; the connector is still collision checked.
+    start_snap_radius: 0.80
+    snap_radius: 0.80
+    # Central-torso envelope for open-field bring-up. Restore the measured
+    # leg-inclusive footprint before obstacle-rich deployment.
+    flat_obstacle.footprint_length: 0.60
+    flat_obstacle.footprint_width: 0.30
+    flat_obstacle.obstacle_clearance: 0.00
+    # If perception overlaps the measured body footprint, escape toward the
+    # nearest free start inside start_snap_radius instead of clearing the path.
+    flat_obstacle.recover_colliding_start: true
+    verified_flat_start.enabled: false
+    verified_flat_start.support_inner_radius: 1.0
+    verified_flat_start.support_outer_radius: 2.5
+    verified_flat_start.fill_radius: 1.35
+    verified_flat_start.sector_count: 8
+    verified_flat_start.min_supported_sectors: 7
+    verified_flat_start.min_cells_per_sector: 3
+    verified_flat_start.min_support_cells: 32
+    verified_flat_start.min_observation_count: 4
+    verified_flat_start.max_plane_slope: 0.15
+    verified_flat_start.max_plane_rmse: 0.04
+    verified_flat_start.max_plane_residual: 0.10
+    verified_flat_start.max_elevation_range: 0.18
+    verified_flat_start.inferred_traversability: 0.20

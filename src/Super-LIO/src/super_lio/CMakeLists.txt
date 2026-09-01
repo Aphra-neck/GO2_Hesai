@@ -1,99 +1,178 @@
 cmake_minimum_required(VERSION 3.16)
-project(super_lio)
+project(super_lio VERSION 2.0 LANGUAGES CXX C)
 
+option(SUPER_LIO_WITH_LIVOX "Build Livox CustomMsg input support" OFF)
+option(SUPER_LIO_ENABLE_LTO "Enable link-time optimization" OFF)
 
-#DEBUG CONFIGURATION
-# set(CMAKE_BUILD_TYPE "Debug")
-# set(CMAKE_CXX_STANDARD 17)
-# set(CMAKE_CXX_FLAGS_DEBUG "-O0 -Wall -g -pthread -fsanitize=address")
+set(CMAKE_SUPPRESS_DEVELOPER_WARNINGS 1 CACHE STRING "Suppress developer warnings" FORCE)
 
-set(CMAKE_BUILD_TYPE Release)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -pthread -fexceptions -flto=auto")
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_BUILD_TYPE "Release")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -pthread -fexceptions")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -Wall -fPIC")
 add_definitions(-DROOT=\"${CMAKE_CURRENT_SOURCE_DIR}/\")
 
-# Find packages
-find_package(Eigen3 REQUIRED)
-find_package(catkin REQUIRED COMPONENTS
-  roscpp
-  rospy
-  basic
-  pcl_ros
+if(SUPER_LIO_ENABLE_LTO)
+  include(CheckIPOSupported)
+  check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_ERROR)
+  if(NOT LTO_SUPPORTED)
+    message(FATAL_ERROR "LTO requested but unavailable: ${LTO_ERROR}")
+  endif()
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
+
+
+find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+find_package(builtin_interfaces REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(pcl_ros REQUIRED)
+find_package(tf2_ros REQUIRED)
+
+if(SUPER_LIO_WITH_LIVOX)
+  find_package(livox_ros_driver2 REQUIRED)
+endif()
+
+find_package(Eigen3 REQUIRED NO_MODULE)
+find_package(PCL REQUIRED)
+find_package(Glog REQUIRED)
+find_package(TBB REQUIRED)
+find_package(basic REQUIRED)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+endif()
+
+
+rosidl_generate_interfaces(${PROJECT_NAME}
+  msg/CloudPose.msg
+  msg/CloudPose2.msg
+  DEPENDENCIES std_msgs sensor_msgs geometry_msgs
+)
+
+rosidl_get_typesupport_target(
+  cpp_typesupport_target
+  ${PROJECT_NAME}
+  "rosidl_typesupport_cpp"
+)
+
+include_directories(
+  include
+  3rdparty
+  ${EIGEN3_INCLUDE_DIRS}
+  ${PCL_INCLUDE_DIRS}
+  ${Glog_INCLUDE_DIRS}
+)
+
+file(GLOB_RECURSE LIO_LIB_SRC "src/lio/*.cpp" "src/ros/*.cpp")
+file(GLOB_RECURSE LIO_LIB_HEADERS "include/lio/*.hpp" "include/lio/*.h")
+
+add_library(lio ${LIO_LIB_SRC} ${LIO_LIB_HEADERS})
+
+set(SUPER_LIO_ROS_DEPENDENCIES
+  builtin_interfaces
+  rclcpp
   std_msgs
   geometry_msgs
   sensor_msgs
   visualization_msgs
   nav_msgs
-  message_generation
-)
-find_package(PythonLibs REQUIRED)
-
-add_message_files(
-  FILES
-  CloudPose.msg
-  CloudPose2.msg
+  pcl_ros
+  tf2_ros
+  basic
 )
 
-generate_messages(
-  DEPENDENCIES
-  std_msgs
-  sensor_msgs
-  geometry_msgs
-)
+if(SUPER_LIO_WITH_LIVOX)
+  list(APPEND SUPER_LIO_ROS_DEPENDENCIES livox_ros_driver2)
+  target_compile_definitions(lio PUBLIC SUPER_LIO_HAS_LIVOX=1)
+endif()
 
-# Include directories for libraries
-include_directories(
-  ${catkin_INCLUDE_DIRS}
-  ${EIGEN3_INCLUDE_DIRS}
-  include
-  3rdparty
-)
+ament_target_dependencies(lio ${SUPER_LIO_ROS_DEPENDENCIES})
 
-# Package setup for catkin
-catkin_package(
-  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs message_runtime
-  DEPENDS EIGEN3 PCL
-  INCLUDE_DIRS include
-)
-
-# LIO library source files
-file(GLOB_RECURSE LIO_LIB_SRC "src/lio/*.cpp" "src/ros/*.cpp")
-
-file(GLOB_RECURSE LIO_LIB_HEADERS "include/lio/*.hpp" "include/lio/*.h")
-
-# library build
-add_library(lio ${LIO_LIB_SRC} ${LIO_LIB_HEADERS})
-
-# Target specific includes
-target_include_directories(lio PUBLIC
-  include
-  3rdparty
-  ${EIGEN3_INCLUDE_DIRS}
-  ${catkin_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
-)
-
-# Linking libraries
 target_link_libraries(lio
-  ${EIGEN3_LIBRARIES}
-  ${catkin_LIBRARIES}
+  Eigen3::Eigen
   ${PCL_LIBRARIES}
-  ${PYTHON_LIBRARIES}
-  tbb 
-  gflags 
   glog
+  TBB::tbb
+  pthread
+  ${cpp_typesupport_target}
 )
-
 
 add_executable(super_lio_node src/apps/super_lio_node.cpp)
 target_link_libraries(super_lio_node
   lio
-  ${catkin_LIBRARIES}
+  ${cpp_typesupport_target}
 )
-
 
 add_executable(relocation_node src/apps/relocation_node.cpp)
 target_link_libraries(relocation_node
   lio
-  ${catkin_LIBRARIES}
+  ${cpp_typesupport_target}
 )
+
+if(BUILD_TESTING)
+  ament_add_gtest(
+    test_measurement_synchronizer
+    test/test_measurement_synchronizer.cpp
+  )
+  target_include_directories(test_measurement_synchronizer PRIVATE include)
+
+  ament_add_gtest(test_runtime_timing test/test_runtime_timing.cpp)
+  target_include_directories(test_runtime_timing PRIVATE include)
+
+  ament_add_gtest(test_state_publication test/test_state_publication.cpp)
+  target_include_directories(test_state_publication PRIVATE include)
+  ament_target_dependencies(
+    test_state_publication
+    basic
+    builtin_interfaces
+    geometry_msgs
+    nav_msgs
+    sensor_msgs
+    std_msgs
+  )
+endif()
+
+install(TARGETS
+  lio
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+)
+
+install(TARGETS
+  super_lio_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(TARGETS
+  relocation_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY
+  include/
+  3rdparty/
+  DESTINATION include/${PROJECT_NAME}
+)
+
+install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+)
+
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
+)
+
+install(DIRECTORY rviz/
+  DESTINATION share/${PROJECT_NAME}/rviz
+)
+
+ament_package()

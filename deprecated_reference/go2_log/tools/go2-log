@@ -1,0 +1,3593 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+resolve_repository_root() {
+  local script_parent candidate
+  script_parent="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+  if [[ -n "${GO2_WORKSPACE:-}" ]]; then
+    candidate="${GO2_WORKSPACE}"
+  elif git -C "${script_parent}" rev-parse --show-toplevel >/dev/null 2>&1; then
+    candidate="$(git -C "${script_parent}" rev-parse --show-toplevel)"
+  elif git -C "${PWD}" rev-parse --show-toplevel >/dev/null 2>&1; then
+    candidate="$(git -C "${PWD}" rev-parse --show-toplevel)"
+  else
+    candidate="${PWD}"
+  fi
+  if [[ ! -d "${candidate}" ]]; then
+    echo "go2-log: workspace directory does not exist: ${candidate}" >&2
+    return 1
+  fi
+  (cd -- "${candidate}" && pwd)
+}
+
+REPO_ROOT="$(resolve_repository_root)"
+LOG_ROOT="${GO2_LOG_ROOT:-${HOME}/go2_logs}"
+SESSIONS_DIR="${LOG_ROOT}/sessions"
+ACTIVE_FILE="${LOG_ROOT}/active_session"
+LOCK_DIR="${LOG_ROOT}/.command-lock"
+LOCK_OWNER_FILE="${LOCK_DIR}/owner"
+LOG_REPO="${GO2_LOG_REPO:-${HOME}/G02_log}"
+LOG_REMOTE="${GO2_LOG_REMOTE:-https://github.com/Aphra-neck/G02_log.git}"
+LOG_BRANCH="${GO2_LOG_BRANCH:-main}"
+LOG_PROXY="${GO2_LOG_PROXY:-http://192.168.151.132:7890}"
+
+# Leave room for the independently bounded rosout and parameter-capture writers.
+readonly SESSION_STOP_BYTES=$((36 * 1024 * 1024))
+readonly SESSION_FINAL_BYTES=$((94 * 1024 * 1024))
+readonly SESSION_MAX_BYTES=$((100 * 1024 * 1024))
+readonly MAX_GIT_FILE_BYTES=$((40 * 1024 * 1024))
+readonly COMMAND_CAPTURE_BYTES=$((4 * 1024 * 1024))
+readonly PLANNER_RECORD_HEADROOM_BYTES=$((1 * 1024 * 1024))
+readonly TOPIC_TIMING_MAX_BYTES=$((4 * 1024 * 1024))
+readonly HESAI_TAIL_BYTES=$((256 * 1024))
+readonly MAX_LOCAL_SESSIONS=20
+
+PLANNER_RESULT_FILE=''
+PLANNER_ERROR_FILE=''
+PLANNER_SERIES_ID=''
+PLANNER_SERIES_INDEX=''
+PLANNER_SERIES_COUNT=''
+PLANNER_SERIES_INTERVAL_SEC=''
+
+# Bracket the first character so concurrent pgrep queries cannot match each other.
+readonly ROBOT_PROCESS_PATTERN='[h]esai_ros_driver_node|[g]o2_imu_bridge_node|[s]uper_lio_node|[b]ody_odom_adapter_node|[t]errain_mapper_node|[b]ody_lattice_planner_node|[g]o2_sdk2_bridge_node|[g]o2_sdk2_direct_bridge_node|[g]o2_sdk2_simple_nav_node|[r]l_controller_node|[u]tree_go2_rl_controller'
+readonly MOTION_PROCESS_PATTERN='[g]o2_sdk2_bridge_node|[g]o2_sdk2_direct_bridge_node|[g]o2_sdk2_simple_nav_node|[r]l_controller_node|[u]tree_go2_rl_controller'
+
+declare -ar COMPONENT_SPECS=(
+  'hesai_lidar:[h]esai_ros_driver_node'
+  'go2_imu_bridge:[g]o2_imu_bridge_node'
+  'super_lio:[s]uper_lio_node'
+  'body_odom_adapter:[b]ody_odom_adapter_node'
+  'terrain_mapper:[t]errain_mapper_node'
+  'body_lattice_planner:[b]ody_lattice_planner_node'
+  'go2_sdk2_bridge:[g]o2_sdk2_bridge_node'
+  'go2_sdk2_direct_bridge:[g]o2_sdk2_direct_bridge_node'
+  'go2_rl_controller:[r]l_controller_node|[u]tree_go2_rl_controller'
+)
+
+declare -ar REPAIRABLE_SESSION_TEXT_FILES=(
+  'topic_rates.csv'
+  'odom_position.csv'
+  'body_odom_pose.csv'
+  'sdk2_commands.csv'
+  'process_health.csv'
+  'topic_timing.csv'
+  'system_health.csv'
+  'network_health.csv'
+  'hesai_summary.csv'
+  'events.jsonl'
+  'planner_input_inspections.jsonl'
+  'rosout_warn_error.txt'
+  'collector.log'
+)
+
+die() {
+  echo "go2-log: $*" >&2
+  exit 1
+}
+
+utc_now() {
+  date -u +'%Y-%m-%dT%H:%M:%SZ'
+}
+
+ensure_directories() {
+  mkdir -p -- "${SESSIONS_DIR}"
+}
+
+process_start_ticks() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  local stat_line stat_tail
+  local -a stat_fields=()
+  IFS= read -r stat_line < "/proc/${pid}/stat" || return 1
+  # The comm field is parenthesized and may itself contain spaces or ')'.
+  # Strip through its final delimiter; starttime is field 20 of the tail
+  # because the tail begins with the process state (the kernel's field 3).
+  stat_tail="${stat_line##*) }"
+  read -r -a stat_fields <<< "${stat_tail}"
+  (( ${#stat_fields[@]} >= 20 )) || return 1
+  [[ "${stat_fields[19]}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${stat_fields[19]}"
+}
+
+process_state() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  local stat_line stat_tail
+  IFS= read -r stat_line < "/proc/${pid}/stat" || return 1
+  stat_tail="${stat_line##*) }"
+  [[ -n "${stat_tail}" ]] || return 1
+  printf '%s\n' "${stat_tail%% *}"
+}
+
+boot_id() {
+  read_first_line /proc/sys/kernel/random/boot_id
+}
+
+lock_owner_is_live() {
+  [[ -r "${LOCK_OWNER_FILE}" ]] || return 1
+  local key value owner_pid='' owner_boot='' owner_start=''
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      pid) owner_pid="${value}" ;;
+      boot_id) owner_boot="${value}" ;;
+      start_ticks) owner_start="${value}" ;;
+    esac
+  done < "${LOCK_OWNER_FILE}"
+
+  [[ "${owner_pid}" =~ ^[1-9][0-9]*$ && -n "${owner_boot}" && -n "${owner_start}" ]] || return 1
+  [[ "$(boot_id 2>/dev/null || true)" == "${owner_boot}" ]] || return 1
+  kill -0 "${owner_pid}" 2>/dev/null || return 1
+  [[ "$(process_start_ticks "${owner_pid}" 2>/dev/null || true)" == "${owner_start}" ]] || return 1
+  [[ -r "/proc/${owner_pid}/cmdline" ]] || return 1
+  local command_line
+  command_line="$(tr '\0' ' ' < "/proc/${owner_pid}/cmdline")"
+  [[ "${command_line}" == *"go2-log"* ]]
+}
+
+release_lock() {
+  [[ -d "${LOCK_DIR}" && -r "${LOCK_OWNER_FILE}" ]] || return 0
+  local owner_pid
+  owner_pid="$(awk -F= '$1 == "pid" {print $2; exit}' "${LOCK_OWNER_FILE}")"
+  [[ "${owner_pid}" == "$$" ]] || return 0
+  rm -f -- "${LOCK_OWNER_FILE}"
+  rmdir -- "${LOCK_DIR}" 2>/dev/null || true
+}
+
+cleanup_planner_temporaries() {
+  if [[ -n "${PLANNER_RESULT_FILE}" ]]; then
+    rm -f -- "${PLANNER_RESULT_FILE}"
+    PLANNER_RESULT_FILE=''
+  fi
+  if [[ -n "${PLANNER_ERROR_FILE}" ]]; then
+    rm -f -- "${PLANNER_ERROR_FILE}"
+    PLANNER_ERROR_FILE=''
+  fi
+}
+
+go2_log_exit_cleanup() {
+  cleanup_planner_temporaries
+  release_lock
+}
+
+acquire_lock() {
+  ensure_directories
+  local attempt stale_dir age_seconds modified_at owner_pid
+  for attempt in 1 2 3; do
+    if mkdir -- "${LOCK_DIR}" 2>/dev/null; then
+      local owner_temp="${LOCK_OWNER_FILE}.tmp.$$"
+      {
+        echo "pid=$$"
+        echo "boot_id=$(boot_id)"
+        echo "start_ticks=$(process_start_ticks "$$")"
+        echo "created_at=$(utc_now)"
+      } > "${owner_temp}"
+      mv -f -- "${owner_temp}" "${LOCK_OWNER_FILE}"
+      trap go2_log_exit_cleanup EXIT
+      return 0
+    fi
+
+    if lock_owner_is_live; then
+      owner_pid="$(awk -F= '$1 == "pid" {print $2; exit}' "${LOCK_OWNER_FILE}")"
+      die "another go2-log command is running (PID ${owner_pid})"
+    fi
+
+    # Do not reclaim a directory while its owner file may still be initialized.
+    modified_at="$(stat -c '%Y' -- "${LOCK_DIR}" 2>/dev/null || echo 0)"
+    age_seconds=$(( $(date +%s) - modified_at ))
+    if [[ ! -r "${LOCK_OWNER_FILE}" && ${age_seconds} -lt 10 ]]; then
+      die "another go2-log command is initializing its lock"
+    fi
+
+    stale_dir="${LOCK_DIR}.stale.$$-${attempt}"
+    if mv -- "${LOCK_DIR}" "${stale_dir}" 2>/dev/null; then
+      find "${stale_dir}" -mindepth 1 -maxdepth 1 -type f -delete
+      rmdir -- "${stale_dir}" || die "stale lock contains unexpected entries: ${stale_dir}"
+    fi
+  done
+  die "could not acquire the go2-log command lock"
+}
+
+checked_pgrep() {
+  local pattern="$1"
+  local matches='' status=0
+  if matches="$(pgrep -af -- "${pattern}" 2>/dev/null)"; then
+    status=0
+  else
+    status=$?
+  fi
+  case "${status}" in
+    0)
+      [[ -n "${matches}" ]] || return 2
+      printf '%s\n' "${matches}"
+      ;;
+    1)
+      [[ -z "${matches}" ]] || return 2
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+session_bytes() {
+  local session_dir="$1"
+  du -sb -- "${session_dir}" 2>/dev/null | awk '{print $1}' || echo 0
+}
+
+human_bytes() {
+  local bytes="$1"
+  if command -v numfmt >/dev/null 2>&1; then
+    numfmt --to=iec-i --suffix=B "${bytes}"
+  else
+    echo "${bytes} bytes"
+  fi
+}
+
+cap_text_file() {
+  local path="$1"
+  local max_bytes="${2:-${COMMAND_CAPTURE_BYTES}}"
+  [[ -f "${path}" && ! -L "${path}" ]] || return 0
+  local size
+  size="$(stat -c '%s' -- "${path}" 2>/dev/null || echo 0)"
+  (( size > max_bytes )) || return 0
+
+  python3 - "${path}" "${max_bytes}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+limit = int(sys.argv[2])
+marker = b"\n[go2-log: capture truncated to preserve the session size limit]\n"
+with path.open("rb") as stream:
+    data = stream.read(limit)
+prefix = data[: max(0, limit - len(marker))].decode("utf-8", errors="replace").encode("utf-8")
+while len(prefix) + len(marker) > limit:
+    prefix = prefix[:-1]
+temporary = path.with_name(path.name + ".bounded.tmp")
+temporary.write_bytes(prefix + marker)
+temporary.replace(path)
+PY
+}
+
+enforce_session_size_limit() {
+  local session_dir="$1"
+  local size protect_repair_outputs=false
+  if [[ -f "${session_dir}/repair_manifest.jsonl" && ! -L "${session_dir}/repair_manifest.jsonl" ]]; then
+    protect_repair_outputs=true
+  fi
+  size="$(session_bytes "${session_dir}")"
+  (( size <= SESSION_FINAL_BYTES )) && return 0
+
+  printf '%s session captures were trimmed on approach to the 100 MiB safety ceiling\n' \
+    "$(utc_now)" > "${session_dir}/capacity_reached.txt"
+  if [[ "${protect_repair_outputs}" != true ]]; then
+    cap_text_file "${session_dir}/rosout_warn_error.txt" $((16 * 1024 * 1024))
+    cap_text_file "${session_dir}/collector.log" $((4 * 1024 * 1024))
+  fi
+
+  local path
+  for path in git.txt ros_dds_environment.txt network.txt system.txt topics.txt nodes.txt capacity_reached.txt; do
+    cap_text_file "${session_dir}/${path}" $((1 * 1024 * 1024))
+  done
+  while IFS= read -r -d '' path; do
+    cap_text_file "${path}" $((512 * 1024))
+  done < <(find "${session_dir}" -maxdepth 1 -type f -name 'parameters_*.yaml' -print0)
+  for path in topic_rates.csv odom_position.csv body_odom_pose.csv sdk2_commands.csv process_health.csv topic_timing.csv system_health.csv network_health.csv hesai_summary.csv events.jsonl; do
+    [[ "${protect_repair_outputs}" != true ]] || continue
+    cap_text_file "${session_dir}/${path}" $((8 * 1024 * 1024))
+  done
+
+  # Deterministically shrink only collector-owned text outputs. Unknown files
+  # are never altered; they remain subject to the upload payload validator.
+  python3 - "${session_dir}" $((93 * 1024 * 1024)) <<'PY'
+from pathlib import Path
+import os
+import sys
+
+root = Path(sys.argv[1])
+target = int(sys.argv[2])
+owned_names = {
+    "git.txt", "ros_dds_environment.txt", "network.txt", "system.txt",
+    "topics.txt", "nodes.txt", "rosout_warn_error.txt", "collector.log",
+    "topic_rates.csv", "odom_position.csv", "body_odom_pose.csv", "sdk2_commands.csv",
+    "process_health.csv", "topic_timing.csv", "system_health.csv",
+    "network_health.csv", "hesai_summary.csv", "events.jsonl",
+    "capacity_reached.txt", "topic_timing_capacity_reached.txt",
+    "rosout.identity", "timing.identity",
+}
+repair_protected_names = {
+    "topic_rates.csv", "odom_position.csv", "body_odom_pose.csv",
+    "sdk2_commands.csv", "process_health.csv", "topic_timing.csv",
+    "system_health.csv", "network_health.csv", "hesai_summary.csv", "events.jsonl",
+    "rosout_warn_error.txt", "collector.log",
+}
+protect_repair_outputs = (root / "repair_manifest.jsonl").is_file()
+
+def files() -> list[Path]:
+    return [path for path in root.rglob("*") if path.is_file() and not path.is_symlink()]
+
+def is_owned_text(path: Path) -> bool:
+    relative = path.relative_to(root)
+    if len(relative.parts) == 1:
+        if protect_repair_outputs and path.name in repair_protected_names:
+            return False
+        return path.name in owned_names or (
+            path.name.startswith("parameters_") and path.suffix in {".yaml", ".tmp"}
+        )
+    return relative.parts[0] == "analysis" and path.suffix.lower() in {".md", ".csv", ".txt", ".json", ".jsonl"}
+
+current = sum(path.stat().st_size for path in files())
+marker = b"\n[go2-log: content trimmed to preserve the session size ceiling]\n"
+while current > target:
+    candidates = sorted(
+        (path for path in files() if is_owned_text(path) and path.stat().st_size > 4096),
+        key=lambda path: path.stat().st_size,
+        reverse=True,
+    )
+    if not candidates:
+        break
+    path = candidates[0]
+    old_size = path.stat().st_size
+    requested = max(4096, old_size - (current - target) - 1024 * 1024)
+    with path.open("rb") as stream:
+        data = stream.read(requested)
+    prefix = data[: max(0, requested - len(marker))].decode("utf-8", errors="replace").encode("utf-8")
+    while len(prefix) + len(marker) > requested:
+        prefix = prefix[:-1]
+    temporary = path.with_name(path.name + ".bounded.tmp")
+    temporary.write_bytes(prefix + marker)
+    temporary.replace(path)
+    current -= old_size - path.stat().st_size
+
+if current > target:
+    print("collector-owned text could not be compacted below the hard ceiling", file=sys.stderr)
+    raise SystemExit(1)
+PY
+
+  size="$(session_bytes "${session_dir}")"
+  if (( size > SESSION_FINAL_BYTES )); then
+    echo "go2-log: session still exceeds the 94 MiB finalized-session ceiling" >&2
+    return 1
+  fi
+}
+
+collector_is_running() {
+  local pid="$1"
+  local session_dir="$2"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+  [[ -r "/proc/${pid}/cmdline" ]] || return 1
+
+  local command_line
+  command_line="$(tr '\0' ' ' < "/proc/${pid}/cmdline")"
+  [[ "${command_line}" == *"go2-log"* ]] &&
+    [[ "${command_line}" == *"_collect"* ]] &&
+    [[ "${command_line}" == *"${session_dir}"* ]]
+}
+
+diagnostic_writer_identity_matches() {
+  local pid="$1"
+  local expected_boot_id="$2"
+  local expected_start_ticks="$3"
+  local session_dir="$4"
+  local subcommand="$5"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -n "${expected_boot_id}" && "${expected_start_ticks}" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "${session_dir}" && "${subcommand}" == _* ]] || return 1
+  [[ "$(boot_id 2>/dev/null || true)" == "${expected_boot_id}" ]] || return 1
+  kill -0 "${pid}" 2>/dev/null || return 1
+  [[ "$(process_start_ticks "${pid}" 2>/dev/null || true)" == "${expected_start_ticks}" ]] || return 1
+  [[ -r "/proc/${pid}/cmdline" ]] || return 1
+
+  local command_line
+  command_line="$(tr '\0' ' ' < "/proc/${pid}/cmdline")"
+  [[ "${command_line}" == *"go2-log"* ]] &&
+    [[ "${command_line}" == *"${subcommand}"* ]] &&
+    [[ "${command_line}" == *"${session_dir}"* ]]
+}
+
+rosout_identity_matches() {
+  diagnostic_writer_identity_matches "$@" _rosout
+}
+
+timing_identity_matches() {
+  diagnostic_writer_identity_matches "$@" _timing
+}
+
+write_diagnostic_writer_identity() {
+  local session_dir="$1"
+  local pid="$2"
+  local captured_boot_id="$3"
+  local captured_start_ticks="$4"
+  local writer_name="$5"
+  local pgid identity_file temporary
+  pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+  identity_file="${session_dir}/${writer_name}.identity"
+  temporary="${identity_file}.tmp.$$"
+  {
+    echo "pid=${pid}"
+    echo "boot_id=${captured_boot_id}"
+    echo "start_ticks=${captured_start_ticks}"
+    echo "pgid=${pgid:-unknown}"
+    echo "session_dir=${session_dir}"
+    echo "writer=${writer_name}"
+    echo "collector_pid=$$"
+    echo "captured_at=$(utc_now)"
+  } > "${temporary}"
+  mv -f -- "${temporary}" "${identity_file}"
+}
+
+write_rosout_identity() {
+  write_diagnostic_writer_identity "$@" rosout
+}
+
+write_timing_identity() {
+  write_diagnostic_writer_identity "$@" timing
+}
+
+capture_diagnostic_writer_identity() {
+  local pid="$1"
+  local session_dir="$2"
+  local writer_name="$3"
+  local subcommand="$4"
+  local attempt captured_boot_id captured_start_ticks
+  for (( attempt = 0; attempt < 100; attempt++ )); do
+    captured_boot_id="$(boot_id 2>/dev/null || true)"
+    captured_start_ticks="$(process_start_ticks "${pid}" 2>/dev/null || true)"
+    if diagnostic_writer_identity_matches \
+      "${pid}" "${captured_boot_id}" "${captured_start_ticks}" \
+      "${session_dir}" "${subcommand}"; then
+      write_diagnostic_writer_identity \
+        "${session_dir}" "${pid}" "${captured_boot_id}" \
+        "${captured_start_ticks}" "${writer_name}"
+      printf '%s %s\n' "${captured_boot_id}" "${captured_start_ticks}"
+      return 0
+    fi
+    kill -0 "${pid}" 2>/dev/null || return 1
+    sleep 0.02
+  done
+  return 1
+}
+
+capture_rosout_identity() {
+  capture_diagnostic_writer_identity "$@" rosout _rosout
+}
+
+capture_timing_identity() {
+  capture_diagnostic_writer_identity "$@" timing _timing
+}
+
+read_recorded_writer_pgid() {
+  local session_dir="$1"
+  local writer_name="$2"
+  local expected_pid="$3"
+  local expected_boot_id="$4"
+  local expected_start_ticks="$5"
+  local identity_file="${session_dir}/${writer_name}.identity"
+  [[ -f "${identity_file}" && ! -L "${identity_file}" ]] || return 1
+
+  local key value pid='' captured_boot_id='' captured_start_ticks=''
+  local pgid='' recorded_session='' recorded_writer=''
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      pid) pid="${value}" ;;
+      boot_id) captured_boot_id="${value}" ;;
+      start_ticks) captured_start_ticks="${value}" ;;
+      pgid) pgid="${value}" ;;
+      session_dir) recorded_session="${value}" ;;
+      writer) recorded_writer="${value}" ;;
+    esac
+  done < "${identity_file}"
+  [[ "${pid}" == "${expected_pid}" ]] || return 1
+  [[ "${captured_boot_id}" == "${expected_boot_id}" ]] || return 1
+  [[ "${captured_start_ticks}" == "${expected_start_ticks}" ]] || return 1
+  [[ "${pgid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "${recorded_session}" == "${session_dir}" ]] || return 1
+  [[ -z "${recorded_writer}" || "${recorded_writer}" == "${writer_name}" ]] || return 1
+  printf '%s\n' "${pgid}"
+}
+
+stop_diagnostic_writer_process() {
+  local pid="$1"
+  local expected_boot_id="$2"
+  local expected_start_ticks="$3"
+  local session_dir="$4"
+  local subcommand="$5"
+  local writer_name="${subcommand#_}"
+  local recorded_pgid=''
+  recorded_pgid="$(read_recorded_writer_pgid \
+    "${session_dir}" "${writer_name}" "${pid}" "${expected_boot_id}" \
+    "${expected_start_ticks}" 2>/dev/null || true)"
+
+  # Once the identity anchor is gone, never signal its old group: the numeric
+  # PGID may have been reused. A still-existing recorded group is fail-closed.
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    wait "${pid}" 2>/dev/null || true
+    if [[ "${recorded_pgid}" =~ ^[1-9][0-9]*$ ]] &&
+      kill -0 -- "-${recorded_pgid}" 2>/dev/null; then
+      return 1
+    fi
+    return 0
+  fi
+
+  local pgid leader_state
+  leader_state="$(process_state "${pid}" 2>/dev/null || true)"
+  pgid="$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "${leader_state}" == Z ]]; then
+    # A zombie has no cmdline, so anchor the group to its still-live kernel
+    # identity. Requiring a session leader prevents signalling a group which
+    # was inherited from an unrelated parent.
+    [[ "$(boot_id 2>/dev/null || true)" == "${expected_boot_id}" ]] || return 2
+    [[ "$(process_start_ticks "${pid}" 2>/dev/null || true)" == "${expected_start_ticks}" ]] ||
+      return 2
+    [[ "${pgid}" == "${pid}" ]] || return 2
+    [[ "${recorded_pgid}" == "${pgid}" ]] || return 2
+  else
+    diagnostic_writer_identity_matches \
+      "${pid}" "${expected_boot_id}" "${expected_start_ticks}" \
+      "${session_dir}" "${subcommand}" || return 2
+    if [[ -n "${recorded_pgid}" && "${recorded_pgid}" != "${pgid}" ]]; then
+      return 2
+    fi
+  fi
+
+  # Close the check-to-signal window as much as shell APIs allow. Never signal
+  # after any identity field changes, even if the numeric PID is still live.
+  if [[ "${leader_state}" == Z ]]; then
+    [[ "$(boot_id 2>/dev/null || true)" == "${expected_boot_id}" ]] || return 2
+    [[ "$(process_start_ticks "${pid}" 2>/dev/null || true)" == "${expected_start_ticks}" ]] ||
+      return 2
+    [[ "$(process_state "${pid}" 2>/dev/null || true)" == Z ]] || return 2
+    [[ "$(ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true)" == "${pgid}" ]] ||
+      return 2
+  else
+    diagnostic_writer_identity_matches \
+      "${pid}" "${expected_boot_id}" "${expected_start_ticks}" \
+      "${session_dir}" "${subcommand}" || return 2
+  fi
+  if [[ "${pgid}" == "${pid}" ]]; then
+    kill -TERM -- "-${pid}" 2>/dev/null || return 1
+  else
+    kill -TERM "${pid}" 2>/dev/null || return 1
+  fi
+  for _ in {1..50}; do
+    if [[ "${pgid}" == "${pid}" ]]; then
+      if ! kill -0 -- "-${pgid}" 2>/dev/null; then
+        wait "${pid}" 2>/dev/null || true
+        return 0
+      fi
+    elif ! diagnostic_writer_identity_matches \
+      "${pid}" "${expected_boot_id}" "${expected_start_ticks}" \
+      "${session_dir}" "${subcommand}"; then
+      wait "${pid}" 2>/dev/null || true
+      return 0
+    fi
+    if [[ "$(process_state "${pid}" 2>/dev/null || true)" == Z ]]; then
+      # Reap only when this shell is the parent. A surviving same-PGID child
+      # keeps the group probe alive, so reaping the leader cannot mask it.
+      wait "${pid}" 2>/dev/null || true
+    fi
+    sleep 0.1
+  done
+  wait "${pid}" 2>/dev/null || true
+  if [[ "${pgid}" == "${pid}" ]]; then
+    kill -0 -- "-${pgid}" 2>/dev/null && return 1
+  elif diagnostic_writer_identity_matches \
+    "${pid}" "${expected_boot_id}" "${expected_start_ticks}" \
+    "${session_dir}" "${subcommand}"; then
+    return 1
+  fi
+  return 0
+}
+
+stop_rosout_collector_process() {
+  stop_diagnostic_writer_process "$@" _rosout
+}
+
+stop_timing_sampler_process() {
+  stop_diagnostic_writer_process "$@" _timing
+}
+
+read_diagnostic_writer_identity() {
+  local session_dir="$1"
+  local writer_name="$2"
+  local identity_file="${session_dir}/${writer_name}.identity"
+  [[ -f "${identity_file}" && ! -L "${identity_file}" ]] || return 1
+  local key value pid='' captured_boot_id='' captured_start_ticks=''
+  local recorded_session='' recorded_writer=''
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      pid) pid="${value}" ;;
+      boot_id) captured_boot_id="${value}" ;;
+      start_ticks) captured_start_ticks="${value}" ;;
+      session_dir) recorded_session="${value}" ;;
+      writer) recorded_writer="${value}" ;;
+    esac
+  done < "${identity_file}"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "${captured_start_ticks}" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "${captured_boot_id}" && "${recorded_session}" == "${session_dir}" ]] || return 1
+  [[ -z "${recorded_writer}" || "${recorded_writer}" == "${writer_name}" ]] || return 1
+  printf '%s %s %s\n' "${pid}" "${captured_boot_id}" "${captured_start_ticks}"
+}
+
+read_rosout_identity() {
+  read_diagnostic_writer_identity "$1" rosout
+}
+
+read_timing_identity() {
+  read_diagnostic_writer_identity "$1" timing
+}
+
+active_session_dir() {
+  [[ -f "${ACTIVE_FILE}" ]] || return 1
+  local session_dir
+  IFS= read -r session_dir < "${ACTIVE_FILE}"
+  [[ -n "${session_dir}" && -d "${session_dir}" ]] || return 1
+  printf '%s\n' "${session_dir}"
+}
+
+read_first_line() {
+  local path="$1"
+  local value=''
+  [[ -r "${path}" ]] || return 1
+  IFS= read -r value < "${path}" || [[ -n "${value}" ]]
+  printf '%s\n' "${value}"
+}
+
+append_event() {
+  local session_dir="$1"
+  local level="$2"
+  local category="$3"
+  local message="$4"
+
+  (( $(session_bytes "${session_dir}") < SESSION_STOP_BYTES )) || return 0
+  python3 - "${session_dir}/events.jsonl" "${level}" "${category}" "${message}" <<'PY'
+import datetime
+import json
+import sys
+
+path, level, category, message = sys.argv[1:]
+record = {
+    "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    "level": level,
+    "category": category,
+    "message": message,
+}
+with open(path, "a", encoding="utf-8") as stream:
+    stream.write(json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n")
+PY
+}
+
+source_ros_environment() {
+  if command -v ros2 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  set +u
+  if [[ -f /opt/ros/humble/setup.bash ]]; then
+    # shellcheck disable=SC1091
+    source /opt/ros/humble/setup.bash
+  fi
+  if [[ -f "${REPO_ROOT}/install/setup.bash" ]]; then
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/install/setup.bash"
+  fi
+  set -u
+}
+
+validate_planner_session() {
+  local session_dir="$1"
+  local session_parent sessions_parent session_id
+
+  [[ -f "${ACTIVE_FILE}" && ! -L "${ACTIVE_FILE}" ]] ||
+    die "active-session state is missing or symbolic"
+  [[ -d "${session_dir}" && ! -L "${session_dir}" ]] ||
+    die "active diagnostic session is invalid or symbolic"
+  session_parent="$(cd -- "$(dirname -- "${session_dir}")" && pwd -P)"
+  sessions_parent="$(cd -- "${SESSIONS_DIR}" && pwd -P)"
+  [[ "${session_parent}" == "${sessions_parent}" ]] ||
+    die "active diagnostic session is outside the sessions directory"
+  session_id="$(basename -- "${session_dir}")"
+  validate_session_id "${session_id}"
+  [[ ! -e "${session_dir}/.uploaded" && ! -L "${session_dir}/.uploaded" ]] ||
+    die "active diagnostic session is already marked uploaded"
+  [[ ! -e "${session_dir}/ended_at.txt" && ! -L "${session_dir}/ended_at.txt" ]] ||
+    die "active diagnostic session already has an end marker"
+}
+
+assert_planner_check_motion_idle() {
+  local processes topic_list lowcmd_info publisher_count pgrep_status
+  set +e
+  processes="$(
+    pgrep -af "${MOTION_PROCESS_PATTERN}" 2>/dev/null
+  )"
+  pgrep_status=$?
+  set -e
+  if (( pgrep_status > 1 )); then
+    echo "Refusing planner check: motion process query failed." >&2
+    return 1
+  fi
+  [[ ${pgrep_status} -eq 1 && -z "${processes}" ]] || {
+    echo "Refusing planner check while a motion command process is running:" >&2
+    echo "${processes}" >&2
+    return 1
+  }
+
+  topic_list="$(
+    timeout 8 ros2 topic list --no-daemon --spin-time 3 2>/dev/null
+  )" || {
+    echo "Refusing planner check: ROS graph query failed." >&2
+    return 1
+  }
+  grep -Fxq '/lowcmd' <<< "${topic_list}" || return 0
+  lowcmd_info="$(
+    timeout 8 ros2 topic info --no-daemon --spin-time 3 -v /lowcmd 2>/dev/null
+  )" || {
+    echo "Refusing planner check: /lowcmd publisher query failed." >&2
+    return 1
+  }
+  publisher_count="$(
+    awk -F': *' '$1 == "Publisher count" {print $2; exit}' <<< "${lowcmd_info}"
+  )"
+  [[ "${publisher_count}" =~ ^[0-9]+$ ]] || {
+    echo "Refusing planner check: /lowcmd publisher count is unavailable." >&2
+    return 1
+  }
+  [[ "${publisher_count}" == 0 ]] || {
+    echo "Refusing planner check: /lowcmd has ${publisher_count} publisher(s)." >&2
+    return 1
+  }
+}
+
+record_planner_inspection() {
+  local session_dir="$1"
+  local exit_code="$2"
+  local result_file="$3"
+  local error_file="$4"
+  local log_path="${session_dir}/planner_input_inspections.jsonl"
+  local size
+
+  [[ "${exit_code}" =~ ^[0-9]+$ ]] || die "invalid planner-check exit code"
+  size="$(session_bytes "${session_dir}")"
+  (( size + PLANNER_RECORD_HEADROOM_BYTES < SESSION_STOP_BYTES )) ||
+    die "session is too close to its size limit for another planner inspection"
+
+  python3 - \
+    "${REPO_ROOT}/tools" \
+    "${log_path}" \
+    "${LOG_ROOT}" \
+    "${exit_code}" \
+    "${result_file}" \
+    "${error_file}" \
+    "${PLANNER_SERIES_ID}" \
+    "${PLANNER_SERIES_INDEX}" \
+    "${PLANNER_SERIES_COUNT}" \
+    "${PLANNER_SERIES_INTERVAL_SEC}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+(
+    tools_dir,
+    log_name,
+    temporary_directory,
+    raw_exit,
+    result_name,
+    error_name,
+    series_id,
+    raw_series_index,
+    raw_series_count,
+    raw_series_interval,
+) = sys.argv[1:]
+sys.path.insert(0, tools_dir)
+from inspect_planner_inputs import _write_session_record_atomic  # noqa: E402
+
+exit_code = int(raw_exit)
+result_text = Path(result_name).read_text(encoding="utf-8", errors="replace")
+error_text = Path(error_name).read_text(encoding="utf-8", errors="replace")
+inspection = None
+
+def reject_constant(value):
+    raise ValueError(f"invalid JSON numeric constant: {value}")
+
+try:
+    candidate = json.loads(
+        result_text,
+        parse_constant=reject_constant,
+    )
+    if isinstance(candidate, dict) and isinstance(candidate.get("diagnosis"), str):
+        inspection = candidate
+except (json.JSONDecodeError, ValueError):
+    pass
+
+if exit_code in {0, 2} and inspection is not None:
+    if series_id:
+        inspection["series"] = {
+            "id": series_id,
+            "index": int(raw_series_index),
+            "count": int(raw_series_count),
+            "interval_sec": float(raw_series_interval),
+        }
+    _write_session_record_atomic(
+        Path(log_name),
+        Path(temporary_directory),
+        exit_code,
+        inspection=inspection,
+    )
+    print(f"Planner inspection recorded: {log_name}")
+    print(f"Diagnosis: {inspection['diagnosis']}")
+else:
+    message = error_text.strip() or result_text.strip()
+    if not message:
+        message = f"inspector exited {exit_code} without diagnostic output"
+    _write_session_record_atomic(
+        Path(log_name),
+        Path(temporary_directory),
+        1,
+        error={
+            "type": "inspector_capture_error",
+            "message": message[:65536],
+        },
+    )
+    print(f"Planner inspection capture error recorded: {log_name}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+planner_check() {
+  local session_dir collector_pid current
+  local inspector_status tee_status postflight_error=''
+  local -a pipeline_status=()
+
+  session_dir="$(active_session_dir 2>/dev/null)" ||
+    die "no active diagnostic session; run ./tools/go2-log start first"
+  validate_planner_session "${session_dir}"
+  collector_pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+  collector_is_running "${collector_pid}" "${session_dir}" ||
+    die "active diagnostic collector is not healthy"
+  (( $(session_bytes "${session_dir}") + PLANNER_RECORD_HEADROOM_BYTES <
+      SESSION_STOP_BYTES )) ||
+    die "session is too close to its size limit for another planner inspection"
+  [[ -r "${REPO_ROOT}/tools/inspect_planner_inputs.py" ]] ||
+    die "planner input inspector is missing from ${REPO_ROOT}/tools"
+  [[ -r "${REPO_ROOT}/shell/ros2_environment.sh" ]] ||
+    die "ROS 2 environment helper is missing from ${REPO_ROOT}/shell"
+
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/shell/ros2_environment.sh"
+  command -v ros2 >/dev/null 2>&1 || die "ros2 is unavailable"
+  assert_planner_check_motion_idle || die "motion safety preflight failed"
+
+  trap go2_log_exit_cleanup EXIT
+  PLANNER_RESULT_FILE="$(mktemp --tmpdir go2-planner-result.XXXXXX)"
+  PLANNER_ERROR_FILE="$(mktemp --tmpdir go2-planner-error.XXXXXX)"
+
+  set +e
+  {
+    (
+      ulimit -f $((COMMAND_CAPTURE_BYTES / 1024))
+      exec python3 "${REPO_ROOT}/tools/inspect_planner_inputs.py" --json \
+        --record-start-on-goal-timeout \
+        --read-live-parameters \
+        "$@"
+    ) > "${PLANNER_RESULT_FILE}"
+  } 2>&1 | (
+    ulimit -f $((COMMAND_CAPTURE_BYTES / 1024))
+    exec tee -- "${PLANNER_ERROR_FILE}" >&2
+  )
+  pipeline_status=("${PIPESTATUS[@]}")
+  set -e
+  inspector_status="${pipeline_status[0]:-1}"
+  tee_status="${pipeline_status[1]:-1}"
+  if (( ${#pipeline_status[@]} != 2 || tee_status != 0 )); then
+    printf '%s\n' 'planner-check stderr streaming failed' >&2
+    printf '%s\n' 'planner-check stderr streaming failed' \
+      > "${PLANNER_ERROR_FILE}"
+    : > "${PLANNER_RESULT_FILE}"
+    inspector_status=1
+  fi
+
+  if ! postflight_error="$(assert_planner_check_motion_idle 2>&1)"; then
+    {
+      printf 'post-capture motion safety preflight failed\n'
+      printf '%s\n' "${postflight_error}"
+    } | tee "${PLANNER_ERROR_FILE}" >&2
+    : > "${PLANNER_RESULT_FILE}"
+    inspector_status=1
+  fi
+
+  acquire_lock
+  current="$(active_session_dir 2>/dev/null)" ||
+    die "diagnostic session stopped before planner inspection could be recorded"
+  [[ "${current}" == "${session_dir}" ]] ||
+    die "active diagnostic session changed during planner inspection"
+  validate_planner_session "${session_dir}"
+  collector_pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+  collector_is_running "${collector_pid}" "${session_dir}" ||
+    die "diagnostic collector stopped before planner inspection could be recorded"
+  record_planner_inspection \
+    "${session_dir}" "${inspector_status}" \
+    "${PLANNER_RESULT_FILE}" "${PLANNER_ERROR_FILE}"
+  cleanup_planner_temporaries
+  return "${inspector_status}"
+}
+
+validate_planner_series_schedule() {
+  python3 - "$1" "$2" <<'PY'
+import math
+import re
+import sys
+
+raw_samples, raw_interval = sys.argv[1:]
+if re.fullmatch(r"[0-9]+", raw_samples) is None:
+    raise SystemExit("samples must be an integer from 2 through 30")
+samples = int(raw_samples)
+if not 2 <= samples <= 30:
+    raise SystemExit("samples must be an integer from 2 through 30")
+
+if re.fullmatch(
+    r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?",
+    raw_interval,
+) is None:
+    raise SystemExit("interval must be a finite number from 0.5 through 5 seconds")
+interval = float(raw_interval)
+if not math.isfinite(interval) or not 0.5 <= interval <= 5.0:
+    raise SystemExit("interval must be a finite number from 0.5 through 5 seconds")
+if (samples - 1) * interval > 30.0:
+    raise SystemExit("planned series span must not exceed 30 seconds")
+
+print(f"{samples}\t{interval!r}")
+PY
+}
+
+planner_series() {
+  local samples=10 interval_sec=1.0 index inspector_status aggregate_status=0
+  local no_goal=false has_goal_x=false has_goal_y=false argument
+  local schedule_values
+  local -a inspector_arguments=()
+
+  while (( $# > 0 )); do
+    case "$1" in
+      --samples)
+        (( $# >= 2 )) || die "planner-series --samples requires a value"
+        samples="$2"
+        shift 2
+        ;;
+      --samples=*)
+        samples="${1#*=}"
+        shift
+        ;;
+      --interval)
+        (( $# >= 2 )) || die "planner-series --interval requires a value"
+        interval_sec="$2"
+        shift 2
+        ;;
+      --interval=*)
+        interval_sec="${1#*=}"
+        shift
+        ;;
+      *)
+        inspector_arguments+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+  if ! schedule_values="$(
+    validate_planner_series_schedule "${samples}" "${interval_sec}"
+  )"; then
+    die "invalid planner-series schedule"
+  fi
+  IFS=$'\t' read -r samples interval_sec <<< "${schedule_values}"
+
+  for argument in "${inspector_arguments[@]}"; do
+    case "${argument}" in
+      --no-goal)
+        no_goal=true
+        ;;
+      --goal-x|--goal-x=*)
+        has_goal_x=true
+        ;;
+      --goal-y|--goal-y=*)
+        has_goal_y=true
+        ;;
+    esac
+  done
+  if [[ "${no_goal}" == true ]]; then
+    [[ "${has_goal_x}" == false && "${has_goal_y}" == false ]] ||
+      die "planner-series --no-goal cannot be combined with manual goal coordinates"
+  elif [[ "${has_goal_x}" != true || "${has_goal_y}" != true ]]; then
+    die "planner-series requires --no-goal or both --goal-x and --goal-y"
+  fi
+
+  PLANNER_SERIES_ID="$(date -u +'%Y%m%dT%H%M%SZ')-$$"
+  PLANNER_SERIES_COUNT="${samples}"
+  PLANNER_SERIES_INTERVAL_SEC="${interval_sec}"
+
+  for (( index = 1; index <= samples; index++ )); do
+    PLANNER_SERIES_INDEX="${index}"
+    set +e
+    (set -e; planner_check "${inspector_arguments[@]}")
+    inspector_status=$?
+    set -e
+    case "${inspector_status}" in
+      0)
+        ;;
+      2)
+        aggregate_status=2
+        ;;
+      *)
+        return "${inspector_status}"
+        ;;
+    esac
+    if (( index < samples )); then
+      sleep "${interval_sec}"
+    fi
+  done
+
+  echo "Planner series complete: ${samples}/${samples} samples"
+  return "${aggregate_status}"
+}
+
+read_recorded_environment_value() {
+  local session_dir="$1"
+  local key="$2"
+  local line value=''
+  [[ -r "${session_dir}/ros_dds_environment.txt" ]] || return 1
+  while IFS= read -r line; do
+    if [[ "${line}" == "${key}="* ]]; then
+      value="${line#*=}"
+    fi
+  done < "${session_dir}/ros_dds_environment.txt"
+  [[ -n "${value}" ]] || return 1
+  printf '%s\n' "${value}"
+}
+
+record_active_runtime_overrides() {
+  local session_dir="$1"
+  local body_yaw_offset="${GO2_BODY_YAW_OFFSET_RAD:-}"
+  local lio_dense_output="${GO2_LIO_DENSE_OUTPUT:-}"
+  local recorded_dense_output=''
+
+  if [[ -n "${body_yaw_offset}" ]]; then
+    if [[ "${body_yaw_offset}" =~ ^[-+]?([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][-+]?[0-9]+)?$ ]]; then
+      printf 'GO2_BODY_YAW_OFFSET_RAD=%s\n' "${body_yaw_offset}" \
+        >> "${session_dir}/ros_dds_environment.txt"
+    else
+      append_event "${session_dir}" warning configuration \
+        "ignored invalid GO2_BODY_YAW_OFFSET_RAD from a repeated start command"
+    fi
+  fi
+
+  if [[ -n "${lio_dense_output}" ]]; then
+    case "${lio_dense_output}" in
+      true|false)
+        if recorded_dense_output="$(
+          read_recorded_environment_value \
+            "${session_dir}" GO2_LIO_DENSE_OUTPUT
+        )"; then
+          case "${recorded_dense_output}" in
+            true|false) ;;
+            *)
+              die "active diagnostic session has an invalid recorded GO2_LIO_DENSE_OUTPUT"
+              ;;
+          esac
+          if [[ "${recorded_dense_output}" != "${lio_dense_output}" ]]; then
+            die "active diagnostic session uses GO2_LIO_DENSE_OUTPUT=${recorded_dense_output}; stop it before changing to ${lio_dense_output}"
+          fi
+        else
+          printf 'GO2_LIO_DENSE_OUTPUT=%s\n' "${lio_dense_output}" \
+            >> "${session_dir}/ros_dds_environment.txt"
+        fi
+        ;;
+      *)
+        append_event "${session_dir}" warning configuration \
+          "ignored invalid GO2_LIO_DENSE_OUTPUT from a repeated start command"
+        ;;
+    esac
+  fi
+}
+
+capture_static_context() {
+  local session_dir="$1"
+  local session_id="$2"
+
+  python3 - "${session_dir}/metadata.json" "${session_id}" "$(utc_now)" \
+    "$(hostname)" "${REPO_ROOT}" <<'PY'
+import json
+import platform
+import sys
+
+path, session_id, started_at, hostname, repository = sys.argv[1:]
+record = {
+    "schema_version": 1,
+    "session_id": session_id,
+    "started_at": started_at,
+    "hostname": hostname,
+    "machine": platform.machine(),
+    "platform": platform.platform(),
+    "source_repository": repository,
+    "size_limit_bytes": 100 * 1024 * 1024,
+}
+with open(path, "w", encoding="utf-8") as stream:
+    json.dump(record, stream, ensure_ascii=True, indent=2)
+    stream.write("\n")
+PY
+
+  {
+    echo "captured_at=$(utc_now)"
+    echo "repository=${REPO_ROOT}"
+    echo "sha=$(git -C "${REPO_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "branch=$(git -C "${REPO_ROOT}" branch --show-current 2>/dev/null || echo unknown)"
+    echo "worktree_status:"
+    git -C "${REPO_ROOT}" status --short 2>/dev/null || true
+  } > "${session_dir}/git.txt"
+
+  env | LC_ALL=C sort | grep -E \
+    '^(ROS_|RMW_|CYCLONEDDS_URI=|FASTRTPS_DEFAULT_PROFILES_FILE=|FASTDDS_DEFAULT_PROFILES_FILE=|LD_LIBRARY_PATH=|GO2_NETWORK_INTERFACE=|GO2_IMU_RATE=|GO2_BODY_YAW_OFFSET_RAD=|GO2_LIO_DENSE_OUTPUT=)' \
+    > "${session_dir}/ros_dds_environment.txt" || true
+
+  {
+    echo "captured_at=$(utc_now)"
+    echo ""
+    echo "[addresses]"
+    ip -brief address 2>&1 || true
+    echo ""
+    echo "[routes]"
+    ip route 2>&1 || true
+    echo ""
+    echo "[neighbors]"
+    ip neigh 2>&1 || true
+  } > "${session_dir}/network.txt"
+
+  {
+    echo "captured_at=$(utc_now)"
+    uname -a
+    if command -v lsb_release >/dev/null 2>&1; then
+      lsb_release -a 2>&1 || true
+    fi
+  } > "${session_dir}/system.txt"
+
+  local context_file
+  for context_file in git.txt ros_dds_environment.txt network.txt system.txt; do
+    cap_text_file "${session_dir}/${context_file}"
+  done
+
+  printf 'timestamp,topic,average_hz,status\n' > "${session_dir}/topic_rates.csv"
+  local odometry_header
+  odometry_header='timestamp,topic,ros_stamp_ns,frame_id,child_frame_id,x,y,z,qx,qy,qz,qw,yaw,status'
+  printf '%s\n' "${odometry_header}" > "${session_dir}/odom_position.csv"
+  printf '%s\n' "${odometry_header}" > "${session_dir}/body_odom_pose.csv"
+  printf 'timestamp,vx,vy,yaw_rate,status\n' > "${session_dir}/sdk2_commands.csv"
+  printf 'timestamp,component,running,pids,states,cpu_percent_interval,rss_kib,threads,metrics_status\n' \
+    > "${session_dir}/process_health.csv"
+  printf '%s\n' \
+    'window_end,window_duration_sec,topic,status,message_count,first_receive_ns,last_receive_ns,first_header_ns,last_header_ns,latest_header_age_ms,header_span_ms,first_local_sequence,last_local_sequence,unique_header_count,duplicate_header_count,nonmonotonic_header_count,invalid_header_count,min_header_gap_ms,max_header_gap_ms,max_receive_gap_ms' \
+    > "${session_dir}/topic_timing.csv"
+  printf '%s\n' \
+    'timestamp,monotonic_ns,load1,load5,load15,mem_available_kib,swap_free_kib,thermal_max_millic,thermal_zone,status' \
+    > "${session_dir}/system_health.csv"
+  printf '%s\n' \
+    'timestamp,monotonic_ns,interface,operstate,carrier,rx_bytes,rx_packets,rx_errors,rx_dropped,tx_bytes,tx_packets,tx_errors,tx_dropped,status' \
+    > "${session_dir}/network_health.csv"
+  printf '%s\n' \
+    'timestamp,status,file_size_bytes,mtime_epoch,last_frame,frame_delta,last_points,last_packets,last_start_time,last_end_time,tail_warning_lines,tail_error_lines' \
+    > "${session_dir}/hesai_summary.csv"
+  : > "${session_dir}/events.jsonl"
+  : > "${session_dir}/planner_input_inspections.jsonl"
+  : > "${session_dir}/rosout_warn_error.txt"
+}
+
+capture_ros_graph() {
+  local session_dir="$1"
+  declare -n stop_requested_ref="$2"
+  command -v ros2 >/dev/null 2>&1 || return 0
+  (( $(session_bytes "${session_dir}") < SESSION_STOP_BYTES )) || return 0
+  (( stop_requested_ref == 0 )) || return 0
+
+  timeout 8 ros2 topic list --no-daemon --spin-time 3 -t \
+    > "${session_dir}/topics.txt.tmp" 2>&1 || true
+  if (( stop_requested_ref != 0 )); then
+    rm -f -- "${session_dir}/topics.txt.tmp"
+    return 0
+  fi
+  cap_text_file "${session_dir}/topics.txt.tmp"
+  mv -f -- "${session_dir}/topics.txt.tmp" "${session_dir}/topics.txt"
+
+  local nodes
+  nodes="$(timeout 8 ros2 node list --no-daemon --spin-time 3 2>/dev/null || true)"
+  (( stop_requested_ref == 0 )) || return 0
+  printf '%s\n' "${nodes}" > "${session_dir}/nodes.txt"
+  cap_text_file "${session_dir}/nodes.txt"
+
+  local node safe_name output_file param_status
+  while IFS= read -r node; do
+    (( stop_requested_ref == 0 )) || break
+    [[ "${node}" =~ (super_lio|body_odom_adapter|terrain_mapper|body_lattice_planner|go2_sdk2_bridge|go2_sdk2_direct_bridge|go2_imu_bridge|hesai_ros_driver) ]] || continue
+    safe_name="$(printf '%s' "${node#/}" | tr -c 'A-Za-z0-9_.-' '_')"
+    output_file="${session_dir}/parameters_${safe_name}.yaml"
+    [[ -f "${output_file}" ]] && continue
+    # Humble param dump creates two DirectNodes before querying services.
+    param_status=0
+    timeout 15 ros2 param dump --no-daemon --spin-time 3 "${node}" \
+      > "${output_file}.tmp" 2>&1 || param_status=$?
+    if (( stop_requested_ref != 0 )); then
+      rm -f -- "${output_file}.tmp"
+      break
+    fi
+    if (( param_status == 0 )) && [[ -s "${output_file}.tmp" ]]; then
+      cap_text_file "${output_file}.tmp"
+      mv -f -- "${output_file}.tmp" "${output_file}"
+    else
+      rm -f -- "${output_file}.tmp"
+      append_event "${session_dir}" warning collector \
+        "parameter capture for ${node} failed or was empty (exit ${param_status}); will retry"
+    fi
+  done <<< "${nodes}"
+}
+
+sample_topic_rate() {
+  local session_dir="$1"
+  local topic="$2"
+  local result rate status timestamp
+  timestamp="$(utc_now)"
+
+  if ! command -v ros2 >/dev/null 2>&1; then
+    rate=''
+    status=ros_unavailable
+  else
+    result="$(LC_ALL=C timeout 4 ros2 topic hz "${topic}" --window 100 2>&1 || true)"
+    rate="$(awk '/average rate:/ {value=$3} END {print value}' <<< "${result}")"
+    if [[ "${rate}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      status=ok
+    else
+      rate=''
+      status=no_data
+    fi
+  fi
+
+  printf '%s,%s,%s,%s\n' "${timestamp}" "${topic}" "${rate}" "${status}" \
+    >> "${session_dir}/topic_rates.csv"
+  if ! sync --data -- "${session_dir}/topic_rates.csv"; then
+    echo "go2-log: failed to fdatasync ${session_dir}/topic_rates.csv" >&2
+    return 1
+  fi
+}
+
+sample_odometry_pair() {
+  local session_dir="$1"
+  local timestamp
+  timestamp="$(utc_now)"
+  if ! timeout 5 python3 - \
+    "${session_dir}/odom_position.csv" \
+    "${session_dir}/body_odom_pose.csv" \
+    "${timestamp}" <<'PY'
+import csv
+import math
+from pathlib import Path
+import sys
+import time
+
+import rclpy
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+
+raw_path = Path(sys.argv[1])
+body_path = Path(sys.argv[2])
+captured_at = sys.argv[3]
+topics = ("/lio/odom", "/lio/body_odom")
+message_buffers = {topic: {} for topic in topics}
+latest_messages = {}
+node = None
+
+
+def blank_row(topic, status):
+    return [captured_at, topic, "", "", "", "", "", "", "", "", "", "", "", status]
+
+
+def encode(topic, message, status_override=None):
+    if message is None:
+        return blank_row(topic, "no_data")
+    position = message.pose.pose.position
+    orientation = message.pose.pose.orientation
+    values = [
+        float(position.x), float(position.y), float(position.z),
+        float(orientation.x), float(orientation.y),
+        float(orientation.z), float(orientation.w),
+    ]
+    stamp = message.header.stamp
+    stamp_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+    norm_squared = sum(value * value for value in values[3:])
+    status = "ok"
+    yaw = ""
+    if (
+        not all(math.isfinite(value) for value in values)
+        or not math.isfinite(norm_squared)
+        or abs(norm_squared - 1.0) > 1.0e-3
+        or stamp_ns <= 0
+        or not 0 <= int(stamp.nanosec) < 1_000_000_000
+    ):
+        status = "invalid_message"
+    else:
+        norm = math.sqrt(norm_squared)
+        qx, qy, qz, qw = (value / norm for value in values[3:])
+        yaw = math.atan2(
+            2.0 * (qw * qz + qx * qy),
+            1.0 - 2.0 * (qy * qy + qz * qz),
+        )
+        if status_override is not None:
+            status = status_override
+    return [
+        captured_at,
+        topic,
+        str(stamp_ns),
+        message.header.frame_id,
+        message.child_frame_id,
+        *values,
+        yaw,
+        status,
+    ]
+
+
+def valid_stamp_ns(message):
+    stamp = message.header.stamp
+    nanosec = int(stamp.nanosec)
+    stamp_ns = int(stamp.sec) * 1_000_000_000 + nanosec
+    if stamp_ns <= 0 or not 0 <= nanosec < 1_000_000_000:
+        return None
+    return stamp_ns
+
+
+def store(topic):
+    def callback(message):
+        latest_messages[topic] = message
+        stamp_ns = valid_stamp_ns(message)
+        if stamp_ns is None:
+            return
+        buffer = message_buffers[topic]
+        buffer[stamp_ns] = message
+        while len(buffer) > 64:
+            del buffer[min(buffer)]
+    return callback
+
+
+try:
+    rclpy.init(args=None)
+    node = Node("go2_log_odometry_sampler")
+    subscriptions = [
+        node.create_subscription(
+            Odometry,
+            topic,
+            store(topic),
+            qos_profile_sensor_data,
+        )
+        for topic in topics
+    ]
+    deadline = time.monotonic() + 3.0
+    matched_stamp = None
+    while time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        common_stamps = set(message_buffers[topics[0]]).intersection(
+            message_buffers[topics[1]]
+        )
+        if common_stamps:
+            matched_stamp = max(common_stamps)
+            break
+    if matched_stamp is None:
+        rows = [
+            encode(topic, latest_messages.get(topic), "unpaired_stamp")
+            for topic in topics
+        ]
+    else:
+        rows = [
+            encode(topic, message_buffers[topic][matched_stamp])
+            for topic in topics
+        ]
+except Exception as exception:
+    print(f"go2-log odometry sampler failed: {exception}", file=sys.stderr)
+    rows = [blank_row(topic, "sampler_error") for topic in topics]
+finally:
+    if node is not None:
+        node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+for path, row in zip((raw_path, body_path), rows):
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        csv.writer(stream, lineterminator="\n").writerow(row)
+PY
+  then
+    append_event "${session_dir}" warning collector \
+      "odometry sampler timed out or failed before writing samples"
+    python3 - \
+      "${session_dir}/odom_position.csv" \
+      "${session_dir}/body_odom_pose.csv" \
+      "${timestamp}" <<'PY'
+import csv
+from pathlib import Path
+import sys
+
+for path, topic in zip(map(Path, sys.argv[1:3]), ("/lio/odom", "/lio/body_odom")):
+    row = [sys.argv[3], topic, "", "", "", "", "", "", "", "", "", "", "", "sampler_error"]
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        csv.writer(stream, lineterminator="\n").writerow(row)
+PY
+  fi
+}
+
+sample_sdk2_command() {
+  local session_dir="$1"
+  local result vx vy yaw_rate status timestamp
+  timestamp="$(utc_now)"
+  if ! command -v ros2 >/dev/null 2>&1; then
+    printf '%s,,,,ros_unavailable\n' "${timestamp}" >> "${session_dir}/sdk2_commands.csv"
+    return 0
+  fi
+
+  result="$(timeout 3 ros2 topic echo --no-daemon --spin-time 1 --once \
+    /sdk2_command geometry_msgs/msg/TwistStamped --field twist 2>/dev/null || true)"
+  vx="$(awk '
+    /^linear:$/ {section="linear"; next}
+    /^angular:$/ {section="angular"; next}
+    $1 == "x:" && section == "linear" {print $2; exit}
+  ' <<< "${result}")"
+  vy="$(awk '
+    /^linear:$/ {section="linear"; next}
+    /^angular:$/ {section="angular"; next}
+    $1 == "y:" && section == "linear" {print $2; exit}
+  ' <<< "${result}")"
+  yaw_rate="$(awk '
+    /^linear:$/ {section="linear"; next}
+    /^angular:$/ {section="angular"; next}
+    $1 == "z:" && section == "angular" {print $2; exit}
+  ' <<< "${result}")"
+
+  if [[ "${vx}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] &&
+    [[ "${vy}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]] &&
+    [[ "${yaw_rate}" =~ ^-?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$ ]]; then
+    status=ok
+  else
+    vx=''
+    vy=''
+    yaw_rate=''
+    status=no_data
+  fi
+  printf '%s,%s,%s,%s,%s\n' \
+    "${timestamp}" "${vx}" "${vy}" "${yaw_rate}" "${status}" \
+    >> "${session_dir}/sdk2_commands.csv"
+}
+
+process_resource_sample() {
+  local pid="$1"
+  [[ -r "/proc/${pid}/stat" ]] || return 1
+  local stat_line stat_tail page_size
+  local -a fields=()
+  IFS= read -r stat_line < "/proc/${pid}/stat" || return 1
+  stat_tail="${stat_line##*) }"
+  read -r -a fields <<< "${stat_tail}"
+  (( ${#fields[@]} >= 22 )) || return 1
+  page_size="$(getconf PAGESIZE 2>/dev/null || printf '4096')"
+  printf '%s %s %s %s %s\n' \
+    "${fields[0]}" \
+    "${fields[19]}" \
+    "$(( fields[11] + fields[12] ))" \
+    "$(( fields[21] * page_size / 1024 ))" \
+    "${fields[17]}"
+}
+
+classify_process_metrics_status() {
+  local running="$1"
+  local failures="$2"
+  local cpu_clock_available="$3"
+  local metric_samples="$4"
+  local cpu_samples="$5"
+  if (( running == 0 )); then
+    printf 'stopped\n'
+  elif (( failures > 0 || cpu_clock_available == 0 )); then
+    printf 'partial\n'
+  elif (( cpu_samples == 0 )); then
+    printf 'baseline\n'
+  elif (( cpu_samples < metric_samples )); then
+    printf 'partial\n'
+  else
+    printf 'ok\n'
+  fi
+}
+
+sample_process_health() {
+  local session_dir="$1"
+  local timestamp="$2"
+  local spec component pattern pids running previous
+  declare -n previous_states_ref="$3"
+  declare -n previous_cpu_ref="$4"
+
+  local clock_ticks uptime_ticks
+  clock_ticks="$(getconf CLK_TCK 2>/dev/null || printf '100')"
+  uptime_ticks="$(LC_ALL=C awk -v hz="${clock_ticks}" \
+    '{printf "%.0f", $1 * hz}' /proc/uptime 2>/dev/null || true)"
+
+  for spec in "${COMPONENT_SPECS[@]}"; do
+    component="${spec%%:*}"
+    pattern="${spec#*:}"
+    pids="$(pgrep -f "${pattern}" 2>/dev/null | paste -sd ';' - || true)"
+    if [[ -n "${pids}" ]]; then
+      running=1
+    else
+      running=0
+    fi
+
+    local pid metrics state start_ticks process_ticks rss threads key prior
+    local prior_ticks prior_uptime delta_ticks delta_uptime
+    local states='' rss_total=0 thread_total=0 cpu_total='0'
+    local cpu_samples=0 metric_samples=0 failures=0 cpu_clock_available=0
+    [[ "${uptime_ticks}" =~ ^[0-9]+$ ]] && cpu_clock_available=1
+    while IFS= read -r pid; do
+      [[ -n "${pid}" ]] || continue
+      if ! metrics="$(process_resource_sample "${pid}" 2>/dev/null)"; then
+        failures=$((failures + 1))
+        continue
+      fi
+      read -r state start_ticks process_ticks rss threads <<< "${metrics}"
+      metric_samples=$((metric_samples + 1))
+      states+="${states:+;}${pid}:${state}"
+      rss_total=$((rss_total + rss))
+      thread_total=$((thread_total + threads))
+      key="${pid}:${start_ticks}"
+      prior="${previous_cpu_ref[${key}]:-}"
+      if [[ -n "${prior}" && "${uptime_ticks}" =~ ^[0-9]+$ ]]; then
+        read -r prior_ticks prior_uptime <<< "${prior}"
+        delta_ticks=$((process_ticks - prior_ticks))
+        delta_uptime=$((uptime_ticks - prior_uptime))
+        if (( delta_ticks >= 0 && delta_uptime > 0 )); then
+          cpu_total="$(LC_ALL=C awk \
+            -v total="${cpu_total}" -v work="${delta_ticks}" -v elapsed="${delta_uptime}" \
+            'BEGIN {printf "%.3f", total + 100.0 * work / elapsed}')"
+          cpu_samples=$((cpu_samples + 1))
+        fi
+      fi
+      if [[ "${uptime_ticks}" =~ ^[0-9]+$ ]]; then
+        previous_cpu_ref["${key}"]="${process_ticks} ${uptime_ticks}"
+      fi
+    done < <(tr ';' '\n' <<< "${pids}")
+
+    local cpu_value='' metrics_status
+    metrics_status="$(classify_process_metrics_status \
+      "${running}" "${failures}" "${cpu_clock_available}" \
+      "${metric_samples}" "${cpu_samples}")"
+    if [[ "${metrics_status}" == stopped ]]; then
+      rss_total=0
+      thread_total=0
+    elif (( cpu_samples > 0 )); then
+      cpu_value="${cpu_total}"
+    fi
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "${timestamp}" "${component}" "${running}" "${pids}" "${states}" \
+      "${cpu_value}" "${rss_total}" "${thread_total}" "${metrics_status}" \
+      >> "${session_dir}/process_health.csv"
+
+    previous="${previous_states_ref[${component}]:-unknown}"
+    if [[ "${previous}" != "${running}" ]]; then
+      if [[ "${running}" == 1 ]]; then
+        append_event "${session_dir}" info lifecycle "${component} started (pids=${pids})"
+      elif [[ "${previous}" != unknown ]]; then
+        append_event "${session_dir}" warning lifecycle "${component} stopped"
+      fi
+      previous_states_ref["${component}"]="${running}"
+    fi
+  done
+}
+
+sample_system_health() {
+  local session_dir="$1"
+  local timestamp="$2"
+  local monotonic_ns='' load1='' load5='' load15=''
+  local mem_available='' swap_free='' thermal_max='' thermal_zone='' status=ok
+  monotonic_ns="$(LC_ALL=C awk '{printf "%.0f", $1 * 1000000000}' \
+    /proc/uptime 2>/dev/null || true)"
+  read -r load1 load5 load15 _ < /proc/loadavg || status=partial
+  mem_available="$(awk '$1 == "MemAvailable:" {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+  swap_free="$(awk '$1 == "SwapFree:" {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+
+  local path value zone
+  for path in /sys/class/thermal/thermal_zone*/temp; do
+    [[ -r "${path}" ]] || continue
+    value="$(read_first_line "${path}" 2>/dev/null || true)"
+    [[ "${value}" =~ ^-?[0-9]+$ ]] || continue
+    zone="$(read_first_line "${path%/temp}/type" 2>/dev/null || basename "${path%/temp}")"
+    if [[ -z "${thermal_max}" ]] || (( value > thermal_max )); then
+      thermal_max="${value}"
+      thermal_zone="${zone//,/__}"
+    fi
+  done
+  [[ -n "${monotonic_ns}" && -n "${load1}" && -n "${mem_available}" ]] || status=partial
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "${timestamp}" "${monotonic_ns}" "${load1}" "${load5}" "${load15}" \
+    "${mem_available}" "${swap_free}" "${thermal_max}" "${thermal_zone}" "${status}" \
+    >> "${session_dir}/system_health.csv"
+}
+
+sample_network_health() {
+  local session_dir="$1"
+  local timestamp="$2"
+  local monotonic_ns path interface operstate carrier status field value
+  local -a fields=(rx_bytes rx_packets rx_errors rx_dropped tx_bytes tx_packets tx_errors tx_dropped)
+  monotonic_ns="$(LC_ALL=C awk '{printf "%.0f", $1 * 1000000000}' \
+    /proc/uptime 2>/dev/null || true)"
+  for path in /sys/class/net/*; do
+    [[ -d "${path}" ]] || continue
+    interface="$(basename -- "${path}")"
+    [[ "${interface}" != lo ]] || continue
+    operstate="$(read_first_line "${path}/operstate" 2>/dev/null || true)"
+    carrier="$(read_first_line "${path}/carrier" 2>/dev/null || true)"
+    status=ok
+    [[ "${monotonic_ns}" =~ ^[0-9]+$ && -n "${operstate}" && "${carrier}" =~ ^[01]$ ]] ||
+      status=partial
+    local -a values=()
+    for field in "${fields[@]}"; do
+      value="$(read_first_line "${path}/statistics/${field}" 2>/dev/null || true)"
+      [[ "${value}" =~ ^[0-9]+$ ]] || status=partial
+      values+=("${value}")
+    done
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+      "${timestamp}" "${monotonic_ns}" "${interface}" "${operstate}" "${carrier}" \
+      "${values[0]}" "${values[1]}" "${values[2]}" "${values[3]}" \
+      "${values[4]}" "${values[5]}" "${values[6]}" "${values[7]}" "${status}" \
+      >> "${session_dir}/network_health.csv"
+  done
+}
+
+sample_hesai_summary() {
+  local session_dir="$1"
+  local timestamp="$2"
+  declare -n previous_frame_ref="$3"
+  local log_path="${SLAM_LOG_DIR:-${HOME}/slam_logs}/hesai.log"
+  local status=missing size='' modified='' frame='' delta='' points='' packets=''
+  local start_time='' end_time='' warning_lines='' error_lines='' tail_text='' last_line=''
+  if [[ -f "${log_path}" && ! -L "${log_path}" ]]; then
+    size="$(stat -c '%s' -- "${log_path}" 2>/dev/null || true)"
+    modified="$(stat -c '%Y' -- "${log_path}" 2>/dev/null || true)"
+    tail_text="$(
+      LC_ALL=C tail -c "${HESAI_TAIL_BYTES}" -- "${log_path}" 2>/dev/null |
+        tail -n 512 || true
+    )"
+    last_line="$(awk '/raw frame:/ {line=$0} END {print line}' <<< "${tail_text}")"
+    warning_lines="$(grep -Eic 'warn|warning' <<< "${tail_text}" || true)"
+    error_lines="$(grep -Eic 'error|fatal|exception' <<< "${tail_text}" || true)"
+    if [[ "${last_line}" =~ raw[[:space:]]+frame:([0-9]+)[[:space:]]+points:([0-9]+)[[:space:]]+packet:([0-9]+)[[:space:]]+start[[:space:]]+time:([^[:space:]]+)[[:space:]]+end[[:space:]]+time:([^[:space:]]+) ]]; then
+      frame="${BASH_REMATCH[1]}"
+      points="${BASH_REMATCH[2]}"
+      packets="${BASH_REMATCH[3]}"
+      start_time="${BASH_REMATCH[4]}"
+      end_time="${BASH_REMATCH[5]}"
+      status=ok
+      if [[ "${previous_frame_ref}" =~ ^[0-9]+$ ]]; then
+        if (( frame >= previous_frame_ref )); then
+          delta=$((frame - previous_frame_ref))
+        else
+          status=frame_reset
+        fi
+      fi
+      previous_frame_ref="${frame}"
+    else
+      status=unparsed
+    fi
+  fi
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "${timestamp}" "${status}" "${size}" "${modified}" "${frame}" "${delta}" \
+    "${points}" "${packets}" "${start_time}" "${end_time}" \
+    "${warning_lines}" "${error_lines}" >> "${session_dir}/hesai_summary.csv"
+}
+
+run_topic_timing_sampler() {
+  local session_dir="$1"
+  local timing_file="${session_dir}/topic_timing.csv"
+  local status=0
+  # TERM at seven seconds and KILL one second later bounds even a stuck helper
+  # to eight seconds of wall-clock time.
+  if [[ -n "${GO2_TOPIC_TIMING_COMMAND:-}" ]]; then
+    timeout --foreground --kill-after=1 7 "${GO2_TOPIC_TIMING_COMMAND}" \
+      --timing-csv "${timing_file}" \
+      --rates-csv "${session_dir}/topic_rates.csv" \
+      --duration 5 --max-bytes "${TOPIC_TIMING_MAX_BYTES}" || status=$?
+  else
+    local helper="${REPO_ROOT}/tools/sample_topic_timing.py"
+    [[ -r "${helper}" ]] || helper="${SCRIPT_DIR}/sample_topic_timing.py"
+    timeout --foreground --kill-after=1 7 python3 "${helper}" \
+      --timing-csv "${timing_file}" \
+      --rates-csv "${session_dir}/topic_rates.csv" \
+      --duration 5 --max-bytes "${TOPIC_TIMING_MAX_BYTES}" || status=$?
+  fi
+  return "${status}"
+}
+
+sample_topic_timing() {
+  local session_dir="$1"
+  declare -n timing_pid_ref="$2"
+  declare -n timing_boot_id_ref="$3"
+  declare -n timing_start_ticks_ref="$4"
+  local timing_file="${session_dir}/topic_timing.csv"
+  local marker="${session_dir}/topic_timing_capacity_reached.txt"
+  local size
+  size="$(stat -c '%s' -- "${timing_file}" 2>/dev/null || printf '0')"
+  if (( size >= TOPIC_TIMING_MAX_BYTES )); then
+    [[ -f "${marker}" ]] || printf '%s topic timing capture reached %s bytes\n' \
+      "$(utc_now)" "${TOPIC_TIMING_MAX_BYTES}" > "${marker}"
+    return 0
+  fi
+
+  if ! command -v setsid >/dev/null 2>&1; then
+    append_event "${session_dir}" warning collector \
+      "topic timing sampler skipped because setsid is unavailable"
+    return 0
+  fi
+
+  local status=0 timing_identity=''
+  setsid "${SCRIPT_DIR}/go2-log" _timing "${session_dir}" &
+  timing_pid_ref="$!"
+  if timing_identity="$(capture_timing_identity "${timing_pid_ref}" "${session_dir}")"; then
+    read -r timing_boot_id_ref timing_start_ticks_ref <<< "${timing_identity}"
+  elif kill -0 "${timing_pid_ref}" 2>/dev/null; then
+    append_event "${session_dir}" warning collector \
+      "could not capture the complete timing identity for PID ${timing_pid_ref}"
+  fi
+  wait "${timing_pid_ref}" 2>/dev/null || status=$?
+  if ! kill -0 "${timing_pid_ref}" 2>/dev/null ||
+    [[ "$(process_state "${timing_pid_ref}" 2>/dev/null || true)" == Z ]]; then
+    rm -f -- "${session_dir}/timing.identity"
+    timing_pid_ref=''
+    timing_boot_id_ref=''
+    timing_start_ticks_ref=''
+  fi
+
+  if (( status == 3 )); then
+    [[ -f "${marker}" ]] || printf '%s topic timing capture reached its file ceiling\n' \
+      "$(utc_now)" > "${marker}"
+  elif (( status != 0 )); then
+    append_event "${session_dir}" warning collector \
+      "topic timing sampler failed with exit ${status}"
+  fi
+}
+
+run_rosout_collector() {
+  local session_dir="$1"
+  command -v ros2 >/dev/null 2>&1 || exit 0
+
+  # A 32 MiB per-file ceiling stays inside the headroom above the stop threshold.
+  ulimit -f 32768 2>/dev/null || true
+  ros2 topic echo --no-daemon --spin-time 3 /rosout 2>/dev/null | awk '
+    BEGIN { RS="---[[:space:]]*\n"; ORS="---\n" }
+    /(^|\n)level: (30|40|50)(\n|$)/ { print; fflush() }
+  ' >> "${session_dir}/rosout_warn_error.txt"
+}
+
+run_collector() {
+  local session_dir="$1"
+  local session_id
+  session_id="$(basename -- "${session_dir}")"
+  source_ros_environment
+
+  local stop_requested=0
+  local rosout_pid=''
+  local rosout_boot_id=''
+  local rosout_start_ticks=''
+  local timing_pid=''
+  local timing_boot_id=''
+  local timing_start_ticks=''
+  # Passed by name to sample_process_health via Bash's declare -n.
+  # shellcheck disable=SC2034
+  declare -A previous_states=()
+  # shellcheck disable=SC2034
+  declare -A previous_cpu_samples=()
+  local previous_hesai_frame=''
+
+  request_stop() {
+    stop_requested=1
+  }
+
+  finish_collector() {
+    local writer_cleanup_failed=0
+    if [[ -n "${timing_pid}" ]]; then
+      local timing_stop_status=0
+      if [[ -n "${timing_boot_id}" && -n "${timing_start_ticks}" ]]; then
+        stop_timing_sampler_process \
+          "${timing_pid}" "${timing_boot_id}" "${timing_start_ticks}" "${session_dir}" ||
+          timing_stop_status=$?
+      else
+        timing_stop_status=2
+      fi
+      if (( timing_stop_status == 2 )); then
+        writer_cleanup_failed=1
+        append_event "${session_dir}" warning collector \
+          "timing identity mismatch for PID ${timing_pid}; no signal was sent"
+      elif (( timing_stop_status != 0 )); then
+        writer_cleanup_failed=1
+        append_event "${session_dir}" warning collector \
+          "failed to stop the verified timing process PID ${timing_pid}"
+      else
+        rm -f -- "${session_dir}/timing.identity"
+      fi
+      timing_pid=''
+    fi
+    if [[ -n "${rosout_pid}" ]]; then
+      local rosout_stop_status=0
+      stop_rosout_collector_process \
+        "${rosout_pid}" "${rosout_boot_id}" "${rosout_start_ticks}" "${session_dir}" ||
+        rosout_stop_status=$?
+      if (( rosout_stop_status == 2 )); then
+        writer_cleanup_failed=1
+        append_event "${session_dir}" warning collector \
+          "rosout identity mismatch for PID ${rosout_pid}; no signal was sent"
+      elif (( rosout_stop_status != 0 )); then
+        writer_cleanup_failed=1
+        append_event "${session_dir}" warning collector \
+          "failed to stop the verified rosout process PID ${rosout_pid}"
+      fi
+      rosout_pid=''
+    fi
+    append_event "${session_dir}" info collector "collector stopped"
+    printf '%s\n' "$(utc_now)" > "${session_dir}/ended_at.txt"
+    enforce_session_size_limit "${session_dir}" ||
+      echo "WARNING: preserve the oversized session with SCP: ${session_dir}" >&2
+    if [[ -f "${ACTIVE_FILE}" ]] && [[ "$(< "${ACTIVE_FILE}")" == "${session_dir}" ]]; then
+      local remaining_writers='' all_auxiliary_writers=''
+      if ! all_auxiliary_writers="$(running_auxiliary_diagnostic_writers)"; then
+        writer_cleanup_failed=1
+        append_event "${session_dir}" warning collector \
+          "diagnostic writer process query failed; active-session state was preserved"
+      else
+        remaining_writers="$(
+          grep -F -- "${session_dir}" <<< "${all_auxiliary_writers}" || true
+        )"
+      fi
+      if (( writer_cleanup_failed == 0 )) && [[ -z "${remaining_writers}" ]]; then
+        rm -f -- "${ACTIVE_FILE}"
+      else
+        append_event "${session_dir}" warning collector \
+          "active-session state preserved because a diagnostic writer is still running"
+      fi
+    fi
+  }
+
+  trap request_stop INT TERM
+  trap finish_collector EXIT
+
+  if command -v setsid >/dev/null 2>&1 && command -v ros2 >/dev/null 2>&1; then
+    setsid "${SCRIPT_DIR}/go2-log" _rosout "${session_dir}" &
+    rosout_pid="$!"
+    printf '%s\n' "${rosout_pid}" > "${session_dir}/rosout.pid"
+    local rosout_identity
+    if rosout_identity="$(capture_rosout_identity "${rosout_pid}" "${session_dir}")"; then
+      read -r rosout_boot_id rosout_start_ticks <<< "${rosout_identity}"
+    else
+      append_event "${session_dir}" warning collector \
+        "could not capture the complete rosout identity for PID ${rosout_pid}"
+    fi
+  fi
+
+  append_event "${session_dir}" info collector "collector started"
+  local graph_cycle=0 size timestamp topic
+  while (( stop_requested == 0 )); do
+    size="$(session_bytes "${session_dir}")"
+    if (( size >= SESSION_STOP_BYTES )); then
+      printf '%s session collection stopped at %s to enforce the 100 MiB limit\n' \
+        "$(utc_now)" "$(human_bytes "${size}")" > "${session_dir}/capacity_reached.txt"
+      break
+    fi
+
+    timestamp="$(utc_now)"
+    sample_process_health \
+      "${session_dir}" "${timestamp}" previous_states previous_cpu_samples
+    sample_system_health "${session_dir}" "${timestamp}"
+    sample_network_health "${session_dir}" "${timestamp}"
+    sample_hesai_summary "${session_dir}" "${timestamp}" previous_hesai_frame
+    sample_topic_timing \
+      "${session_dir}" timing_pid timing_boot_id timing_start_ticks
+    (( stop_requested == 0 )) || break
+
+    if (( graph_cycle % 4 == 0 )); then
+      capture_ros_graph "${session_dir}" stop_requested
+    fi
+    (( stop_requested == 0 )) || break
+    graph_cycle=$((graph_cycle + 1))
+
+    for topic in /imu/data /lio/odom /lio/body_odom /body_path /terrain_costmap /sdk2_command; do
+      (( stop_requested == 0 )) || break
+      (( $(session_bytes "${session_dir}") < SESSION_STOP_BYTES )) || break
+      sample_topic_rate "${session_dir}" "${topic}"
+    done
+    (( stop_requested == 0 )) || break
+    sample_odometry_pair "${session_dir}"
+    (( stop_requested == 0 )) || break
+    sample_sdk2_command "${session_dir}"
+
+    local slept=0
+    while (( slept < 10 && stop_requested == 0 )); do
+      sleep 1
+      slept=$((slept + 1))
+    done
+  done
+
+  # On a normal return, run cleanup while this function's local state is still
+  # in scope. The EXIT trap remains the fallback for errors and abrupt exits.
+  finish_collector
+  trap - EXIT INT TERM
+}
+
+write_start_result() {
+  local result_file="$1"
+  local ownership="$2"
+  local session_dir="$3"
+  [[ -n "${result_file}" ]] || return 0
+
+  local session_id result_temp
+  session_id="$(basename -- "${session_dir}")"
+  [[ "${ownership}" == created || "${ownership}" == existing ]] ||
+    die "invalid diagnostic start ownership result: ${ownership}"
+  [[ -n "${session_id}" && "${session_id}" != *$'\n'* &&
+      "${session_dir}" != *$'\n'* ]] ||
+    die "diagnostic start result contains an invalid session value"
+  [[ -d "$(dirname -- "${result_file}")" ]] ||
+    die "diagnostic start result directory does not exist: $(dirname -- "${result_file}")"
+
+  result_temp="$(mktemp -- "${result_file}.tmp.XXXXXX")" ||
+    die "could not create diagnostic start result temporary file"
+  chmod 0600 -- "${result_temp}" || {
+    rm -f -- "${result_temp}"
+    die "could not protect diagnostic start result temporary file"
+  }
+  if ! {
+    echo 'format=go2-log-start-v1'
+    echo "ownership=${ownership}"
+    echo "session_id=${session_id}"
+    echo "session_dir=${session_dir}"
+  } > "${result_temp}"; then
+    rm -f -- "${result_temp}"
+    die "could not write diagnostic start result"
+  fi
+  if ! mv -f -- "${result_temp}" "${result_file}"; then
+    rm -f -- "${result_temp}"
+    die "could not publish diagnostic start result"
+  fi
+}
+
+start_session() {
+  local result_file="${1:-}"
+  acquire_lock
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+
+  local current pid writers
+  if current="$(active_session_dir 2>/dev/null)"; then
+    pid="$(read_first_line "${current}/collector.pid" 2>/dev/null || true)"
+    if collector_is_running "${pid}" "${current}"; then
+      record_active_runtime_overrides "${current}"
+      write_start_result "${result_file}" existing "${current}"
+      echo "Diagnostic session is already running: $(basename -- "${current}")"
+      echo "Directory: ${current}"
+      echo "Collector PID: ${pid}"
+      return 0
+    fi
+    die "active diagnostic session is stale ($(basename -- "${current}")); run './tools/go2-log stop' before starting a new session"
+  fi
+
+  if ! writers="$(running_diagnostic_writers)"; then
+    die "diagnostic writer process query failed before starting a session"
+  fi
+  if [[ -n "${writers}" ]]; then
+    echo "${writers}" >&2
+    die "live diagnostic writer exists without active-session state; inspect and stop it before starting a new session"
+  fi
+
+  cleanup_uploaded_sessions 19
+  local session_count
+  session_count="$(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '.\n' | wc -l)"
+  if (( session_count >= MAX_LOCAL_SESSIONS )); then
+    die "${session_count} unuploaded sessions are retained; upload one before starting another"
+  fi
+
+  source_ros_environment
+  command -v ros2 >/dev/null 2>&1 || die "ROS 2 Humble environment is required"
+  command -v sync >/dev/null 2>&1 || die "GNU sync is required"
+  sync --help 2>&1 | grep -Fq -- '--data' ||
+    die "sync must support --data for durable topic-rate logging"
+  python3 -c 'import rclpy; from nav_msgs.msg import Odometry' >/dev/null 2>&1 ||
+    die "ROS 2 Python packages rclpy and nav_msgs are required"
+
+  local host session_id session_dir temp_active collector_pid
+  host="$(hostname -s | tr -d '\n' | tr -c 'A-Za-z0-9_.-' '-')"
+  session_id="$(date -u +'%Y%m%dT%H%M%SZ')-${host}-$$"
+  session_dir="${SESSIONS_DIR}/${session_id}"
+  mkdir -m 0750 -- "${session_dir}"
+  capture_static_context "${session_dir}" "${session_id}"
+
+  temp_active="${ACTIVE_FILE}.tmp.$$"
+  printf '%s\n' "${session_dir}" > "${temp_active}"
+  mv -f -- "${temp_active}" "${ACTIVE_FILE}"
+
+  nohup "${SCRIPT_DIR}/go2-log" _collect "${session_dir}" \
+    >> "${session_dir}/collector.log" 2>&1 </dev/null &
+  collector_pid="$!"
+  printf '%s\n' "${collector_pid}" > "${session_dir}/collector.pid"
+
+  sleep 1
+  if ! collector_is_running "${collector_pid}" "${session_dir}"; then
+    rm -f -- "${ACTIVE_FILE}"
+    die "collector failed to start; see ${session_dir}/collector.log"
+  fi
+
+  write_start_result "${result_file}" created "${session_dir}"
+  echo "Started diagnostic session: ${session_id}"
+  echo "Directory: ${session_dir}"
+  echo "Collector PID: ${collector_pid}"
+}
+
+status_session() {
+  ensure_directories
+  local session_dir pid size
+  if session_dir="$(active_session_dir 2>/dev/null)"; then
+    pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+    size="$(session_bytes "${session_dir}")"
+    if collector_is_running "${pid}" "${session_dir}"; then
+      echo "Status: running"
+    else
+      echo "Status: stale (collector is not running)"
+    fi
+    echo "Session: $(basename -- "${session_dir}")"
+    echo "Directory: ${session_dir}"
+    echo "Collector PID: ${pid:-unknown}"
+    echo "Size: $(human_bytes "${size}") / 100 MiB"
+  else
+    echo "Status: stopped"
+    local latest
+    latest="$(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+    [[ -z "${latest}" ]] || echo "Latest session: ${latest}"
+  fi
+}
+
+stop_session() {
+  acquire_lock
+  local expected_session_id="${1:-}"
+  local expected_session_dir=""
+  local session_dir pid rosout_details rosout_pid rosout_boot rosout_start
+  local timing_details timing_pid timing_boot timing_start
+  local rosout_status timing_status writers all_writers
+  if [[ -n "${expected_session_id}" ]]; then
+    validate_session_id "${expected_session_id}"
+    expected_session_dir="${SESSIONS_DIR}/${expected_session_id}"
+  fi
+  session_dir="$(active_session_dir 2>/dev/null)" || die "no active session"
+  if [[ -n "${expected_session_id}" &&
+        "${session_dir}" != "${expected_session_dir}" ]]; then
+    die \
+      "refusing to stop unexpected active diagnostic session: expected ${expected_session_dir}, active ${session_dir}"
+  fi
+  pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+
+  if ! collector_is_running "${pid}" "${session_dir}"; then
+    if rosout_details="$(read_rosout_identity "${session_dir}" 2>/dev/null)"; then
+      read -r rosout_pid rosout_boot rosout_start <<< "${rosout_details}"
+      rosout_status=0
+      stop_rosout_collector_process \
+        "${rosout_pid}" "${rosout_boot}" "${rosout_start}" "${session_dir}" ||
+        rosout_status=$?
+      if (( rosout_status != 0 && rosout_status != 2 )); then
+        die "stale collector has a verified rosout writer that could not be stopped; active state was preserved"
+      fi
+    fi
+    if timing_details="$(read_timing_identity "${session_dir}" 2>/dev/null)"; then
+      read -r timing_pid timing_boot timing_start <<< "${timing_details}"
+      timing_status=0
+      stop_timing_sampler_process \
+        "${timing_pid}" "${timing_boot}" "${timing_start}" "${session_dir}" ||
+        timing_status=$?
+      if (( timing_status != 0 && timing_status != 2 )); then
+        die "stale collector has a verified timing writer that could not be stopped; active state was preserved"
+      fi
+    fi
+    if ! all_writers="$(running_diagnostic_writers)"; then
+      die "diagnostic writer process query failed; active state was preserved"
+    fi
+    writers="$(grep -F -- "${session_dir}" <<< "${all_writers}" || true)"
+    [[ -z "${writers}" ]] ||
+      die "stale session still has a live diagnostic writer; active state was preserved"
+    rm -f -- "${ACTIVE_FILE}"
+    die "removed stale active-session state; collector was not running"
+  fi
+
+  kill -TERM "${pid}"
+  for _ in {1..20}; do
+    collector_is_running "${pid}" "${session_dir}" || break
+    sleep 1
+  done
+  if collector_is_running "${pid}" "${session_dir}"; then
+    die "collector did not stop within 20 seconds; inspect PID ${pid} before taking further action"
+  fi
+
+  if [[ -f "${ACTIVE_FILE}" ]] && [[ "$(< "${ACTIVE_FILE}")" == "${session_dir}" ]]; then
+    die "collector stopped but writer cleanup did not complete; active state was preserved"
+  fi
+  if ! all_writers="$(running_diagnostic_writers)"; then
+    die "diagnostic writer process query failed; active state was preserved"
+  fi
+  writers="$(grep -F -- "${session_dir}" <<< "${all_writers}" || true)"
+  [[ -z "${writers}" ]] ||
+    die "session still has a live diagnostic writer; active state was preserved"
+  rm -f -- "${ACTIVE_FILE}"
+  echo "Stopped diagnostic session: $(basename -- "${session_dir}")"
+  echo "Directory: ${session_dir}"
+}
+
+lowcmd_publisher_count() {
+  source_ros_environment
+  command -v ros2 >/dev/null 2>&1 || {
+    echo "ROS 2 command is unavailable while checking /lowcmd publishers." >&2
+    return 1
+  }
+
+  local lowcmd_info='' lowcmd_status=0 publisher_count=''
+  if lowcmd_info="$(
+      timeout 8 ros2 topic info --no-daemon --spin-time 3 /lowcmd 2>&1
+    )"; then
+    lowcmd_status=0
+  else
+    lowcmd_status=$?
+  fi
+
+  if (( lowcmd_status != 0 )); then
+    if (( lowcmd_status == 1 )) &&
+      [[ "${lowcmd_info}" == "Unknown topic '/lowcmd'" ]]; then
+      printf '0\n'
+      return 0
+    fi
+    [[ -z "${lowcmd_info}" ]] || printf '%s\n' "${lowcmd_info}" >&2
+    return 1
+  fi
+
+  publisher_count="$(
+    awk -F': *' '$1 == "Publisher count" {print $2; exit}' <<< "${lowcmd_info}"
+  )"
+  [[ "${publisher_count}" =~ ^[0-9]+$ ]] || {
+    [[ -z "${lowcmd_info}" ]] || printf '%s\n' "${lowcmd_info}" >&2
+    return 1
+  }
+  printf '%s\n' "${publisher_count}"
+}
+
+assert_robot_idle() {
+  local action="${1:-Git push}"
+  local processes='' publisher_count=''
+  if ! processes="$(checked_pgrep "${ROBOT_PROCESS_PATTERN}")"; then
+    echo "Refusing ${action}: robot process query failed." >&2
+    return 1
+  fi
+  if [[ -n "${processes}" ]]; then
+    echo "Refusing ${action} while robot/SLAM/planning processes are running:" >&2
+    echo "${processes}" >&2
+    return 1
+  fi
+
+  if ! publisher_count="$(lowcmd_publisher_count)"; then
+    echo "Refusing ${action}: /lowcmd publisher query failed." >&2
+    return 1
+  fi
+  if (( publisher_count > 0 )); then
+    echo \
+      "Refusing ${action}: /lowcmd has ${publisher_count} publisher(s)." \
+      >&2
+    return 1
+  fi
+}
+
+running_diagnostic_writers() {
+  checked_pgrep '[g]o2-log (_collect|_rosout|_timing)'
+}
+
+running_auxiliary_diagnostic_writers() {
+  checked_pgrep '[g]o2-log (_rosout|_timing)'
+}
+
+validate_session_for_upload() {
+  local session_dir="$1"
+  local allow_oversized_text="${2:-false}"
+  [[ -d "${session_dir}" && ! -L "${session_dir}" ]] || die "invalid session directory: ${session_dir}"
+  local size
+  size="$(session_bytes "${session_dir}")"
+  if [[ "${allow_oversized_text}" != true ]]; then
+    (( size <= SESSION_MAX_BYTES )) || die "session exceeds 100 MiB; preserve it with SCP instead of Git"
+  fi
+
+  local max_file_bytes="${MAX_GIT_FILE_BYTES}"
+  [[ "${allow_oversized_text}" != true ]] || max_file_bytes=0
+  if ! python3 - "${session_dir}" "${max_file_bytes}" <<'PY'
+from pathlib import Path
+import os
+import re
+import stat
+import sys
+
+root = Path(sys.argv[1])
+max_file_bytes = int(sys.argv[2])
+artifact_pattern = re.compile(
+    r"(?:^|\.)(?:pcd|ply|las|bag|bag2|db3|sqlite3|mcap|pcap)(?:\.|$)", re.IGNORECASE
+)
+archive_suffixes = (
+    ".zip", ".7z", ".rar", ".tar", ".tgz", ".gz", ".bz2", ".xz", ".zst", ".lz4"
+)
+binary_magic = (
+    b"\x7fELF", b"PK\x03\x04", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00",
+    b"(\xb5/\xfd", b"7z\xbc\xaf'\x1c", b"Rar!\x1a\x07", b"SQLite format 3\x00",
+    b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"%PDF-",
+)
+allowed_controls = {9, 10, 12, 13, 27}
+
+def reject(message: str) -> None:
+    print(f"go2-log payload rejection: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+for directory, dirnames, filenames in os.walk(root, followlinks=False):
+    directory_path = Path(directory)
+    for dirname in list(dirnames):
+        path = directory_path / dirname
+        if path.is_symlink():
+            reject(f"symbolic-link directory: {path.relative_to(root)}")
+    for filename in filenames:
+        path = directory_path / filename
+        relative = path.relative_to(root)
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            reject(f"non-regular file: {relative}")
+        lower_name = filename.lower()
+        if artifact_pattern.search(lower_name) or re.match(r"^core(?:\.|$)", lower_name):
+            reject(f"runtime artifact filename: {relative}")
+        if lower_name.endswith(archive_suffixes):
+            reject(f"archive/compressed filename: {relative}")
+        size = path.stat().st_size
+        if max_file_bytes and size > max_file_bytes:
+            reject(f"file exceeds {max_file_bytes} bytes: {relative} ({size} bytes)")
+        if size == 0:
+            continue
+        controls = 0
+        inspected = 0
+        first = b""
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                if not first:
+                    first = chunk[:4096]
+                    if any(first.startswith(magic) for magic in binary_magic):
+                        reject(f"binary file signature: {relative}")
+                    if b"FIELDS " in first and b"POINTS " in first and b"DATA " in first:
+                        reject(f"PCD content: {relative}")
+                if b"\x00" in chunk:
+                    reject(f"NUL-containing binary file: {relative}")
+                controls += sum(byte < 32 and byte not in allowed_controls for byte in chunk)
+                inspected += len(chunk)
+        if controls > 16 and controls * 100 > inspected:
+            reject(f"binary control-byte content: {relative}")
+PY
+  then
+    die "session contains a forbidden or unsafe Git payload: ${session_dir}"
+  fi
+}
+
+validate_repair_evidence() {
+  local session_dir="$1"
+  if ! python3 - \
+    "${session_dir}" \
+    "${LOG_ROOT}" \
+    "${MAX_GIT_FILE_BYTES}" \
+    "${REPAIRABLE_SESSION_TEXT_FILES[@]}" <<'PY'
+from pathlib import Path
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+session = Path(sys.argv[1])
+log_root = Path(sys.argv[2])
+max_file_bytes = int(sys.argv[3])
+allowed_names = set(sys.argv[4:])
+session_id = session.name
+manifest = session / "repair_manifest.jsonl"
+hash_pattern = re.compile(r"^[0-9a-f]{64}$")
+effective_uid = os.geteuid()
+manifest_fields = {
+    "file",
+    "original_sha256",
+    "original_size",
+    "quarantine_file",
+    "repaired_at",
+    "repaired_sha256",
+    "repaired_size",
+    "trailing_nul_bytes",
+}
+
+
+def reject(message: str) -> None:
+    print(f"go2-log repair evidence rejection: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def owned_directory(path: Path, description: str, missing_ok: bool = False):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        if missing_ok:
+            return False
+        reject(f"{description} is missing: {path}")
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != effective_uid
+    ):
+        reject(f"{description} is not an owned directory: {path}")
+    return True
+
+
+def read_owned_file(path: Path, description: str, limit: int):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        reject(f"{description} is missing: {path}")
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != effective_uid
+    ):
+        reject(f"{description} is not an owned regular file: {path}")
+    if metadata.st_size > limit:
+        reject(f"{description} exceeds {limit} bytes: {path}")
+    data = path.read_bytes()
+    after = path.lstat()
+    if (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        reject(f"{description} changed while being read: {path}")
+    return data
+
+
+def validate_record(record, line_number: int):
+    if not isinstance(record, dict) or set(record) != manifest_fields:
+        reject(f"invalid manifest schema at line {line_number}")
+    if record["file"] not in allowed_names:
+        reject(f"invalid repaired filename at line {line_number}")
+    for key in ("original_sha256", "repaired_sha256"):
+        if not isinstance(record[key], str) or not hash_pattern.fullmatch(record[key]):
+            reject(f"invalid {key} at line {line_number}")
+    for key in ("original_size", "repaired_size", "trailing_nul_bytes"):
+        if not isinstance(record[key], int) or isinstance(record[key], bool) or record[key] < 0:
+            reject(f"invalid {key} at line {line_number}")
+    if (
+        record["trailing_nul_bytes"] <= 0
+        or record["repaired_size"] + record["trailing_nul_bytes"]
+        != record["original_size"]
+        or record["original_size"] > max_file_bytes
+    ):
+        reject(f"inconsistent sizes at line {line_number}")
+    if not isinstance(record["repaired_at"], str) or not record["repaired_at"]:
+        reject(f"invalid repaired_at at line {line_number}")
+    expected_quarantine = (
+        f"quarantine/{session_id}/{record['file']}."
+        f"{record['original_sha256']}.corrupt"
+    )
+    if record["quarantine_file"] != expected_quarantine:
+        reject(f"invalid quarantine path at line {line_number}")
+    return record
+
+
+owned_directory(log_root, "diagnostics root")
+owned_directory(session, "session")
+quarantine_root = log_root / "quarantine"
+quarantine = quarantine_root / session_id
+
+if not manifest.exists() and not manifest.is_symlink():
+    if owned_directory(quarantine, "session quarantine", missing_ok=True):
+        unfinished = sorted(
+            path.name
+            for path in quarantine.iterdir()
+            if path.name.endswith(".repair.json") or path.name.endswith(".corrupt")
+        )
+        if unfinished:
+            reject("quarantine evidence exists without a repair manifest; run go2-log repair")
+    raise SystemExit(0)
+
+manifest_data = read_owned_file(manifest, "repair manifest", 1024 * 1024)
+if not manifest_data or not manifest_data.endswith(b"\n"):
+    reject("repair manifest is empty or lacks a final newline")
+try:
+    manifest_text = manifest_data.decode("utf-8")
+except UnicodeDecodeError:
+    reject("repair manifest is not valid UTF-8")
+
+owned_directory(quarantine_root, "quarantine root")
+owned_directory(quarantine, "session quarantine")
+records = []
+record_keys = set()
+for line_number, line in enumerate(manifest_text.splitlines(), 1):
+    try:
+        record = validate_record(json.loads(line), line_number)
+    except json.JSONDecodeError:
+        reject(f"invalid repair manifest JSON at line {line_number}")
+    key = (record["file"], record["original_sha256"])
+    if key in record_keys:
+        reject(f"duplicate manifest record at line {line_number}")
+    record_keys.add(key)
+    records.append(record)
+
+expected_journals = {
+    f"{record['file']}.{record['original_sha256']}.repair.json"
+    for record in records
+}
+expected_originals = {
+    f"{record['file']}.{record['original_sha256']}.corrupt"
+    for record in records
+}
+actual_journals = {
+    path.name for path in quarantine.iterdir() if path.name.endswith(".repair.json")
+}
+actual_originals = {
+    path.name for path in quarantine.iterdir() if path.name.endswith(".corrupt")
+}
+if actual_journals != expected_journals or actual_originals != expected_originals:
+    reject("manifest, repair journals, and quarantined originals do not match")
+
+latest_clean = {}
+for record in records:
+    name = record["file"]
+    original_name = f"{name}.{record['original_sha256']}.corrupt"
+    journal_name = f"{name}.{record['original_sha256']}.repair.json"
+    original = read_owned_file(
+        quarantine / original_name,
+        "quarantined original",
+        max_file_bytes,
+    )
+    if (
+        len(original) != record["original_size"]
+        or hashlib.sha256(original).hexdigest() != record["original_sha256"]
+    ):
+        reject(f"quarantined original hash or size mismatch: {name}")
+    clean = original[: record["repaired_size"]]
+    suffix = original[record["repaired_size"] :]
+    if (
+        len(suffix) != record["trailing_nul_bytes"]
+        or not suffix
+        or any(suffix)
+        or not clean.endswith(b"\n")
+        or hashlib.sha256(clean).hexdigest() != record["repaired_sha256"]
+    ):
+        reject(f"quarantined original is not the recorded trailing-NUL repair: {name}")
+    try:
+        clean.decode("utf-8")
+    except UnicodeDecodeError:
+        reject(f"recorded repaired text is not valid UTF-8: {name}")
+    previous = latest_clean.get(name)
+    if previous is not None and not clean.startswith(previous):
+        reject(f"repair history is not append-only: {name}")
+    latest_clean[name] = clean
+
+    journal_data = read_owned_file(
+        quarantine / journal_name,
+        "repair journal",
+        1024 * 1024,
+    )
+    try:
+        journal = json.loads(journal_data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        reject(f"invalid repair journal JSON: {journal_name}")
+    expected_journal = dict(record, state="completed")
+    if journal != expected_journal:
+        reject(f"repair journal is not completed or disagrees with manifest: {name}")
+
+for name, clean in latest_clean.items():
+    current = read_owned_file(
+        session / name,
+        "repaired session file",
+        max_file_bytes,
+    )
+    if current != clean:
+        reject(f"repaired session file no longer matches completed evidence: {name}")
+PY
+  then
+    die "session repair evidence is incomplete or inconsistent: ${session_dir}"
+  fi
+}
+
+git_with_proxy() {
+  git -c "http.proxy=${LOG_PROXY}" -c "https.proxy=${LOG_PROXY}" "$@"
+}
+
+canonical_git_remote() {
+  python3 - "$1" <<'PY'
+import os
+import posixpath
+import re
+import sys
+from urllib.parse import unquote, urlsplit
+
+value = sys.argv[1].strip()
+if not value or any(character in value for character in "\r\n\0"):
+    raise SystemExit("invalid empty or multiline Git remote")
+
+scp = re.fullmatch(r"(?:([^@/:]+)@)?([^/:]+):(.+)", value)
+if scp and "://" not in value:
+    host = scp.group(2).lower()
+    path = scp.group(3)
+    if "?" in path or "#" in path:
+        raise SystemExit("Git remote query strings and fragments are forbidden")
+    kind = "remote"
+else:
+    parsed = urlsplit(value)
+    if parsed.query or parsed.fragment:
+        raise SystemExit("Git remote query strings and fragments are forbidden")
+    if parsed.scheme in {"http", "https"}:
+        if parsed.username is not None or parsed.password is not None:
+            raise SystemExit("embedded HTTP Git credentials are forbidden")
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        default_port = 80 if parsed.scheme == "http" else 443
+        path = unquote(parsed.path)
+        kind = "remote"
+    elif parsed.scheme in {"ssh", "git"}:
+        if parsed.password is not None:
+            raise SystemExit("embedded SSH password is forbidden")
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        default_port = 22 if parsed.scheme == "ssh" else 9418
+        path = unquote(parsed.path)
+        kind = "remote"
+    elif parsed.scheme == "file":
+        if parsed.hostname not in (None, "", "localhost"):
+            raise SystemExit("non-local file:// Git remote is forbidden")
+        print("local:" + os.path.realpath(os.path.expanduser(unquote(parsed.path))))
+        raise SystemExit(0)
+    elif parsed.scheme:
+        raise SystemExit(f"unsupported Git remote scheme: {parsed.scheme}")
+    else:
+        print("local:" + os.path.realpath(os.path.expanduser(value)))
+        raise SystemExit(0)
+
+if not host:
+    raise SystemExit("Git remote has no host")
+path = posixpath.normpath("/" + path).lstrip("/")
+if path.lower().endswith(".git"):
+    path = path[:-4]
+if not path or path == ".":
+    raise SystemExit("Git remote has no repository path")
+if host == "github.com":
+    path = path.lower()
+if 'port' in locals() and port not in (None, default_port):
+    host = f"{host}:{port}"
+print(f"remote:{host}/{path}")
+PY
+}
+
+assert_log_remote_identity() {
+  local expected actual canonical
+  if ! expected="$(canonical_git_remote "${LOG_REMOTE}")"; then
+    die "GO2_LOG_REMOTE is invalid or embeds credentials"
+  fi
+  local -a urls=()
+  mapfile -t urls < <(git -C "${LOG_REPO}" remote get-url --all origin 2>/dev/null || true)
+  (( ${#urls[@]} > 0 )) || die "log repository has no origin fetch URL"
+  for actual in "${urls[@]}"; do
+    canonical="$(canonical_git_remote "${actual}")" || die "origin has an invalid fetch URL"
+    [[ "${canonical}" == "${expected}" ]] ||
+      die "origin fetch URL is not GO2_LOG_REMOTE (${canonical} != ${expected})"
+  done
+  urls=()
+  mapfile -t urls < <(git -C "${LOG_REPO}" remote get-url --push --all origin 2>/dev/null || true)
+  (( ${#urls[@]} > 0 )) || die "log repository has no origin push URL"
+  for actual in "${urls[@]}"; do
+    canonical="$(canonical_git_remote "${actual}")" || die "origin has an invalid push URL"
+    [[ "${canonical}" == "${expected}" ]] ||
+      die "origin push URL is not GO2_LOG_REMOTE (${canonical} != ${expected})"
+  done
+  LOG_REMOTE_IDENTITY="${expected}"
+}
+
+ensure_log_repository_identity() {
+  local name email source_name source_email
+  name="$(git -C "${LOG_REPO}" config --local --get user.name 2>/dev/null || true)"
+  email="$(git -C "${LOG_REPO}" config --local --get user.email 2>/dev/null || true)"
+  [[ -n "${name}" && -n "${email}" ]] && return 0
+
+  source_name="$(git -C "${REPO_ROOT}" show -s --format='%an' HEAD 2>/dev/null || true)"
+  source_email="$(git -C "${REPO_ROOT}" show -s --format='%ae' HEAD 2>/dev/null || true)"
+  if [[ -z "${source_name}" || -z "${source_email}" ]]; then
+    die "log repository has no local Git identity and the GO2_Hesai commit author could not be read"
+  fi
+
+  if [[ -z "${name}" ]]; then
+    git -C "${LOG_REPO}" config --local user.name "${source_name}"
+  fi
+  if [[ -z "${email}" ]]; then
+    git -C "${LOG_REPO}" config --local user.email "${source_email}"
+  fi
+}
+
+assert_local_commits_are_diagnostic_only() {
+  local upstream="$1"
+  local commit path
+  while IFS= read -r commit; do
+    [[ -n "${commit}" ]] || continue
+    while IFS= read -r -d '' path; do
+      [[ "${path}" == sessions/* ]] ||
+        die "local log-repository commit contains unrelated path: ${path}"
+    done < <(git -C "${LOG_REPO}" diff-tree --root --no-commit-id --name-only -r -z "${commit}")
+  done < <(git -C "${LOG_REPO}" rev-list "${upstream}..HEAD")
+}
+
+prepare_log_repository() {
+  local session_id="$1"
+  local parent expected unrelated session_path destination
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+  expected="$(canonical_git_remote "${LOG_REMOTE}")" ||
+    die "GO2_LOG_REMOTE is invalid or embeds credentials"
+  if [[ ! -d "${LOG_REPO}/.git" ]]; then
+    [[ ! -e "${LOG_REPO}" ]] || die "GO2_LOG_REPO exists but is not a Git checkout: ${LOG_REPO}"
+    parent="$(dirname -- "${LOG_REPO}")"
+    mkdir -p -- "${parent}"
+    git_with_proxy clone "${LOG_REMOTE}" "${LOG_REPO}"
+  fi
+
+  [[ -d "${LOG_REPO}/.git" ]] || die "not a Git repository: ${LOG_REPO}"
+  assert_log_remote_identity
+  ensure_log_repository_identity
+
+  session_path="sessions/${session_id}"
+  unrelated="$(git -C "${LOG_REPO}" status --porcelain --untracked-files=all -- . \
+    ":(exclude)${session_path}" 2>/dev/null || true)"
+  [[ -z "${unrelated}" ]] || die "log repository has unrelated local changes:\n${unrelated}"
+
+  # A failed copy/add/commit is recoverable because the source session remains
+  # authoritative. Clear only this session path, never any unrelated work.
+  if [[ -n "$(git -C "${LOG_REPO}" status --porcelain --untracked-files=all -- "${session_path}")" ]]; then
+    destination="${LOG_REPO}/${session_path}"
+    rm -rf -- "${destination}"
+    git -C "${LOG_REPO}" reset -q HEAD -- "${session_path}" 2>/dev/null || true
+    if git -C "${LOG_REPO}" cat-file -e "HEAD:${session_path}" 2>/dev/null; then
+      git -C "${LOG_REPO}" checkout HEAD -- "${session_path}"
+    fi
+  fi
+
+  git_with_proxy -C "${LOG_REPO}" fetch origin
+  if git -C "${LOG_REPO}" show-ref --verify --quiet "refs/heads/${LOG_BRANCH}"; then
+    git -C "${LOG_REPO}" checkout "${LOG_BRANCH}"
+  elif git -C "${LOG_REPO}" show-ref --verify --quiet "refs/remotes/origin/${LOG_BRANCH}"; then
+    git -C "${LOG_REPO}" checkout --track -b "${LOG_BRANCH}" "origin/${LOG_BRANCH}"
+  else
+    git -C "${LOG_REPO}" checkout -b "${LOG_BRANCH}"
+  fi
+
+  if git -C "${LOG_REPO}" show-ref --verify --quiet "refs/remotes/origin/${LOG_BRANCH}"; then
+    assert_local_commits_are_diagnostic_only "origin/${LOG_BRANCH}"
+    if git -C "${LOG_REPO}" merge-base --is-ancestor HEAD "origin/${LOG_BRANCH}"; then
+      git -C "${LOG_REPO}" merge --ff-only "origin/${LOG_BRANCH}"
+    elif ! git -C "${LOG_REPO}" merge-base --is-ancestor "origin/${LOG_BRANCH}" HEAD; then
+      if ! git -C "${LOG_REPO}" rebase "origin/${LOG_BRANCH}"; then
+        git -C "${LOG_REPO}" rebase --abort 2>/dev/null || true
+        die "could not replay the pending diagnostic commit onto origin/${LOG_BRANCH}"
+      fi
+    fi
+  fi
+}
+
+cleanup_uploaded_sessions() {
+  local retention_limit="${1:-${MAX_LOCAL_SESSIONS}}"
+  local total candidate resolved_root resolved_candidate
+  total="$(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '.\n' | wc -l)"
+  (( total > retention_limit )) || return 0
+  resolved_root="$(realpath -- "${SESSIONS_DIR}")"
+
+  while IFS= read -r candidate; do
+    (( total > retention_limit )) || break
+    [[ -f "${candidate}/.uploaded" && ! -L "${candidate}" ]] || continue
+    resolved_candidate="$(realpath -- "${candidate}")"
+    [[ "${resolved_candidate}" == "${resolved_root}/"* ]] || continue
+    rm -rf -- "${resolved_candidate}"
+    total=$((total - 1))
+    echo "Removed verified uploaded session: $(basename -- "${candidate}")"
+  done < <(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d -printf '%p\n' | LC_ALL=C sort)
+
+  if (( total > retention_limit )); then
+    echo "WARNING: ${total} sessions remain because unuploaded sessions are never deleted." >&2
+  fi
+}
+
+validate_session_id() {
+  local session_id="$1"
+  [[ ${#session_id} -le 160 ]] || die "session ID is too long"
+  [[ "${session_id}" =~ ^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9_.-]+-[1-9][0-9]*$ ]] ||
+    die "invalid session ID: ${session_id}"
+}
+
+select_session() {
+  local requested="${1:-}"
+  if [[ -n "${requested}" ]]; then
+    validate_session_id "${requested}"
+    printf '%s\n' "${SESSIONS_DIR}/${requested}"
+    return 0
+  fi
+
+  local latest
+  latest="$(find "${SESSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d ! -exec test -e '{}/.uploaded' \; \
+    -printf '%f\n' 2>/dev/null | LC_ALL=C sort | tail -n 1)"
+  [[ -n "${latest}" ]] || die "no unuploaded session found"
+  printf '%s\n' "${SESSIONS_DIR}/${latest}"
+}
+
+repair_trailing_nul_suffixes() {
+  local log_root="$1"
+  local session_id="$2"
+  local repaired_at="$3"
+  local max_file_bytes="$4"
+
+  python3 - \
+    "${log_root}" \
+    "${session_id}" \
+    "${repaired_at}" \
+    "${max_file_bytes}" \
+    "${REPAIRABLE_SESSION_TEXT_FILES[@]}" <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import stat
+import sys
+
+log_root = Path(sys.argv[1])
+session_id = sys.argv[2]
+repaired_at = sys.argv[3]
+max_file_bytes = int(sys.argv[4])
+names = sys.argv[5:]
+manifest_name = "repair_manifest.jsonl"
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+directory_flag = getattr(os, "O_DIRECTORY", 0)
+effective_uid = os.geteuid()
+hash_pattern = re.compile(r"^[0-9a-f]{64}$")
+manifest_payload = b""
+manifest_records = {}
+latest_manifest_key = {}
+temporary_counter = 0
+
+
+def reject(message: str) -> None:
+    print(f"go2-log repair rejection: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def open_owned_directory(path: Path, description: str) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | directory_flag | no_follow)
+    except OSError as exception:
+        reject(f"cannot open {description}: {path}: {exception}")
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != effective_uid:
+        os.close(descriptor)
+        reject(f"{description} is not an owned directory: {path}")
+    return descriptor
+
+
+def open_owned_directory_at(parent: int, name: str, description: str) -> int:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | directory_flag | no_follow,
+            dir_fd=parent,
+        )
+    except OSError as exception:
+        reject(f"cannot open {description}: {name}: {exception}")
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != effective_uid:
+        os.close(descriptor)
+        reject(f"{description} is not an owned directory: {name}")
+    return descriptor
+
+
+def ensure_owned_directory_at(parent: int, name: str, description: str) -> int:
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent)
+        os.fsync(parent)
+    except FileExistsError:
+        pass
+    return open_owned_directory_at(parent, name, description)
+
+
+def read_regular(
+    directory: int,
+    name: str,
+    description: str,
+    limit: int,
+    missing_ok: bool = False,
+):
+    try:
+        descriptor = os.open(name, os.O_RDONLY | no_follow, dir_fd=directory)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        reject(f"{description} is missing: {name}")
+    except OSError as exception:
+        reject(f"cannot open {description}: {name}: {exception}")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_uid != effective_uid:
+            reject(f"{description} is not an owned regular file: {name}")
+        if before.st_size > limit:
+            reject(f"{description} exceeds {limit} bytes: {name}")
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                reject(f"{description} changed while being read: {name}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            reject(f"{description} grew while being read: {name}")
+        after = os.fstat(descriptor)
+        signature_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        signature_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        )
+        if signature_before != signature_after:
+            reject(f"{description} changed while being read: {name}")
+        return b"".join(chunks), before
+    finally:
+        os.close(descriptor)
+
+
+def write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+def next_temporary_name(label: str) -> str:
+    global temporary_counter
+    temporary_counter += 1
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", label)
+    nonce = secrets.token_hex(8)
+    return f".{safe}.repair-{os.getpid()}-{temporary_counter}-{nonce}.tmp"
+
+
+def write_quarantine_temporary(quarantine_fd: int, label: str, payload: bytes, mode: int) -> str:
+    descriptor = None
+    temporary = ""
+    for _ in range(100):
+        temporary = next_temporary_name(label)
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow,
+                mode,
+                dir_fd=quarantine_fd,
+            )
+            break
+        except FileExistsError:
+            continue
+    if descriptor is None:
+        reject(f"could not allocate a repair temporary for: {label}")
+    try:
+        write_all(descriptor, payload)
+        os.fsync(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=quarantine_fd)
+            os.fsync(quarantine_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    return temporary
+
+
+def atomic_replace_from_quarantine(
+    quarantine_fd: int,
+    target_fd: int,
+    target_name: str,
+    payload: bytes,
+    mode: int,
+) -> None:
+    temporary = write_quarantine_temporary(
+        quarantine_fd, target_name, payload, mode
+    )
+    try:
+        os.replace(
+            temporary,
+            target_name,
+            src_dir_fd=quarantine_fd,
+            dst_dir_fd=target_fd,
+        )
+        os.fsync(quarantine_fd)
+        os.fsync(target_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=quarantine_fd)
+        except FileNotFoundError:
+            pass
+
+
+def ensure_quarantined_original(
+    quarantine_fd: int,
+    name: str,
+    payload: bytes,
+) -> None:
+    existing = read_regular(
+        quarantine_fd,
+        name,
+        "quarantined original",
+        max_file_bytes,
+        missing_ok=True,
+    )
+    if existing is not None:
+        if existing[0] != payload:
+            reject(f"quarantine hash collision: {name}")
+        return
+
+    temporary = write_quarantine_temporary(
+        quarantine_fd, name, payload, 0o600
+    )
+    try:
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=quarantine_fd,
+                dst_dir_fd=quarantine_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            existing = read_regular(
+                quarantine_fd,
+                name,
+                "quarantined original",
+                max_file_bytes,
+            )
+            if existing[0] != payload:
+                reject(f"quarantine hash collision: {name}")
+        os.unlink(temporary, dir_fd=quarantine_fd)
+        os.fsync(quarantine_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=quarantine_fd)
+        except FileNotFoundError:
+            pass
+
+
+def analyze_trailing_nul(data: bytes, name: str):
+    first_nul = data.find(b"\0")
+    if first_nul < 0:
+        return None
+    if any(memoryview(data)[first_nul:]):
+        reject(f"NUL bytes are not a trailing suffix: {name}")
+    if first_nul == 0 or data[first_nul - 1] != 0x0A:
+        reject(f"text before the trailing NUL suffix is not a complete line: {name}")
+    clean = data[:first_nul]
+    try:
+        clean.decode("utf-8")
+    except UnicodeDecodeError:
+        reject(f"text before the trailing NUL suffix is not valid UTF-8: {name}")
+    return {
+        "original_sha256": hashlib.sha256(data).hexdigest(),
+        "original_size": len(data),
+        "repaired_sha256": hashlib.sha256(clean).hexdigest(),
+        "repaired_size": len(clean),
+        "trailing_nul_bytes": len(data) - first_nul,
+        "clean": clean,
+    }
+
+
+manifest_fields = {
+    "file",
+    "original_sha256",
+    "original_size",
+    "quarantine_file",
+    "repaired_at",
+    "repaired_sha256",
+    "repaired_size",
+    "trailing_nul_bytes",
+}
+
+
+def validate_record(record, description: str, allow_state: bool):
+    expected = manifest_fields | ({"state"} if allow_state else set())
+    if not isinstance(record, dict) or set(record) != expected:
+        reject(f"invalid {description} schema")
+    if record["file"] not in names:
+        reject(f"invalid {description} file: {record['file']}")
+    for key in ("original_sha256", "repaired_sha256"):
+        if not isinstance(record[key], str) or not hash_pattern.fullmatch(record[key]):
+            reject(f"invalid {description} {key}")
+    for key in (
+        "original_size",
+        "repaired_size",
+        "trailing_nul_bytes",
+    ):
+        if not isinstance(record[key], int) or isinstance(record[key], bool) or record[key] < 0:
+            reject(f"invalid {description} {key}")
+    if (
+        record["trailing_nul_bytes"] <= 0
+        or record["repaired_size"] + record["trailing_nul_bytes"]
+        != record["original_size"]
+        or record["original_size"] > max_file_bytes
+    ):
+        reject(f"inconsistent {description} sizes")
+    if not isinstance(record["repaired_at"], str) or not record["repaired_at"]:
+        reject(f"invalid {description} repaired_at")
+    expected_quarantine = (
+        f"quarantine/{session_id}/{record['file']}."
+        f"{record['original_sha256']}.corrupt"
+    )
+    if record["quarantine_file"] != expected_quarantine:
+        reject(f"invalid {description} quarantine_file")
+    if allow_state and record["state"] not in {"prepared", "completed"}:
+        reject(f"invalid {description} state")
+    return record
+
+
+def json_line(record) -> bytes:
+    return (
+        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+root_fd = sessions_fd = session_fd = quarantine_root_fd = quarantine_fd = None
+try:
+    root_fd = open_owned_directory(log_root, "diagnostics root")
+    sessions_fd = open_owned_directory_at(root_fd, "sessions", "sessions root")
+    session_fd = open_owned_directory_at(sessions_fd, session_id, "session")
+    quarantine_root_fd = ensure_owned_directory_at(
+        root_fd, "quarantine", "quarantine root"
+    )
+    quarantine_fd = ensure_owned_directory_at(
+        quarantine_root_fd, session_id, "session quarantine"
+    )
+
+    manifest = read_regular(
+        session_fd,
+        manifest_name,
+        "repair manifest",
+        1024 * 1024,
+        missing_ok=True,
+    )
+    if manifest is not None:
+        manifest_payload = manifest[0]
+        if manifest_payload and not manifest_payload.endswith(b"\n"):
+            reject("existing repair manifest does not end with a newline")
+        try:
+            manifest_text = manifest_payload.decode("utf-8")
+        except UnicodeDecodeError:
+            reject("existing repair manifest is not valid UTF-8")
+        for line_number, line in enumerate(manifest_text.splitlines(), 1):
+            try:
+                record = validate_record(
+                    json.loads(line),
+                    f"repair manifest record at line {line_number}",
+                    False,
+                )
+            except json.JSONDecodeError:
+                reject(f"invalid repair manifest JSON at line {line_number}")
+            key = (record["file"], record["original_sha256"])
+            if key in manifest_records:
+                reject(f"duplicate repair manifest record: {record['file']}")
+            manifest_records[key] = record
+            latest_manifest_key[record["file"]] = key
+
+    journals = {}
+    for entry in sorted(os.listdir(quarantine_fd)):
+        if not entry.endswith(".repair.json"):
+            continue
+        journal_data = read_regular(
+            quarantine_fd,
+            entry,
+            "repair journal",
+            1024 * 1024,
+        )[0]
+        try:
+            journal_record = validate_record(
+                json.loads(journal_data.decode("utf-8")),
+                f"repair journal {entry}",
+                True,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            reject(f"invalid repair journal JSON: {entry}")
+        expected_entry = (
+            f"{journal_record['file']}."
+            f"{journal_record['original_sha256']}.repair.json"
+        )
+        if entry != expected_entry:
+            reject(f"repair journal filename does not match its record: {entry}")
+        key = (journal_record["file"], journal_record["original_sha256"])
+        if key in journals:
+            reject(f"duplicate repair journal: {entry}")
+        journals[key] = journal_record
+
+    plans = {}
+    for name in names:
+        current = read_regular(
+            session_fd,
+            name,
+            "repairable session file",
+            max_file_bytes,
+            missing_ok=True,
+        )
+        if current is None:
+            continue
+        analysis = analyze_trailing_nul(current[0], name)
+        if analysis is None:
+            continue
+        record = {
+            "file": name,
+            "original_sha256": analysis["original_sha256"],
+            "original_size": analysis["original_size"],
+            "quarantine_file": (
+                f"quarantine/{session_id}/{name}."
+                f"{analysis['original_sha256']}.corrupt"
+            ),
+            "repaired_at": repaired_at,
+            "repaired_sha256": analysis["repaired_sha256"],
+            "repaired_size": analysis["repaired_size"],
+            "trailing_nul_bytes": analysis["trailing_nul_bytes"],
+        }
+        plans[(name, analysis["original_sha256"])] = record
+
+    actions = {}
+    for key, journal in journals.items():
+        name = journal["file"]
+        evidence_name = f"{name}.{journal['original_sha256']}.corrupt"
+        evidence = read_regular(
+            quarantine_fd,
+            evidence_name,
+            "quarantined original",
+            max_file_bytes,
+        )[0]
+        analysis = analyze_trailing_nul(evidence, evidence_name)
+        if analysis is None:
+            reject(f"quarantined original has no trailing NUL suffix: {evidence_name}")
+        for field in (
+            "original_sha256",
+            "original_size",
+            "repaired_sha256",
+            "repaired_size",
+            "trailing_nul_bytes",
+        ):
+            if journal[field] != analysis[field]:
+                reject(f"repair journal does not match quarantined original: {evidence_name}")
+        manifest_record = {key: value for key, value in journal.items() if key != "state"}
+        existing_record = manifest_records.get(key)
+        if existing_record is not None and existing_record != manifest_record:
+            reject(f"repair manifest conflicts with journal: {name}")
+        current = read_regular(
+            session_fd,
+            name,
+            "repairable session file",
+            max_file_bytes,
+            missing_ok=True,
+        )
+        if current is None:
+            reject(f"repaired session file is missing: {name}")
+        current_sha = hashlib.sha256(current[0]).hexdigest()
+        if current_sha == journal["original_sha256"] and current[0] == evidence:
+            current_state = "original"
+        elif current_sha == journal["repaired_sha256"] and current[0] == analysis["clean"]:
+            current_state = "repaired"
+        else:
+            current_state = "other"
+        if journal["state"] == "completed":
+            if existing_record is None:
+                reject(f"completed repair journal has no manifest record: {name}")
+            if key != latest_manifest_key.get(name):
+                continue
+            if current_state == "original":
+                actions[key] = manifest_record
+            continue
+        if current_state == "other":
+            reject(f"session file no longer matches its prepared repair journal: {name}")
+        actions[key] = manifest_record
+
+    for key, record in plans.items():
+        if key in actions:
+            continue
+        if key in journals:
+            continue
+        if key in manifest_records:
+            reject(f"corrupt file already has a completed manifest record: {record['file']}")
+        actions[key] = record
+
+    if not actions:
+        print(f"No repairable trailing NUL suffix found in session: {session_id}")
+    else:
+        for key in sorted(actions):
+            record = actions[key]
+            name = record["file"]
+            evidence_name = f"{name}.{record['original_sha256']}.corrupt"
+            journal_name = f"{name}.{record['original_sha256']}.repair.json"
+
+            if key not in journals:
+                source = read_regular(
+                    session_fd,
+                    name,
+                    "repairable session file",
+                    max_file_bytes,
+                )
+                current = source[0]
+                analysis = analyze_trailing_nul(current, name)
+                if (
+                    analysis is None
+                    or analysis["original_sha256"] != record["original_sha256"]
+                    or analysis["repaired_sha256"] != record["repaired_sha256"]
+                ):
+                    reject(f"session file changed before quarantine: {name}")
+                clean = analysis["clean"]
+                ensure_quarantined_original(quarantine_fd, evidence_name, current)
+                prepared = dict(record, state="prepared")
+                atomic_replace_from_quarantine(
+                    quarantine_fd,
+                    quarantine_fd,
+                    journal_name,
+                    json_line(prepared),
+                    0o600,
+                )
+            else:
+                current = read_regular(
+                    quarantine_fd,
+                    evidence_name,
+                    "quarantined original",
+                    max_file_bytes,
+                )[0]
+                analysis = analyze_trailing_nul(current, evidence_name)
+                if analysis is None:
+                    reject(f"quarantined original has no trailing NUL suffix: {evidence_name}")
+                clean = analysis["clean"]
+
+            latest = read_regular(
+                session_fd,
+                name,
+                "repairable session file",
+                max_file_bytes,
+            )
+            latest_sha = hashlib.sha256(latest[0]).hexdigest()
+            if latest_sha == record["original_sha256"] and latest[0] == current:
+                atomic_replace_from_quarantine(
+                    quarantine_fd,
+                    session_fd,
+                    name,
+                    clean,
+                    stat.S_IMODE(latest[1].st_mode),
+                )
+            elif latest_sha != record["repaired_sha256"] or latest[0] != clean:
+                reject(f"session file changed during repair: {name}")
+
+            if key not in manifest_records:
+                manifest_payload += json_line(record)
+                atomic_replace_from_quarantine(
+                    quarantine_fd,
+                    session_fd,
+                    manifest_name,
+                    manifest_payload,
+                    0o600,
+                )
+                manifest_records[key] = record
+                latest_manifest_key[name] = key
+
+            completed = dict(record, state="completed")
+            atomic_replace_from_quarantine(
+                quarantine_fd,
+                quarantine_fd,
+                journal_name,
+                json_line(completed),
+                0o600,
+            )
+            print(
+                f"Repaired trailing NUL suffix: {name} "
+                f"({record['trailing_nul_bytes']} bytes)"
+            )
+            print(
+                "Preserved original: "
+                f"{log_root / record['quarantine_file']}"
+            )
+
+        print(f"Repair manifest: {log_root / 'sessions' / session_id / manifest_name}")
+finally:
+    for descriptor in (
+        quarantine_fd,
+        quarantine_root_fd,
+        session_fd,
+        sessions_fd,
+        root_fd,
+    ):
+        if descriptor is not None:
+            os.close(descriptor)
+PY
+}
+
+repair_session() {
+  acquire_lock
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+  local session_dir session_id active collector_pid writers size
+  session_dir="$(select_session "${1:-}")"
+  session_id="$(basename -- "${session_dir}")"
+  validate_session_id "${session_id}"
+
+  [[ -d "${session_dir}" && ! -L "${session_dir}" ]] ||
+    die "invalid or symbolic-link session directory: ${session_dir}"
+  [[ ! -e "${session_dir}/.uploaded" && ! -L "${session_dir}/.uploaded" ]] ||
+    die "refusing to modify an already uploaded session: ${session_id}"
+  size="$(session_bytes "${session_dir}")"
+  (( size <= SESSION_MAX_BYTES )) ||
+    die "session exceeds 100 MiB; preserve it with SCP instead of repairing in place"
+  if active="$(active_session_dir 2>/dev/null)"; then
+    die "collection is active ($(basename -- "${active}")); stop it before repair"
+  fi
+  collector_pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+  if collector_is_running "${collector_pid}" "${session_dir}"; then
+    die "selected session is still being collected by PID ${collector_pid}"
+  fi
+  if ! writers="$(running_diagnostic_writers)"; then
+    die "diagnostic writer process query failed before repair"
+  fi
+  if [[ -n "${writers}" ]]; then
+    echo "${writers}" >&2
+    die "stop all diagnostic writers before repair"
+  fi
+  assert_robot_idle "diagnostic repair" ||
+    die "stop all robot processes before repairing diagnostics"
+
+  repair_trailing_nul_suffixes \
+    "${LOG_ROOT}" "${session_id}" "$(utc_now)" "${MAX_GIT_FILE_BYTES}"
+  validate_repair_evidence "${session_dir}"
+  validate_session_for_upload "${session_dir}" true
+  echo "Session text validation passed after repair: ${session_id}"
+}
+
+validate_staged_session() {
+  local session_id="$1"
+  local session_path="sessions/${session_id}"
+  local destination="${LOG_REPO}/${session_path}"
+  local unrelated path staged_hash worktree_hash
+
+  unrelated="$(git -C "${LOG_REPO}" status --porcelain --untracked-files=all -- . \
+    ":(exclude)${session_path}" 2>/dev/null || true)"
+  [[ -z "${unrelated}" ]] || die "unrelated log-repository changes detected:\n${unrelated}"
+  validate_session_for_upload "${destination}"
+
+  while IFS= read -r -d '' path; do
+    [[ "${path}" == "${session_path}"/* ]] ||
+      die "staged change escaped the selected session: ${path}"
+  done < <(git -C "${LOG_REPO}" diff --cached --name-only -z)
+
+  while IFS= read -r -d '' path; do
+    [[ -f "${LOG_REPO}/${path}" && ! -L "${LOG_REPO}/${path}" ]] ||
+      die "staged file is not a regular worktree file: ${path}"
+    staged_hash="$(git -C "${LOG_REPO}" rev-parse --verify ":${path}")"
+    worktree_hash="$(git -C "${LOG_REPO}" hash-object -- "${LOG_REPO}/${path}")"
+    [[ "${staged_hash}" == "${worktree_hash}" ]] ||
+      die "file changed after validation and staging: ${path}"
+  done < <(git -C "${LOG_REPO}" diff --cached --name-only --diff-filter=ACMRT -z -- "${session_path}")
+}
+
+upload_session() {
+  acquire_lock
+  command -v python3 >/dev/null 2>&1 || die "python3 is required"
+  local session_dir session_id active destination local_sha remote_sha collector_pid writers
+  session_dir="$(select_session "${1:-}")"
+  session_id="$(basename -- "${session_dir}")"
+  validate_session_id "${session_id}"
+
+  if [[ -f "${session_dir}/.uploaded" ]]; then
+    echo "Session is already verified as uploaded: ${session_id}"
+    cleanup_uploaded_sessions
+    return 0
+  fi
+
+  if active="$(active_session_dir 2>/dev/null)"; then
+    die "collection is active ($(basename -- "${active}")); stop it before upload"
+  fi
+  collector_pid="$(read_first_line "${session_dir}/collector.pid" 2>/dev/null || true)"
+  if collector_is_running "${collector_pid}" "${session_dir}"; then
+    die "selected session is still being collected by PID ${collector_pid}"
+  fi
+  if ! writers="$(running_diagnostic_writers)"; then
+    die "diagnostic writer process query failed before upload"
+  fi
+  if [[ -n "${writers}" ]]; then
+    echo "${writers}" >&2
+    die "stop all diagnostic writers before upload"
+  fi
+  assert_robot_idle "diagnostic upload" ||
+    die "stop all robot processes before uploading diagnostics"
+
+  # Reject artifacts and binary data before any optional text compaction can
+  # alter a stopped session. The strict size checks run after compaction.
+  validate_repair_evidence "${session_dir}"
+  validate_session_for_upload "${session_dir}" true
+  enforce_session_size_limit "${session_dir}" ||
+    die "session remains oversized; preserve it with SCP before removing it"
+  validate_repair_evidence "${session_dir}"
+  validate_session_for_upload "${session_dir}"
+
+  prepare_log_repository "${session_id}"
+  destination="${LOG_REPO}/sessions/${session_id}"
+  rm -rf -- "${destination}"
+  mkdir -p -- "${destination}"
+  cp -a -- "${session_dir}/." "${destination}/"
+  rm -f -- "${destination}/.uploaded"
+  validate_session_for_upload "${destination}"
+
+  git -C "${LOG_REPO}" add -A -- "sessions/${session_id}"
+  validate_staged_session "${session_id}"
+  if ! git -C "${LOG_REPO}" diff --cached --quiet -- "sessions/${session_id}"; then
+    git -C "${LOG_REPO}" commit -m "Add diagnostic session ${session_id}" -- "sessions/${session_id}"
+  fi
+
+  # The clone/copy/commit phase can take long enough for a robot process to
+  # start after the first check. Re-check immediately before network push.
+  assert_robot_idle "Git push" ||
+    die "robot process started during upload; the local commit is retained for retry"
+  git_with_proxy -C "${LOG_REPO}" push origin "HEAD:refs/heads/${LOG_BRANCH}"
+  local_sha="$(git -C "${LOG_REPO}" rev-parse HEAD)"
+  remote_sha="$(git_with_proxy -C "${LOG_REPO}" ls-remote origin "refs/heads/${LOG_BRANCH}" | awk '{print $1}')"
+  [[ -n "${remote_sha}" && "${remote_sha}" == "${local_sha}" ]] ||
+    die "push could not be verified; local logs were preserved"
+
+  {
+    echo "uploaded_at=$(utc_now)"
+    echo "repository_identity=${LOG_REMOTE_IDENTITY}"
+    echo "branch=${LOG_BRANCH}"
+    echo "commit=${local_sha}"
+  } > "${session_dir}/.uploaded"
+
+  echo "Uploaded and verified session: ${session_id}"
+  echo "Commit: ${local_sha}"
+  cleanup_uploaded_sessions
+}
+
+show_usage() {
+  cat <<'EOF'
+Usage: go2-log <command> [arguments]
+
+Commands:
+  start [--result-file PATH]
+                        Start a bounded diagnostic session. The optional file
+                        receives the lock-consistent machine-readable result.
+  status                Show collector state and session size.
+  planner-check [ARGS]  Inspect planner inputs and record them in the session.
+  planner-series [--samples N] [--interval SEC] [INSPECTOR ARGS]
+                        Repeat planner checks (defaults: N=10, SEC=1.0).
+                        Pass --no-goal (recommended) or --goal-x/--goal-y.
+  stop [SESSION_ID]     Stop the active diagnostic session cleanly; optionally
+                        require its ID to match before stopping it.
+  repair [SESSION_ID]   Quarantine and trim a verified trailing-NUL text suffix.
+  upload [SESSION_ID]   Push a stopped session to Aphra-neck/G02_log.
+
+Environment:
+  GO2_LOG_ROOT          Runtime root (default: ~/go2_logs)
+  GO2_WORKSPACE         GO2_Hesai workspace (default: current Git checkout)
+  GO2_LOG_REPO          Local G02_log checkout (default: ~/G02_log)
+  GO2_LOG_PROXY         Git HTTP(S) proxy (default: http://192.168.151.132:7890)
+  GO2_LOG_REMOTE        Git remote URL
+  GO2_LOG_BRANCH        Git branch (default: main)
+EOF
+}
+
+main() {
+  local command="${1:-}"
+  case "${command}" in
+    start)
+      if [[ $# -eq 1 ]]; then
+        start_session
+      elif [[ $# -eq 3 && "${2}" == --result-file && -n "${3}" ]]; then
+        start_session "${3}"
+      else
+        die "start accepts only an optional --result-file PATH"
+      fi
+      ;;
+    status)
+      [[ $# -eq 1 ]] || die "status takes no arguments"
+      status_session
+      ;;
+    planner-check)
+      shift
+      planner_check "$@"
+      ;;
+    planner-series)
+      shift
+      planner_series "$@"
+      ;;
+    stop)
+      [[ $# -le 2 ]] || die "stop accepts at most one session ID"
+      stop_session "${2:-}"
+      ;;
+    repair)
+      [[ $# -le 2 ]] || die "repair accepts at most one session ID"
+      repair_session "${2:-}"
+      ;;
+    upload)
+      [[ $# -le 2 ]] || die "upload accepts at most one session ID"
+      upload_session "${2:-}"
+      ;;
+    _collect)
+      [[ $# -eq 2 ]] || exit 2
+      run_collector "$2"
+      ;;
+    _rosout)
+      [[ $# -eq 2 ]] || exit 2
+      run_rosout_collector "$2"
+      ;;
+    _timing)
+      [[ $# -eq 2 ]] || exit 2
+      run_topic_timing_sampler "$2"
+      ;;
+    -h|--help|help)
+      show_usage
+      ;;
+    *)
+      show_usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

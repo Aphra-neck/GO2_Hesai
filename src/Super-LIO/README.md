@@ -11,14 +11,14 @@
 <div align="center">
   <p>
     <a href="https://github.com/Liansheng-Wang/Super-LIO/tree/ros1" style="text-decoration: none;">
-      <img src="https://img.shields.io/badge/✅ ACTIVE - ROS1 Noetic-22c55e?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22" alt="ROS1 Active"
-      onmouseover="this.src='https://img.shields.io/badge/✅ ACTIVE - ROS1 Noetic-166534?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"
-      onmouseout="this.src='https://img.shields.io/badge/✅ ACTIVE - ROS1 Noetic-22c55e?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"/>
+      <img src="https://img.shields.io/badge/🔄 SWITCH - ROS1 Noetic-3b82f6?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22" alt="Switch to ROS1"
+      onmouseover="this.src='https://img.shields.io/badge/🔄 SWITCH - ROS1 Noetic-1e40af?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"
+      onmouseout="this.src='https://img.shields.io/badge/🔄 SWITCH - ROS1 Noetic-3b82f6?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"/>
     </a>&nbsp;&nbsp;
     <a href="https://github.com/Liansheng-Wang/Super-LIO/tree/ros2" style="text-decoration: none;">
-      <img src="https://img.shields.io/badge/🔄 SWITCH - ROS2 Humble/Iron/Jazzy-3b82f6?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22" alt="Switch to ROS2"
-      onmouseover="this.src='https://img.shields.io/badge/🔄 SWITCH - ROS2 Humble/Iron/Jazzy-1e40af?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"
-      onmouseout="this.src='https://img.shields.io/badge/🔄 SWITCH - ROS2 Humble/Iron/Jazzy-3b82f6?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"/>
+      <img src="https://img.shields.io/badge/✅ ACTIVE - ROS2 Humble/Iron/Jazzy-22c55e?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22" alt="ROS2 Active"
+      onmouseover="this.src='https://img.shields.io/badge/✅ ACTIVE - ROS2 Humble/Iron/Jazzy-166534?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"
+      onmouseout="this.src='https://img.shields.io/badge/✅ ACTIVE - ROS2 Humble/Iron/Jazzy-22c55e?style=for-the-badge&logo=ros&logoColor=white&logoWidth=22'"/>
     </a>&nbsp;&nbsp;
     <a href="#" style="text-decoration: none; cursor: default;">
       <img src="https://img.shields.io/badge/🖥️ PLATFORM - X86 + ARM64-8b5cf6?style=for-the-badge&logo=linux&logoColor=white&logoWidth=22" alt="X86 and ARM Support"
@@ -44,11 +44,11 @@ Super-LIO is a robust and efficient LiDAR–Inertial Odometry (LIO) system desig
 
 ## Quickly Run
 
-**For ROS2 Users**: Please switch to the ros2 branch and follow the instructions at [ros2 branch](https://github.com/Liansheng-Wang/Super-LIO/tree/ros2)
+**For ROS1 Users**: Please switch to the **ros1** branch and follow the instructions at [ros1 branch](https://github.com/Liansheng-Wang/Super-LIO/tree/ros1)
 
 ### Requirements
 
-Ubuntu 20.04 · C++17 · ROS Noetic · Eigen · PCL 
+Ubuntu 24(22).04 · C++20 · ROS Jazzy(Humble) · Eigen · PCL
 
 ### Dependencies
 
@@ -62,10 +62,10 @@ sudo apt install libgoogle-glog-dev libtbb-dev
 ```bash
 git clone https://github.com/Liansheng-Wang/Super-LIO.git
 cd Super-LIO
-catkin_make
+colcon build
 
-source devel/setup.bash 
-roslaunch super_lio Livox_mid360.launch
+source install/setup.bash
+ros2 launch super_lio Livox_mid360.py
 
 ```
 
@@ -78,8 +78,8 @@ Before running relocalization, please make sure that:
 
 ```bash
 cd PATH_2_Super-LIO
-source devel/setup.bash 
-roslaunch super_lio relocation.launch
+source install/setup.bash
+ros2 launch super_lio relocation.py
 ```
 
 
@@ -99,7 +99,7 @@ including indoor, outdoor, and large-scale scenes.
 ## Publications
 
 If your like our projects, please cite us and support us with a star 🌟.
-We kindly recommend to cite [our paper](https://arxiv.org/abs/2509.05723) if you find this library useful:
+We kindly recommend to cite [our paper](https://ieeexplore.ieee.org/document/11347459) if you find this library useful:
 
 ```latex
 @article{wang2026superlio,
@@ -122,7 +122,7 @@ We kindly recommend to cite [our paper](https://arxiv.org/abs/2509.05723) if you
 
 <br>
 
-- 2026-01-04  
+- 2026-01-04
   - Separate ROS interface and algorithm.
   - Refactor SuperLIOReLoc to inherit from SuperLIO.
   - Code style aligned with ROS2 version.
@@ -131,7 +131,10 @@ We kindly recommend to cite [our paper](https://arxiv.org/abs/2509.05723) if you
   - The main branch is renamed to ros1
   - add ros2 branch
 
+- 2026-01-04 21:51
+  - release ROS2 version
+
 - 2026-06-07
  - [Important revisions]: Fixed some known errors and improved algorithm accuracy!
- 
+
 </details>

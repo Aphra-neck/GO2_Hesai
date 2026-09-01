@@ -46,6 +46,7 @@
 #include <string>
 #include <functional>
 #include <boost/thread.hpp>
+#include "hesai_frame_timing.hpp"
 #include "source_drive_common.hpp"
 
 class SourceDriver
@@ -104,6 +105,8 @@ protected:
   // Convert Angular Velocity from degree/s to radian/s
   // double From_degs_To_rads(double degree);
   std::string frame_id_;
+  bool frame_timing_source_age_valid_ = false;
+  hesai_frame_timing::Window frame_timing_;
 
   rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr crt_sub_;
   rclcpp::Subscription<hesai_ros_driver::msg::UdpFrame>::SharedPtr pkt_sub_;
@@ -125,6 +128,8 @@ inline void SourceDriver::Init(const YAML::Node& config)
   DriveYamlParam yaml_param;
   yaml_param.GetDriveYamlParam(config, driver_param);
   frame_id_ = driver_param.input_param.frame_id;
+  frame_timing_source_age_valid_ =
+      driver_param.decoder_param.use_timestamp_type != 0;
 
   node_ptr_.reset(new rclcpp::Node("hesai_ros_driver_node"));
   if (driver_param.input_param.send_point_cloud_ros) {
@@ -227,7 +232,96 @@ inline void SourceDriver::SendPacket(const UdpFrame_t& msg, double timestamp)
 
 inline void SourceDriver::SendPointCloud(const LidarDecodedFrame<LidarPointXYZIRT>& msg)
 {
-  pub_->publish(ToRosMsg(msg, frame_id_));
+  using SteadyClock = hesai_frame_timing::Window::SteadyClock;
+  using SystemClock = hesai_frame_timing::Window::SystemClock;
+
+  const bool is_multi_frame = msg.fParam.IsMultiFrameFrequency() != 0;
+  const int output_frame_index =
+      is_multi_frame ? msg.multi_frame_index : msg.frame_index;
+  const uint32_t points =
+      is_multi_frame ? msg.multi_points_num : msg.points_num;
+  const uint32_t packets =
+      is_multi_frame ? msg.multi_packet_num : msg.packet_num;
+  const double output_frequency_hz =
+      is_multi_frame ? msg.fParam.frame_frequency
+                     : msg.fParam.default_frame_frequency;
+  const double source_start_timestamp =
+      is_multi_frame ? msg.multi_frame_start_timestamp : msg.frame_start_timestamp;
+  const double source_end_timestamp =
+      is_multi_frame ? msg.multi_frame_end_timestamp : msg.frame_end_timestamp;
+  const auto callback_start = SteadyClock::now();
+  const bool origin_packet_buffer_full_now =
+      driver_ptr_->OriginPacketIsBufferFull();
+  const auto system_now = SystemClock::now();
+  auto sample = frame_timing_.Begin(
+      is_multi_frame,
+      output_frame_index,
+      msg.frame_index,
+      msg.multi_rate,
+      points,
+      packets,
+      output_frequency_hz,
+      source_start_timestamp,
+      source_end_timestamp,
+      frame_timing_source_age_valid_,
+      origin_packet_buffer_full_now,
+      callback_start,
+      system_now);
+
+  const auto to_ros_start = SteadyClock::now();
+  SteadyClock::time_point after_to_ros;
+  SteadyClock::time_point after_publish;
+  {
+    auto ros_msg = ToRosMsg(msg, frame_id_);
+    after_to_ros = SteadyClock::now();
+    pub_->publish(ros_msg);
+    after_publish = SteadyClock::now();
+  }
+  const auto after_cleanup = SteadyClock::now();
+
+  hesai_frame_timing::Report report;
+  if (frame_timing_.Complete(
+          &sample,
+          to_ros_start,
+          after_to_ros,
+          after_publish,
+          after_cleanup,
+          &report)) {
+    const auto& worst = report.worst;
+    const auto& maxima = report.maxima;
+    const double reported_source_delta_ms =
+        report.cause == hesai_frame_timing::Cause::kSourceTimestampNonmonotonic
+            ? worst.source_start_delta_ms
+            : maxima.source_start_delta_ms;
+    // Hesai's logger truncates message bodies after 255 bytes.
+    LogWarning(
+        "[hesai_frame_timing] c=%s max=%.0f n=%llu/%llu m=%c "
+        "f=%lld d=%lld src=%.0f sp=%.0f age=%.0f pts=%u pkts=%u "
+        "lim=%.0f per=%.0f prev=%.0f rdy=%.0f ros=%.0f pub=%.0f "
+        "free=%.0f tot=%.0f full_now=%s",
+        hesai_frame_timing::CauseName(report.cause),
+        report.max_ms,
+        static_cast<unsigned long long>(report.samples),
+        static_cast<unsigned long long>(report.anomalies),
+        worst.is_multi_frame ? 'm' : 'r',
+        static_cast<long long>(worst.output_frame_index),
+        static_cast<long long>(worst.output_frame_index_delta),
+        reported_source_delta_ms,
+        maxima.source_span_ms,
+        maxima.source_end_age_ms,
+        worst.points,
+        worst.packets,
+        worst.output_gap_threshold_ms,
+        maxima.callback_period_ms,
+        maxima.previous_callback_total_ms,
+        maxima.sdk_ready_gap_ms,
+        maxima.to_ros_ms,
+        maxima.publish_ms,
+        maxima.cleanup_ms,
+        maxima.callback_total_ms,
+        worst.origin_packet_buffer_full ? "yes" : "no");
+  }
+  frame_timing_.MarkCallbackReturned(SteadyClock::now());
 }
 
 inline void SourceDriver::SendCorrection(const u8Array_t& msg)

@@ -1,0 +1,179 @@
+cmake_minimum_required(VERSION 3.8)
+project(utree_dog_navigation)
+
+# Supported platform: Ubuntu 22.04 with ROS 2 Humble.
+if(NOT DEFINED ENV{ROS_DISTRO})
+  message(FATAL_ERROR
+    "ROS_DISTRO is not set. Source /opt/ros/humble/setup.bash before building.")
+elseif(NOT "$ENV{ROS_DISTRO}" STREQUAL "humble")
+  message(WARNING
+    "utree_dog_navigation is validated on ROS 2 Humble; detected '$ENV{ROS_DISTRO}'.")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+find_package(ament_cmake REQUIRED)
+find_package(builtin_interfaces REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+find_package(utree_dog_msgs REQUIRED)
+
+add_library(body_odometry_core
+  src/body_odometry.cpp)
+target_include_directories(body_odometry_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(body_odometry_core
+  geometry_msgs nav_msgs tf2 tf2_geometry_msgs)
+
+add_executable(body_odom_adapter_node
+  src/body_odometry_adapter_node.cpp
+  src/body_odometry_adapter_main.cpp)
+target_link_libraries(body_odom_adapter_node body_odometry_core)
+ament_target_dependencies(body_odom_adapter_node
+  nav_msgs rclcpp)
+
+add_library(terrain_mapping_core
+  src/terrain_map_builder.cpp
+  src/flat_obstacle_layer.cpp)
+target_include_directories(terrain_mapping_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(terrain_mapping_core
+  builtin_interfaces utree_dog_msgs)
+
+add_library(terrain_mapper_node_lib
+  src/terrain_mapper_node.cpp)
+target_include_directories(terrain_mapper_node_lib PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(terrain_mapper_node_lib terrain_mapping_core)
+ament_target_dependencies(terrain_mapper_node_lib
+  builtin_interfaces geometry_msgs nav_msgs rclcpp sensor_msgs utree_dog_msgs)
+
+add_executable(terrain_mapper_node
+  src/terrain_mapper_main.cpp)
+target_link_libraries(terrain_mapper_node terrain_mapper_node_lib)
+ament_target_dependencies(terrain_mapper_node rclcpp)
+
+add_library(body_planning_core
+  src/lattice_planner.cpp)
+target_include_directories(body_planning_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+ament_target_dependencies(body_planning_core
+  utree_dog_msgs)
+
+add_library(body_lattice_planner_node_lib
+  src/body_lattice_planner_node.cpp)
+target_include_directories(body_lattice_planner_node_lib PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(body_lattice_planner_node_lib body_planning_core)
+ament_target_dependencies(body_lattice_planner_node_lib
+  geometry_msgs nav_msgs rclcpp tf2 tf2_geometry_msgs utree_dog_msgs)
+
+add_executable(body_lattice_planner_node
+  src/body_lattice_planner_main.cpp)
+target_link_libraries(body_lattice_planner_node body_lattice_planner_node_lib)
+ament_target_dependencies(body_lattice_planner_node rclcpp)
+
+install(TARGETS
+  body_odometry_core
+  terrain_mapping_core
+  terrain_mapper_node_lib
+  body_planning_core
+  body_lattice_planner_node_lib
+  body_odom_adapter_node
+  terrain_mapper_node
+  body_lattice_planner_node
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME})
+
+install(DIRECTORY include/
+  DESTINATION include)
+
+# Remove the one obsolete header left by incremental/symlink installs after
+# FlatObstacleVoxelMap was replaced. Do not clean any other package artifacts.
+install(CODE [[
+  set(_obsolete_flat_obstacle_header
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/include/utree_dog_navigation/flat_obstacle_voxel_map.hpp")
+  if(EXISTS "${_obsolete_flat_obstacle_header}" OR
+      IS_SYMLINK "${_obsolete_flat_obstacle_header}")
+    file(REMOVE "${_obsolete_flat_obstacle_header}")
+  endif()
+]])
+
+install(DIRECTORY config launch rviz
+  DESTINATION share/${PROJECT_NAME}
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN "*.py[co]" EXCLUDE)
+
+# Python launch caches are generated locally and must not survive incremental
+# installs or become part of a deployable workspace.
+install(CODE [[
+  set(_navigation_launch_pycache
+    "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/share/utree_dog_navigation/launch/__pycache__")
+  if(IS_DIRECTORY "${_navigation_launch_pycache}")
+    file(REMOVE_RECURSE "${_navigation_launch_pycache}")
+  endif()
+]])
+
+install(PROGRAMS
+  scripts/flat_obstacle_map_recorder.py
+  DESTINATION lib/${PROJECT_NAME})
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
+
+  ament_add_gtest(test_terrain_map_builder test/test_terrain_map_builder.cpp)
+  target_link_libraries(test_terrain_map_builder terrain_mapping_core)
+  ament_target_dependencies(test_terrain_map_builder utree_dog_msgs)
+
+  ament_add_gtest(
+    test_flat_obstacle_layer
+    test/test_flat_obstacle_layer.cpp)
+  target_link_libraries(test_flat_obstacle_layer terrain_mapping_core)
+  ament_target_dependencies(test_flat_obstacle_layer utree_dog_msgs)
+
+  ament_add_pytest_test(
+    test_flat_obstacle_map_recorder
+    test/test_flat_obstacle_map_recorder.py)
+
+  ament_add_gtest(test_terrain_mapper_node test/test_terrain_mapper_node.cpp)
+  target_link_libraries(test_terrain_mapper_node terrain_mapper_node_lib)
+  ament_target_dependencies(test_terrain_mapper_node
+    builtin_interfaces geometry_msgs nav_msgs rclcpp sensor_msgs utree_dog_msgs)
+
+  ament_add_gtest(test_lattice_planner test/test_lattice_planner.cpp)
+  target_link_libraries(test_lattice_planner body_planning_core)
+  ament_target_dependencies(test_lattice_planner utree_dog_msgs)
+
+  ament_add_gtest(test_body_odometry test/test_body_odometry.cpp)
+  target_link_libraries(test_body_odometry body_odometry_core)
+  ament_target_dependencies(test_body_odometry
+    geometry_msgs nav_msgs tf2 tf2_geometry_msgs)
+
+  ament_add_gtest(
+    test_body_lattice_planner_node
+    test/test_body_lattice_planner_node.cpp)
+  target_link_libraries(
+    test_body_lattice_planner_node
+    body_lattice_planner_node_lib)
+  ament_target_dependencies(
+    test_body_lattice_planner_node
+    geometry_msgs nav_msgs rclcpp utree_dog_msgs)
+endif()
+
+ament_package()
