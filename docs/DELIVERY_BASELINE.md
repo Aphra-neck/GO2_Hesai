@@ -44,3 +44,5 @@ MAKEFLAGS=-j2 colcon build \
 - 不改变标准 SDK2 bridge 的路径近似和 `0.40/0.60` 指令。
 - go2-log、上传仓库和历史会话状态不再是启动依赖。
 - `deprecated_reference/` 不参与 colcon 构建和 ROS 2 安装。
+- 未来日志采集和上传必须由开发者自行维护，并保持为独立的可选系统；规范见
+  `docs/LOCAL_DIAGNOSTICS.md`。

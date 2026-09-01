@@ -42,12 +42,16 @@ Go2 LowState -> /imu/data    ├-> Super-LIO -> /lio/odom + /lio/cloud_world
 无避障 direct bridge、go2-log、运动卡住探针和历史研究材料已经移入
 `deprecated_reference/`，不参与构建、安装、启动或运行。
 
+RViz 不是正式运行链的必需节点。可在 Jetson 本机启动、在 WSL2 中远程启动，或完全不启动；
+三种方式只选一种，具体命令见 [部署与日常运行](docs/OPERATIONS.md) 的可视化章节。
+
 ## 文档入口
 
 - [部署与日常运行](docs/OPERATIONS.md)
 - [交付基线与回退](docs/DELIVERY_BASELINE.md)
 - [工作空间保留清单](docs/WORKSPACE_MANIFEST.md)
 - [SDK2 路径执行原理](docs/go2_sdk2_motion_bridge_execution.md)
+- [可选的本地诊断与日志系统](docs/LOCAL_DIAGNOSTICS.md)
 - [停用参考资料说明](deprecated_reference/README.md)
 
 ## 目标平台
@@ -66,3 +70,6 @@ Go2 LowState -> /imu/data    ├-> Super-LIO -> /lio/odom + /lio/cloud_world
 - 每次 bridge 进程启动后必须由操作员显式调用一次 `enable_motion=true`。
 - 正常到达目标后 bridge 保持授权并持续发送零速 Move，等待新的 `/goal_pose`。
 - 外部日志仓库、上传状态和历史 go2-log 会话不会参与或阻断正式运行链。
+
+如需日志采集或上传，开发者必须自行建立独立的本地诊断系统；不得把日志系统重新接入正式启动链。
+建立、校验、远端配置和维护要求见 [可选的本地诊断与日志系统](docs/LOCAL_DIAGNOSTICS.md)。

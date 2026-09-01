@@ -4,7 +4,7 @@
 
 | 路径 | 用途 |
 | --- | --- |
-| `config/fastdds/` | Jetson 与 WSL2 Fast DDS 静态单播配置 |
+| `config/fastdds/` | Jetson Fast DDS 配置；仅选择 WSL2 可视化时才需要额外使用 WSL2 配置 |
 | `shell/ros2_environment.sh` | Humble、工作空间和 DDS 环境 |
 | `shell/start_slam.sh` | Hesai、Go2 IMU、Super-LIO |
 | `shell/start_navigation.sh` | 机身里程计适配、地图和规划 |
@@ -27,6 +27,7 @@ flat-obstacle 管线复用，不能仅凭名称删除或移动。
 - `tools/test_terrain_navigation_launch.py`
 - 各 ROS 2 包的当前单元测试
 - `docs/` 中的正式运行、基线和执行原理文档
+- `docs/LOCAL_DIAGNOSTICS.md`：未来开发者自行建立可选日志系统的边界和维护指南
 
 ## 生成物：不提交、不归档
 
@@ -34,6 +35,7 @@ flat-obstacle 管线复用，不能仅凭名称删除或移动。
 - `build_codex/`、`install_codex/`、`log_codex/`
 - `.pytest_cache/`、`__pycache__/`
 - PCD、bag、运行日志和地图导出
+- `.local_diagnostics/` 及其他开发者自建日志会话目录
 
 这些内容由编译或运行重新生成，不能放入 `deprecated_reference/`。
 
@@ -47,3 +49,6 @@ flat-obstacle 管线复用，不能仅凭名称删除或移动。
 
 `deprecated_reference/COLCON_IGNORE` 阻止 colcon 发现整个归档树。这些目录不得加入
 CMake、launch、启动脚本或日常测试发现路径。
+
+RViz 配置文件随 `utree_dog_navigation` 安装，但 RViz 进程本身是可选的；不启动 WSL2
+不会影响 Jetson 上的感知、地图、规划或 SDK2 bridge。

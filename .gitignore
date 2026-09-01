@@ -14,6 +14,14 @@ build_codex/
 install_codex/
 log_codex/
 
+# Developer-owned optional diagnostics (never commit runtime sessions)
+.local_diagnostics/
+diagnostics/
+*.mcap
+*.db3
+*.pcap
+*.pcapng
+
 # ROS runtime files
 .ros/
 *.bag
